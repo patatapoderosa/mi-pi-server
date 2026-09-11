@@ -3,41 +3,57 @@
 ## Unit tests (no deps, no network)
 
 ```bash
-npm install   # una volta: typescript, @types/node, typebox, pi types
-npm test      # node --test "tests/*.test.ts"  → 32 test
+npm install   # once: typescript, @types/node, typebox, pi types
+npm test      # node --test "tests/*.test.ts"  → 32 tests
 npm run typecheck  # tsc --noEmit
 ```
 
-Copertura reale (non finta):
+Real coverage (no fakes):
 
-| Area | Casi |
+| Area | Cases |
 | --- | --- |
-| Firma | valida, errata, secret sbagliato, payload manomesso byte-exact |
-| Freshness | scaduto (`ts_expired`), futuro (`ts_future`), al limite skew |
-| Forma | prefissi/forme malformate, payload non-oggetto, op non valida (`run_command` rifiutata) |
-| Risposte | correlazione `requestId`, verifica con stesso HMAC, rifiuto con altro secret |
-| Replay store | duplicati, persistenza dopo restart (rilettura file), expiry + prune, last update/error |
-| Atomicità | scrittura valida, nessun tmp residuo, overwrite, backup, fallback su file corrotti |
-| Moduli | patch valida + merge, campi ignoti (`filePath`, `shellCommand`, `command`, `script`…), tipi errati, range, patch vuote/enormi/non-oggetto, nomi file con traversal rifiutati |
+| Signature | valid, wrong, wrong secret, byte-exact tampered payload |
+| Freshness | expired (`ts_expired`), future (`ts_future`), at the skew boundary |
+| Shape | malformed prefixes/shapes, non-object payload, invalid op (`run_command` rejected) |
+| Responses | `requestId` correlation, same-HMAC verification, other-secret rejection |
+| Replay store | duplicates, restart persistence (file re-read), expiry + prune, last update/error |
+| Atomicity | valid write, no leftover tmp, overwrite, backup, corrupt-file fallback |
+| Modules | valid patch + merge, unknown fields (`filePath`, `shellCommand`, `command`, `script`…), wrong types, ranges, empty/huge/non-object patches, traversal filenames rejected |
 
-## Live checklist (richiede Telegram reale, una volta)
+## Windows installer smoke tests (no Pester, no Windows required)
 
-1. `getMe` per entrambi i bot (fatto dagli setup script).
-2. Mac → server: `remote_server_status` → risposta firmata < 90s.
-3. Mac → server: `set_config` valido → conferma `✅` + backup creato in `server-config/`.
-4. Mac → server: `set_config` con campo ignoto → `invalid_patch`, file intatto.
-5. Replay: rimanda lo stesso messaggio (copia dal gruppo) → `replay`, ignorato.
-6. Prefisso con firma rotta → consumato, mai al modello, `rejected` in `remote-state.json`.
-7. Reboot server → `pi-server` online senza login; `/telegram-connect`
-   automatico (log `[pi-server]` nel PM2/Task Scheduler).
-8. Telefono → DM ServerBot: `stato server`, `disattiva example-monitor`,
-   `quali servizi stanno girando`.
+```powershell
+pwsh -NoProfile -File installer/tests/Invoke-SmokeTests.ps1
+# or: npm run test:windows
+```
 
-## Limiti noti dei test automatici
+35 self-contained tests covering the pure installer library: admin detection
+shape, Node version comparison, directory layout, checksum validation
+(good/bad/missing/empty), manifest validation (complete/incomplete),
+idempotent config preservation (created/kept/merged + backup on overwrite),
+fast-failing download errors, never-throwing health check, no-secrets-in-logs,
+and a static scan for PowerShell 7-only operators (the installer must stay
+5.1-compatible). Windows-only parts (Task Scheduler settings) are skipped
+with a count outside Windows — never fake-passed.
 
-- Il flusso Telegram end-to-end non è simulabile senza bot reali (niente mock
-  finti della Bot API): i casi sopra sono checklist manuale.
-- `pi-daemon.mjs` + `ecosystem.config.cjs` si verificano sul server
-  (`pm2 logs pi-server`, `pm2 describe pi-server`) — non in CI.
-- Le extension vengono typecheckate (`tsc`) ma il caricamento jiti reale si
-  prova con `pi` + `/reload` e `session_start` notify.
+## Live checklist (needs real Telegram, once)
+
+1. `getMe` for both bots (done by the setup scripts).
+2. Mac → server: `remote_server_status` → signed reply < 90s.
+3. Mac → server: valid `set_config` → `✅` confirmation + backup created in `server-config/`.
+4. Mac → server: `set_config` with unknown field → `invalid_patch`, file untouched.
+5. Replay: re-send the same message (copy it from the group) → `replay`, ignored.
+6. Broken-signature prefix → consumed, never reaches the model, `rejected` in `remote-state.json`.
+7. Reboot server → `pi-server` online with no login; automatic `/telegram-connect`
+   (look for `[pi-server]` in PM2 / Task Scheduler logs).
+8. Phone → ServerBot DM: `server status`, `disable example-monitor`,
+   `which services are running` (Italian equivalents work too).
+
+## Known limits of automated tests
+
+- The end-to-end Telegram flow cannot be simulated without real bots (no fake
+  Bot API mocks): the cases above are a manual checklist.
+- `pi-daemon.mjs` + `ecosystem.config.cjs` are verified on the server
+  (`pm2 logs pi-server`, `pm2 describe pi-server`) — not in CI.
+- Extensions are typechecked (`tsc`), but real jiti loading is tested with
+  `pi` + `/reload` and the `session_start` notify.

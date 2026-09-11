@@ -1,9 +1,11 @@
-# Pi Remote System — 24/7 Pi Coding Agent node on an old PC
+# PiServer — a 24/7 Pi Coding Agent node on an old PC
 
-Turn an old PC into an always-on Pi Coding Agent node. Control it in natural
-language from your Mac (via a `pi-remote` extension) and from your phone
-(via Telegram DM with the ServerBot). No VPS, no port forwarding, no public
-IP, no open ports. Free and self-hosted.
+Turn an old PC into an always-on [Pi Coding Agent](https://github.com/badlogic/pi-mono)
+node. Talk to it in natural language — from your Mac and from your phone over
+Telegram. No VPS, no port forwarding, no public IP, no inbound firewall rules.
+Free and self-hosted.
+
+## How it works
 
 ```
 Mac ── Pi ── pi-remote ──(HTTPS sendMessage, ControlBot token)──▶ ┌──────────────┐
@@ -15,46 +17,52 @@ Phone ──Telegram DM──▶ ServerBot ── Pi (old PC) ── pi-remote-c
                                               │         │
                                               │         ├── server_config / server_status / service_control
                                               │         └── signed remote ops (set_config/get_status/ping/service)
-                                              └── PM2 pi-server (pi-daemon.mjs → pi --mode rpc)
+                                              └── supervisor: PM2 pi-server (Linux) or Task Scheduler (Windows)
+                                                  pi-daemon.mjs → pi --mode rpc
 ```
 
-## What runs where
+Three moving parts:
 
-| Where | What |
+| Where | What it does |
 | --- | --- |
-| Old PC (Ubuntu/Debian or Windows) | Pi (`--mode rpc`, headless) under PM2 (`pi-server`) or Task Scheduler, `@llblab/pi-telegram` (ServerBot, owns the single `getUpdates` loop), `pi-remote-config` extension |
-| Mac | Pi + `pi-remote` extension (tools `remote_server_config`, `remote_server_status`), secrets in Keychain |
-| Telegram | Two bots: **ServerBot** (talks to you + receives remote ops) and **ControlBot** (Mac-only sender). They meet in one **private control group** — bots cannot DM each other (see docs/ARCHITECTURE.md) |
+| Old PC (Ubuntu/Debian or Windows) | Runs Pi headless (`--mode rpc`) under a supervisor (PM2 on Linux, Task Scheduler on Windows), plus `@llblab/pi-telegram` (the ServerBot, which owns the single `getUpdates` loop) and the `pi-remote-config` extension |
+| Mac | Runs Pi with the `pi-remote` extension, which turns natural-language requests ("set the server interval to 30 minutes") into signed Telegram commands — no slash commands to remember |
+| Telegram | Two bots — **ServerBot** (talks to you, receives remote ops) and **ControlBot** (Mac-only sender) — plus one private control group where they meet. Bots cannot DM each other (see `docs/ARCHITECTURE.md`) |
 
 ## Quick start
 
-### Windows (PC vuoto, un solo comando)
+### Windows — empty PC, one command
 
-Apri PowerShell e incolla:
+Open PowerShell (admin rights not needed, it self-elevates) and paste:
 
 ```powershell
 irm https://raw.githubusercontent.com/patatapoderosa/mi-pi-server/main/setup.ps1 | iex
 ```
 
-Ti chiede solo i secret (ServerBot token, ID gruppo, HMAC). Tutto il resto è
-automatico: Node 22, Pi, pi-telegram, extension, task di avvio, sleep off,
-health check. Dettagli in `docs/INSTALL.md` (sezione Windows).
+It asks only for secrets (ServerBot token, group/chat IDs, HMAC). Everything
+else is automatic: Node 22, Pi CLI, pi-telegram, extension deploy, startup
+task, sleep off, health check. Details in `docs/INSTALL.md` (Windows section).
 
-### Linux / Mac (setup manuali)
+### Ubuntu/Debian server
 
-- **Server (Ubuntu/Debian):** leggi `docs/INSTALL.md`, poi `server/setup-old-pc.sh`.
-- **Mac:** `mac/setup-mac.sh`.
+Read `docs/INSTALL.md`, then run `server/setup-old-pc.sh`.
+
+### Mac controller
+
+Run `mac/setup-mac.sh`. It stores the ControlBot token and the **same** HMAC
+as the server in your Keychain.
+
 ## Repository layout
 
 ```
 shared/                  protocol (HMAC envelope), module schemas, atomic store + anti-replay
 server/pi-remote-config/ server extension (local tools + secure remote ops)
 server/pi-daemon.mjs     RPC supervisor (stdout/stderr, signals, /telegram-connect)
-server/ecosystem.config.cjs  PM2 app(s)
+server/ecosystem.config.cjs  PM2 app(s) — Linux
 server/setup-old-pc.sh   Linux one-click setup (idempotent)
-server/setup-old-pc.ps1  Windows setup manuale (repo presente; preferisci setup.ps1)
-setup.ps1                bootstrap one-line Windows (scarica release verificata)
-uninstall.ps1            rimozione Windows (chiede keep config/secrets)
+server/setup-old-pc.ps1  manual Windows setup (repo present; prefer setup.ps1)
+setup.ps1                one-line Windows bootstrap (downloads verified release)
+uninstall.ps1            Windows removal (asks to keep config/secrets)
 installer/               windows-installer + lib + run-task + release + smoke test
 mac/pi-remote/           Mac extension (remote_server_config/status)
 mac/setup-mac.sh         Mac setup (Keychain secrets)

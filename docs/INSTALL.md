@@ -1,35 +1,35 @@
 # INSTALL
 
-## 0. Prerequisiti
+## 0. Prerequisites
 
-- Vecchio PC (Ubuntu 22.04+/Debian 12+ oppure Windows 10/11), acceso e in rete.
-- Mac con Pi Coding Agent installato e Telegram.
-- Account Telegram (il tuo). Clone di questo repo su entrambe le macchine
-  (`~/pi-remote-system` è il percorso convenzionale).
+- Old PC (Ubuntu 22.04+/Debian 12+ or Windows 10/11), powered on and online.
+- Mac with Pi Coding Agent installed + Telegram.
+- Your Telegram account. Clone this repo on both machines
+  (`~/pi-remote-system` is the conventional path).
 
-## 1. Telegram: due bot + gruppo di controllo (10 minuti, manuali)
+## 1. Telegram: two bots + control group (10 manual minutes)
 
-1. Da @BotFather crea **ServerBot** (es. `my_home_server_bot`) e **ControlBot**
-   (es. `my_home_control_bot`). Salva i due token.
-2. Per **entrambi** i bot, apri @BotFather → impostazioni → abilita la
-   **bot-to-bot communication mode** (richiede Bot API ≥ 10.0; senza questo i
-   bot non si vedono a vicenda).
-3. Crea un **gruppo privato** (es. `pi-control`), aggiungi entrambi i bot come
-   **amministratori** (gli admin ricevono tutti i messaggi) e aggiungi te stesso.
-4. Recupera gli ID numerici:
-   - il tuo user id: scrivi a @userinfobot;
-   - ControlBot id: inoltra un suo messaggio a @userinfobot (il campo `from`);
-   - chat id del gruppo: con entrambi i bot dentro, usa un bot tipo
-     @getmyid_bot oppure leggi `getUpdates` del ControlBot dopo aver scritto
-     nel gruppo (l'id è negativo, es. `-123456789`).
-5. Sul telefono apri la DM con ServerBot (servirà per il pairing pi-telegram).
+1. With @BotFather create **ServerBot** (e.g. `my_home_server_bot`) and
+   **ControlBot** (e.g. `my_home_control_bot`). Save both tokens.
+2. For **both** bots, open @BotFather → settings → enable
+   **bot-to-bot communication mode** (requires Bot API ≥ 10.0; without it the
+   bots cannot see each other).
+3. Create a **private group** (e.g. `pi-control`), add both bots as
+   **administrators** (admins receive every message) plus yourself.
+4. Collect the numeric IDs:
+   - your user id: message @userinfobot;
+   - ControlBot id: forward one of its messages to @userinfobot (the `from` field);
+   - group chat id: with both bots inside, use a bot like @getmyid_bot, or read
+     the ControlBot `getUpdates` after writing in the group
+     (the id is negative, e.g. `-123456789`).
+5. On your phone, open the DM with ServerBot (needed for pi-telegram pairing).
 
-Perché il gruppo: i bot Telegram **non possono scriversi in DM** (verificato su
-documentazione corrente: il bot-to-bot funziona solo in gruppi/business chat
-con opt-in). Il Mac invia con il token ControlBot nel gruppo; ServerBot lo
-legge tramite il suo unico loop `getUpdates`.
+Why the group: Telegram bots **cannot DM each other** (verified against current
+docs: bot-to-bot only works in groups/business chats with opt-in). The Mac
+sends with the ControlBot token into the group; ServerBot reads it through its
+single `getUpdates` loop.
 
-## 2. Server Linux
+## 2. Linux server
 
 ```bash
 cd ~/pi-remote-system
@@ -37,79 +37,80 @@ chmod +x server/setup-old-pc.sh
 ./server/setup-old-pc.sh
 ```
 
-Lo script (idempotente, `set -euo pipefail`, backup prima di sovrascrivere)
-installa Node 22, Pi, PM2, `@llblab/pi-telegram`, collega l'extension, crea
-config + secrets (0600/0700), avvia `pi-server` su PM2 con `pm2 save` +
-`pm2 startup`, disabilita sleep/hibernate e verifica `getMe` + stato PM2.
-Ti chiederà (nascosti): ServerBot token, owner id, ControlBot id, chat id del
-gruppo, HMAC (INVIO = genera uno casuale — copialo, serve identico sul Mac).
+The script (idempotent, `set -euo pipefail`, backs up before overwriting)
+installs Node 22, Pi, PM2, `@llblab/pi-telegram`, links the extension, creates
+config + secrets (0600/0700), starts `pi-server` on PM2 with `pm2 save` +
+`pm2 startup`, disables sleep/hibernate, and verifies `getMe` + PM2 status.
+It asks you (hidden input): ServerBot token, owner id, ControlBot id, group
+chat id, HMAC (ENTER = random one — copy it, the Mac needs the identical value).
 
-Poi, una volta sola: `pi` → `/telegram-setup` (se serve) → `/telegram-connect`,
-e dal telefono apri la DM ServerBot per il pairing.
+Then, once: `pi` → `/telegram-setup` (if needed) → `/telegram-connect`,
+and on your phone open the ServerBot DM for pairing.
 
-## 3. Server Windows (PC vuoto: un solo comando)
+## 3. Windows server (empty PC: one command)
 
-Apri PowerShell (non serve admin: si auto-eleva) e incolla:
+Open PowerShell (no admin needed: it self-elevates) and paste:
 
 ```powershell
 irm https://raw.githubusercontent.com/patatapoderosa/mi-pi-server/main/setup.ps1 | iex
 ```
 
-### Cosa fa questo comando?
+### What does this command do?
 
-1. Scarica `setup.ps1` (trust root: solo HTTPS+TLS 1.2, vedi `docs/SECURITY.md`).
-2. Si riavvia come amministratore da solo e propaga l'exit code.
-3. Scarica la release `mi-pi-server-windows.zip` + `SHA256SUMS.txt`, verifica
-   lo SHA256 (fail closed: se non coincide si ferma) ed estrae in `%TEMP%`.
-4. Lancia `installer/windows-installer.ps1`: [1/10] Windows, [2/10] Node.js 22
-   (winget, fallback MSI), [3/10] Pi CLI, [4/10] pi-telegram, [5/10] deploy app in
-   `C:\PiServer\app` + extension in `C:\PiServer\data`, [6/10] config (mai
-   sovrascritte), [7/10] secrets (ACL SYSTEM+Administrators) + login Pi,
-   [8/10] task `PiHomeServer` (SYSTEM, at-startup, restart), [9/10] sleep AC off
-   + hibernate off, [10/10] health check (se fallisce: SETUP FALLITO, exit 1).
-5. Pulisce i file temporanei.
+1. Downloads `setup.ps1` (trust root: HTTPS+TLS 1.2 only, see `docs/SECURITY.md`).
+2. Re-launches itself as administrator and propagates the exit code.
+3. Downloads release `mi-pi-server-windows.zip` + `SHA256SUMS.txt`, verifies
+   the SHA256 (fail closed: mismatch = stop) and extracts to `%TEMP%`.
+4. Runs `installer/windows-installer.ps1`: [1/10] Windows, [2/10] Node.js 22
+   (winget, MSI fallback), [3/10] Pi CLI, [4/10] pi-telegram, [5/10] app deploy to
+   `C:\PiServer\app` + extension to `C:\PiServer\data`, [6/10] config (never
+   overwritten), [7/10] secrets (SYSTEM+Administrators ACL) + Pi login,
+   [8/10] `PiHomeServer` task (SYSTEM, at-startup, restart), [9/10] AC sleep off
+   + hibernate off, [10/10] health check (on failure: SETUP FAILED, exit 1).
+5. Cleans up temp files.
 
-Layout su disco: `C:\PiServer\app` (codice), `C:\PiServer\logs` (log ruotati),
-`C:\PiServer\data` (`PI_CODING_AGENT_DIR`: config, extension, secrets). Il task gira
-come SYSTEM con path assoluti salvati in `runtime-env.json`: nessun login richiesto,
-HOME utente irrilevante.
+Disk layout: `C:\PiServer\app` (code), `C:\PiServer\logs` (rotated logs),
+`C:\PiServer\data` (`PI_CODING_AGENT_DIR`: config, extension, secrets). The task runs
+as SYSTEM with absolute paths stored in `runtime-env.json`: no login required,
+user HOME irrelevant.
 
-### Unici passaggi manuali rimasti
+### Remaining manual steps
 
-- Durante l'installazione: ServerBot token, ControlBot ID, chat ID gruppo, HMAC
-  (INVIO = generato, mostrato una volta) e owner ID. In alternativa non-interattiva:
+- During install: ServerBot token, ControlBot ID, group chat ID, HMAC
+  (ENTER = generated, shown once) and owner ID. Non-interactive alternative:
   `$env:PI_SERVER_BOT_TOKEN`, `$env:PI_CONTROL_BOT_ID`, `$env:PI_CONTROL_CHAT_ID`,
-  `$env:PI_REMOTE_HMAC`, `$env:PI_OWNER_ID` (mai nei log).
-- Se Pi non ha credenziali: completa `/login` quando l'installer lo chiede
-  (apre Pi una volta sola), premi INVIO.
-- Sul telefono: apri la DM ServerBot e manda `/start` (pairing).
-- Sul Mac: `mac/setup-mac.sh` con ControlBot token + stesso HMAC.
-- Test reboot: riavvia, senza login il task deve essere Running e Telegram online.
+  `$env:PI_REMOTE_HMAC`, `$env:PI_OWNER_ID` (never logged).
+- If Pi has no credentials: complete `/login` when the installer asks
+  (it opens Pi once), press ENTER.
+- On the phone: open the ServerBot DM and send `/start` (pairing).
+- On the Mac: `mac/setup-mac.sh` with the ControlBot token + the same HMAC.
+- Reboot test: reboot; with no login the task must be Running and Telegram online.
 
-### Aggiorna / disinstalla
+### Update / uninstall
 
 ```powershell
-# Il pipe non inoltra flag: per aggiornare scarica setup.ps1 e rilancialo:
+# Pipes don't forward flags: to update, download setup.ps1 and relaunch it:
 Invoke-WebRequest -Uri https://raw.githubusercontent.com/patatapoderosa/mi-pi-server/main/setup.ps1 -OutFile .\setup.ps1
 .\setup.ps1 -Update
-# Stessa copia riusabile per versioni pinnate:
-# .\setup.ps1 -Version v0.2.0 -ExpectedSha256 <hash>   # pinning checksums
+# Same copy is reusable for pinned versions:
+# .\setup.ps1 -Version v0.2.0 -ExpectedSha256 <hash>   # checksum pinning
 
-# Disinstallazione (ferma task, chiede se tenere config/secrets):
+# Uninstall (stops task, asks whether to keep config/secrets):
 irm https://raw.githubusercontent.com/patatapoderosa/mi-pi-server/main/uninstall.ps1 | iex
 ```
 
-### Alternativa manuale (repo già presente)
+### Manual alternative (repo already present)
 
-Se hai già clonato il repo sul PC:
+If you already cloned the repo on the PC:
 
 ```powershell
 cd $HOME\pi-remote-system
-.\server\setup-old-pc.ps1   # da PowerShell elevata
+.\server\setup-old-pc.ps1   # from an elevated PowerShell
 ```
 
-Differenze rispetto al one-click: niente download/verifica release, niente update/rollback,
-extension copiata (Windows-safe). Per installazioni da zero preferisci `setup.ps1`.
+Differences vs one-click: no release download/verification, no update/rollback,
+copied extension (Windows-safe). For fresh installs prefer `setup.ps1`.
+
 ## 4. Mac
 
 ```bash
@@ -118,28 +119,29 @@ chmod +x mac/setup-mac.sh
 ./mac/setup-mac.sh
 ```
 
-Collega `pi-remote`, crea `~/.pi/agent/remote-server.json` (solo routing, niente
-segreti) e salva ControlBot token + **stesso HMAC del server** nel Keychain.
+It links `pi-remote`, creates `~/.pi/agent/remote-server.json` (routing only, no
+secrets) and stores the ControlBot token + the **same server HMAC** in the Keychain.
 
-## 5. Collaudo finale
+## 5. Final smoke test
 
-1. `sudo reboot` sul server → dopo il riavvio, senza login, `pm2 list` (Linux)
-   o Task Scheduler (Windows) deve mostrare il processo attivo.
-2. Telefono → DM ServerBot: `stato server` → Pi risponde con uptime e moduli.
-3. Mac → Pi: `dammi lo stato del server` → deve usare `remote_server_status`
-   da solo. Poi: `cambia l'intervallo di example-monitor a 45 minuti sul server`
-   → deve usare `remote_server_config` da solo e riportare la conferma.
-4. Verifica anti-manomissione: scrivi nel gruppo una riga che inizia con
-   `PI_REMOTE_V1` ma firmata male → deve essere consumata in silenzio (mai al
-   modello) e registrata in `remote-state.json` come `rejected`.
+1. Reboot the server → after reboot, with no login, `pm2 list` (Linux)
+   or Task Scheduler (Windows) must show the process active.
+2. Phone → ServerBot DM: `server status` (or `stato server` — IT+EN both work) →
+   Pi answers with uptime and modules.
+3. Mac → Pi: `give me the server status` → it must use `remote_server_status`
+   on its own. Then: `set example-monitor to 45 minutes on the server`
+   → it must use `remote_server_config` on its own and report the confirmation.
+4. Tamper check: write a line starting with `PI_REMOTE_V1` but badly signed in
+   the group → it must be silently consumed (never reaches the model) and logged
+   as `rejected` in `remote-state.json`.
 
-## Troubleshooting rapido
+## Quick troubleshooting
 
-| Sintomo | Causa probabile |
+| Symptom | Likely cause |
 | --- | --- |
-| `response_timeout` dal Mac | server spento, `pi-server` non online, bot non admin nel gruppo, bot-to-bot OFF |
-| `bad_sender` in `remote-state.json` | ControlBot id errato in `remote-auth.json` |
-| `bad_signature` | HMAC diverso tra Mac (Keychain) e server (`secrets/remote-hmac`) |
-| `replay` | messaggio duplicato (normale se Telegram riconsegna) |
-| Pi non riparte al reboot (Linux) | `pm2 startup` non completato: riesegui il comando che stampa `pm2 startup` |
-| Extension non caricata | symlink in `~/.pi/agent/extensions/` mancante o `shared/` non raggiungibile (il link deve puntare dentro il repo, così `../../shared` risolve) |
+| `response_timeout` from the Mac | server off, `pi-server` not online, bots not admin in the group, bot-to-bot OFF |
+| `bad_sender` in `remote-state.json` | wrong ControlBot id in `remote-auth.json` |
+| `bad_signature` | HMAC mismatch between Mac (Keychain) and server (`secrets/remote-hmac`) |
+| `replay` | duplicate message (normal on Telegram redelivery) |
+| Pi not restarting on reboot (Linux) | `pm2 startup` incomplete: rerun the command it printed |
+| Extension not loaded | missing symlink in `~/.pi/agent/extensions/` or unreachable `shared/` (the link must point inside the repo so `../../shared` resolves) |

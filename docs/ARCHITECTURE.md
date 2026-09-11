@@ -12,7 +12,7 @@
   the supervisor restarts it.
 - **PM2** (Linux): app `pi-server` from `server/ecosystem.config.cjs`
   (autorestart, restart delay, memory cap, dated logs under
-  `~/.pi/agent/logs/`). On Windows: **Task Scheduler** task `PiServer`
+  `~/.pi/agent/logs/`). On Windows: **Task Scheduler** task `PiHomeServer`
   (at-startup, SYSTEM, restart-on-failure) — PM2 is deliberately not used there.
 - **`@llblab/pi-telegram`** (ServerBot): owns the **single** `getUpdates`
   long-poll loop. Phone DMs arrive here; so do the signed remote messages from
@@ -24,10 +24,10 @@
 ### Mac
 
 - **Pi + `pi-remote`**: tools `remote_server_config` / `remote_server_status`
-  with Italian+English trigger descriptions and prompt guidelines, so the model
-  calls them on natural-language requests. Sends via ControlBot token (HTTPS),
-  waits for the correlated signed reply (short-lived poll, `sequential`
-  execution mode to avoid two concurrent polls).
+  with trigger descriptions and prompt guidelines, so the model calls them on
+  natural-language requests. Sends via ControlBot token (HTTPS), waits for the
+  correlated signed reply (short-lived poll, `sequential` execution mode to
+  avoid two concurrent polls).
 
 ### Telegram
 
@@ -37,7 +37,7 @@
 
 ## Message flow (Mac → server)
 
-1. User: "cambia l'intervallo sul server a 30 minuti".
+1. User: "set the server interval to 30 minutes".
 2. Mac Pi calls `remote_server_config({module:"example-monitor", settings:{intervalMinutes:30}})`.
 3. Extension reads token+HMAC from Keychain, builds
    `PI_REMOTE_V1 <b64url>.<hmac>`, `sendMessage` to the control group.
@@ -59,8 +59,8 @@ Phone flow is direct: DM → ServerBot → Pi → `server_status`/`server_config
   (`{version:1, add, dispatch}`). We use the **zero-coupling** form so load
   order never matters. Verdicts: `"consume"` skips default routing.
   Source: pi-telegram `docs/updates.md` + `docs/public-api.md` (v0.45.4).
-- **There is no `pi.on("telegram:update")`.** The prompt's guess was wrong;
-  we did not invent it — the registry above is the real API.
+- **No `pi.on("telegram:update")` event exists** — the companion registry above
+  is the real API; anything else would be invented.
 - **Bot-to-bot**: Telegram historically blocked all bot↔bot traffic. Since Bot
   API 10.0 (May 2026) bots can exchange messages **only in groups/business
   chats and only after each bot enables bot-to-bot mode in @BotFather**.
@@ -83,7 +83,6 @@ Phone flow is direct: DM → ServerBot → Pi → `server_status`/`server_config
 - `~/.pi/agent/remote-state.json` — nonce window + last remote update/error (0600)
 - `~/.pi/agent/telegram.json` — pi-telegram profile (ServerBot token, allowedUserId)
 
-
 ### Windows one-click layout (`C:\PiServer`)
 
 Same files, different root: `C:\PiServer\data` **is** the agent dir
@@ -98,6 +97,7 @@ prepends node+npm-global to PATH, rotates logs and launches the daemon in
 the foreground so the task stays Running. Secrets ACL: SYSTEM+Administrators.
 Pi provider credentials: the interactive `/login` runs as the installing user,
 then `auth.json` is copied into the data dir (idempotent, backed up).
+
 ## Adding a new module (no protocol/auth/transport changes)
 
 1. Append a `ModuleDefinition` (name, fixed `configFile`, defaults, field
