@@ -3,31 +3,20 @@
 ## 0. Prerequisites
 
 - Old PC (Ubuntu 22.04+/Debian 12+ or Windows 10/11), powered on and online.
-- Mac with Pi Coding Agent installed + Telegram.
-- Your Telegram account. Clone this repo on both machines
-  (`~/pi-remote-system` is the conventional path).
+- Mac with Pi Coding Agent installed.
+- Your Telegram account (phone with Telegram for pairing).
+- A Tailscale account (free): both machines join the same tailnet.
+  Clone this repo on the server and the Mac (`~/pi-remote-system` is the
+  conventional path).
 
-## 1. Telegram: two bots + control group (10 manual minutes)
+## 1. Telegram: one bot (5 manual minutes)
 
-1. With @BotFather create **ServerBot** (e.g. `my_home_server_bot`) and
-   **ControlBot** (e.g. `my_home_control_bot`). Save both tokens.
-2. For **both** bots, open @BotFather → settings → enable
-   **bot-to-bot communication mode** (requires Bot API ≥ 10.0; without it the
-   bots cannot see each other).
-3. Create a **private group** (e.g. `pi-control`), add both bots as
-   **administrators** (admins receive every message) plus yourself.
-4. Collect the numeric IDs:
-   - your user id: message @userinfobot;
-   - ControlBot id: forward one of its messages to @userinfobot (the `from` field);
-   - group chat id: with both bots inside, use a bot like @getmyid_bot, or read
-     the ControlBot `getUpdates` after writing in the group
-     (the id is negative, e.g. `-123456789`).
-5. On your phone, open the DM with ServerBot (needed for pi-telegram pairing).
+1. With @BotFather create **ServerBot** (e.g. `my_home_server_bot`). Save the token.
+2. Collect your numeric user id: message @userinfobot.
+3. On your phone, open the DM with ServerBot (needed for pi-telegram pairing).
 
-Why the group: Telegram bots **cannot DM each other** (verified against current
-docs: bot-to-bot only works in groups/business chats with opt-in). The Mac
-sends with the ControlBot token into the group; ServerBot reads it through its
-single `getUpdates` loop.
+That's it — no second bot, no group. The Mac reaches the server over Tailscale,
+never through Telegram.
 
 ## 2. Linux server
 
@@ -39,10 +28,13 @@ chmod +x server/setup-old-pc.sh
 
 The script (idempotent, `set -euo pipefail`, backs up before overwriting)
 installs Node 22, Pi, PM2, `@llblab/pi-telegram`, links the extension, creates
-config + secrets (0600/0700), starts `pi-server` on PM2 with `pm2 save` +
-`pm2 startup`, disables sleep/hibernate, and verifies `getMe` + PM2 status.
-It asks you (hidden input): ServerBot token, owner id, ControlBot id, group
-chat id, HMAC (ENTER = random one — copy it, the Mac needs the identical value).
+config + secrets (0600/0700), installs Tailscale and joins the tailnet,
+writes `remote-server.json`, starts **both** `pi-server` and `pi-remote-server`
+on PM2 with `pm2 save` + `pm2 startup`, disables sleep/hibernate, and verifies
+`getMe` + PM2 status + a signed `/v1/ping` against the local daemon.
+It asks you (hidden input): ServerBot token, owner id, HMAC (ENTER = random
+one — copy it, the Mac needs the identical value). Tailscale login is either
+`PI_TAILSCALE_AUTHKEY` (headless) or one interactive browser login.
 
 Then, once: `pi` → `/telegram-setup` (if needed) → `/telegram-connect`,
 and on your phone open the ServerBot DM for pairing.
@@ -61,30 +53,36 @@ irm https://raw.githubusercontent.com/patatapoderosa/mi-pi-server/main/setup.ps1
 2. Re-launches itself as administrator and propagates the exit code.
 3. Downloads release `mi-pi-server-windows.zip` + `SHA256SUMS.txt`, verifies
    the SHA256 (fail closed: mismatch = stop) and extracts to `%TEMP%`.
-4. Runs `installer/windows-installer.ps1`: [1/10] Windows, [2/10] Node.js 22
-   (winget, MSI fallback), [3/10] Pi CLI, [4/10] pi-telegram, [5/10] app deploy to
-   `C:\PiServer\app` + extension to `C:\PiServer\data`, [6/10] config (never
-   overwritten), [7/10] secrets (SYSTEM+Administrators ACL) + Pi login,
-   [8/10] `PiHomeServer` task (SYSTEM, at-startup, restart), [9/10] AC sleep off
-   + hibernate off, [10/10] health check (on failure: SETUP FAILED, exit 1).
+4. Runs `installer/windows-installer.ps1`: [1/11] Windows, [2/11] Node.js 22
+   (winget, MSI fallback), [3/11] Pi CLI, [4/11] pi-telegram,
+   [5/11] Tailscale install + tailnet login (interactive browser login, or
+   `-TailscaleAuthKey` for headless), [6/11] app deploy to `C:\PiServer\app`
+   - daemon files + extension to `C:\PiServer\data`, [7/11]
+   `remote-server.json` (port 43128, no Telegram IDs anywhere), [8/11] secrets
+   (SYSTEM+Administrators ACL) + Pi login, [9/11] `PiHomeServer` +
+   `PiRemoteServer` tasks (SYSTEM, at-startup, restart) + Tailscale-scoped
+   firewall rule, [10/11] AC sleep off + hibernate off, [11/11] health check
+   (daemon `/v1/ping` probe included; on failure: SETUP FAILED, exit 1).
 5. Cleans up temp files.
 
 Disk layout: `C:\PiServer\app` (code), `C:\PiServer\logs` (rotated logs),
-`C:\PiServer\data` (`PI_CODING_AGENT_DIR`: config, extension, secrets). The task runs
+`C:\PiServer\data` (`PI_CODING_AGENT_DIR`: config, extension, secrets). The tasks run
 as SYSTEM with absolute paths stored in `runtime-env.json`: no login required,
 user HOME irrelevant.
 
 ### Remaining manual steps
 
-- During install: ServerBot token, ControlBot ID, group chat ID, HMAC
-  (ENTER = generated, shown once) and owner ID. Non-interactive alternative:
-  `$env:PI_SERVER_BOT_TOKEN`, `$env:PI_CONTROL_BOT_ID`, `$env:PI_CONTROL_CHAT_ID`,
-  `$env:PI_REMOTE_HMAC`, `$env:PI_OWNER_ID` (never logged).
+- During install: ServerBot token, owner ID, HMAC (ENTER = generated, shown
+  once). Non-interactive alternative: `$env:PI_SERVER_BOT_TOKEN`,
+  `$env:PI_REMOTE_HMAC`, `$env:PI_OWNER_ID`, `$env:PI_TAILSCALE_AUTHKEY`
+  (never logged; the auth key is accepted only when `setup.ps1` already runs
+  elevated — it is never forwarded through the auto-elevation relaunch).
+- Tailscale: authorize the PC in the browser when asked (or pass the auth key).
 - If Pi has no credentials: complete `/login` when the installer asks
   (it opens Pi once), press ENTER.
 - On the phone: open the ServerBot DM and send `/start` (pairing).
-- On the Mac: `mac/setup-mac.sh` with the ControlBot token + the same HMAC.
-- Reboot test: reboot; with no login the task must be Running and Telegram online.
+- On the Mac: `mac/setup-mac.sh` with the server tailnet name + the same HMAC.
+- Reboot test: reboot; with no login both tasks must be Running and Telegram online.
 
 ### Update / uninstall
 
@@ -95,7 +93,7 @@ Invoke-WebRequest -Uri https://raw.githubusercontent.com/patatapoderosa/mi-pi-se
 # Same copy is reusable for pinned versions:
 # .\setup.ps1 -Version v0.2.0 -ExpectedSha256 <hash>   # checksum pinning
 
-# Uninstall (stops task, asks whether to keep config/secrets):
+# Uninstall (stops both tasks, asks whether to keep config/secrets):
 irm https://raw.githubusercontent.com/patatapoderosa/mi-pi-server/main/uninstall.ps1 | iex
 ```
 
@@ -119,29 +117,36 @@ chmod +x mac/setup-mac.sh
 ./mac/setup-mac.sh
 ```
 
-It links `pi-remote`, creates `~/.pi/agent/remote-server.json` (routing only, no
-secrets) and stores the ControlBot token + the **same server HMAC** in the Keychain.
+It checks Pi + node, checks/installs Tailscale (Homebrew cask) and verifies the
+tailnet, links `pi-remote`, writes `~/.pi/agent/remote-server.json`
+(`serverBaseUrl` like `http://pi-server:43128`, Keychain pointers — routing
+only, no secrets), stores the **same server HMAC** in the Keychain
+(`security add-generic-password`), deletes the dead ControlBot token entry if
+present, and live-tests a signed `GET /v1/status`.
 
 ## 5. Final smoke test
 
 1. Reboot the server → after reboot, with no login, `pm2 list` (Linux)
-   or Task Scheduler (Windows) must show the process active.
-2. Phone → ServerBot DM: `server status` (or `stato server` — IT+EN both work) →
-   Pi answers with uptime and modules.
+   or Task Scheduler (Windows) must show **both** processes active.
+2. Phone → ServerBot DM: `server status` → Pi answers with uptime and modules.
 3. Mac → Pi: `give me the server status` → it must use `remote_server_status`
    on its own. Then: `set example-monitor to 45 minutes on the server`
    → it must use `remote_server_config` on its own and report the confirmation.
-4. Tamper check: write a line starting with `PI_REMOTE_V1` but badly signed in
-   the group → it must be silently consumed (never reaches the model) and logged
-   as `rejected` in `remote-state.json`.
+   Then: `disable example-monitor` / `re-enable it` → `remote_module_disable` /
+   `remote_module_enable`.
+4. Tamper check (proves auth is real): from any machine on the tailnet,
+   `curl http://<server>:43128/v1/status` with no headers → `401 missing_auth`;
+   with a wrong signature → `401`. Nothing is applied, nothing leaks.
 
 ## Quick troubleshooting
 
 | Symptom | Likely cause |
 | --- | --- |
-| `response_timeout` from the Mac | server off, `pi-server` not online, bots not admin in the group, bot-to-bot OFF |
-| `bad_sender` in `remote-state.json` | wrong ControlBot id in `remote-auth.json` |
+| Mac tool error `server unreachable` / timeout | server off, `pi-remote-server` not online, Tailscale down on either side (`tailscale status`), wrong hostname in `~/.pi/agent/remote-server.json` |
 | `bad_signature` | HMAC mismatch between Mac (Keychain) and server (`secrets/remote-hmac`) |
-| `replay` | duplicate message (normal on Telegram redelivery) |
+| `ts_expired` / `ts_future` | clock skew > `maxSkewSeconds` (default 300 s): fix NTP/clock |
+| `replay` | duplicate nonce (normal on retry): retry once with a fresh call |
+| `unknown_module` / `invalid_patch` | wrong module name or field not in the registry schema |
 | Pi not restarting on reboot (Linux) | `pm2 startup` incomplete: rerun the command it printed |
 | Extension not loaded | missing symlink in `~/.pi/agent/extensions/` or unreachable `shared/` (the link must point inside the repo so `../../shared` resolves) |
+| Windows task Running but daemon unreachable | Tailscale not connected yet at boot (`tailscale ip -4` empty → loopback fallback): daemon logs the bind source on every start |

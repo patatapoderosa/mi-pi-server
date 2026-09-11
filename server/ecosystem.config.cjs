@@ -5,6 +5,7 @@
  * never from the shell's cwd, so `pm2 resurrect` works after reboot.
  * Add future services as new entries in `apps` — same shape, own logs.
  */
+const { execFileSync } = require("node:child_process");
 const { homedir } = require("node:os");
 const { join } = require("node:path");
 
@@ -24,6 +25,21 @@ const SYSTEM_DIR =
         : join(homedir(), "pi-remote-system");
 
 const LOG_DIR = join(AGENT_DIR, "logs");
+const REMOTE_ENTRY = join(SYSTEM_DIR, "server", "pi-remote-server", "index.ts");
+
+// Node >= 22.18 strips types natively; older 22.x needs the explicit flag.
+// Probe once with the same node binary PM2 will use, so both work.
+function nodeStripArgs() {
+    try {
+        execFileSync(process.execPath, ["--check", REMOTE_ENTRY], {
+            stdio: "ignore",
+            timeout: 30000,
+        });
+        return [];
+    } catch {
+        return ["--experimental-strip-types"];
+    }
+}
 
 module.exports = {
     apps: [
@@ -39,6 +55,26 @@ module.exports = {
             log_date_format: "YYYY-MM-DD HH:mm:ss Z",
             out_file: join(LOG_DIR, "pi-server-out.log"),
             err_file: join(LOG_DIR, "pi-server-err.log"),
+            merge_logs: true,
+            env: {
+                NODE_ENV: "production",
+                PI_REMOTE_SYSTEM_DIR: SYSTEM_DIR,
+                PI_CODING_AGENT_DIR: AGENT_DIR,
+            },
+        },
+        {
+            name: "pi-remote-server",
+            script: REMOTE_ENTRY,
+            interpreter: "node",
+            interpreter_args: nodeStripArgs().join(" "),
+            cwd: SYSTEM_DIR,
+            autorestart: true,
+            restart_delay: 5000,
+            max_memory_restart: "512M",
+            kill_timeout: 10000,
+            log_date_format: "YYYY-MM-DD HH:mm:ss Z",
+            out_file: join(LOG_DIR, "remote-server-out.log"),
+            err_file: join(LOG_DIR, "remote-server-err.log"),
             merge_logs: true,
             env: {
                 NODE_ENV: "production",

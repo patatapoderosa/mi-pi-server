@@ -9,9 +9,9 @@
   Layout inside the ZIP (payload root):
     server\pi-daemon.mjs
     server\pi-remote-config\index.ts + package.json
+    server\pi-remote-server\index.ts, server.ts, migrate.ts, tailscale.ts
     shared\protocol.ts, modules.ts, store.ts
-    installer\PiServerLib.ps1, windows-installer.ps1, run-task.ps1
-
+    installer\PiServerLib.ps1, windows-installer.ps1, run-task.ps1, run-remote.ps1
   Run from the repo root (any OS with pwsh):
     pwsh -NoProfile -File installer/New-Release.ps1 -Version v0.1.0
 
@@ -45,12 +45,17 @@ $wanted = @(
   "server\pi-daemon.mjs",
   "server\pi-remote-config\index.ts",
   "server\pi-remote-config\package.json",
+  "server\pi-remote-server\index.ts",
+  "server\pi-remote-server\server.ts",
+  "server\pi-remote-server\migrate.ts",
+  "server\pi-remote-server\tailscale.ts",
   "shared\protocol.ts",
   "shared\modules.ts",
   "shared\store.ts",
   "installer\PiServerLib.ps1",
   "installer\windows-installer.ps1",
-  "installer\run-task.ps1"
+  "installer\run-task.ps1",
+  "installer\run-remote.ps1"
 )
 
 foreach ($rel in $wanted) {

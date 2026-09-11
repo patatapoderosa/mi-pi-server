@@ -7,7 +7,8 @@
   side-effect-free functions plus failure paths that don't need Windows:
   admin detection shape, Node version comparison, path layout, checksum
   validation (good/bad/missing), manifest validation (complete/incomplete),
-  idempotent config preservation, download failure, health-check failure,
+  idempotent config preservation (remote-server.json), download failure,
+  health-check + remote-daemon probe fail-closed,
   and the no-secrets-in-logs guarantee.
 
   Windows-only parts (Task Scheduler registration, icacls, powercfg) are
@@ -74,6 +75,10 @@ try {
   Assert-True ($P.Daemon -match "pi-daemon\.mjs$") "Daemon path"
   Assert-True ($P.TaskName -eq "PiHomeServer") "TaskName"
   Assert-True ($P.ExtDir -match "extensions$") "ExtDir"
+  Assert-True ($P.RemoteEntry -match "index\.ts$") "RemoteEntry (daemon TS)"
+  Assert-True ($P.RunRemote -match "run-remote\.ps1$") "RunRemote launcher"
+  Assert-Equal $P.RemoteTaskName "PiRemoteServer" "RemoteTaskName"
+  Assert-Equal $P.RemotePortDefault 43128 "RemotePortDefault"
   Assert-True ($P.SharedDir -match "shared$") "SharedDir (layout ../../shared preservato)"
 
   Write-Host "== checksum validation =="
@@ -91,7 +96,10 @@ try {
   foreach ($rel in @("server\pi-daemon.mjs", "server\pi-remote-config\index.ts",
       "server\pi-remote-config\package.json", "shared\protocol.ts",
       "shared\modules.ts", "shared\store.ts",
-      "installer\run-task.ps1", "installer\windows-installer.ps1")) {
+      "server\pi-remote-server\index.ts", "server\pi-remote-server\server.ts",
+      "server\pi-remote-server\migrate.ts", "server\pi-remote-server\tailscale.ts",
+      "installer\run-task.ps1", "installer\run-remote.ps1",
+      "installer\windows-installer.ps1")) {
     $fp = Join-Path $pay $rel
     $d = Split-Path -Parent $fp
     if (-not (Test-Path -LiteralPath $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
@@ -104,29 +112,29 @@ try {
   Assert-True ((-not $m2.Ok) -and ($m2.Missing -contains "shared\store.ts")) "manifest incompleto rifiutato con dettaglio"
 
   Write-Host "== idempotent config preservation =="
-  $cfg = Join-Path $TmpRoot "remote-auth.json"
+  $cfg = Join-Path $TmpRoot "remote-server.json"
   $r1 = Save-JsonConfigPreserving -Path $cfg `
-    -Defaults @{ allowedControlBotId = 0; controlChatId = 0 } `
-    -RequiredKeys @("allowedControlBotId", "controlChatId")
+    -Defaults @{ port = 43128; maxSkewSeconds = 300 } `
+    -RequiredKeys @("port")
   Assert-Equal $r1 "created" "prima scrittura = created"
   $custom = Get-Content -LiteralPath $cfg -Raw | ConvertFrom-Json
-  $custom.allowedControlBotId = 12345
+  $custom.port = 50000
   $custom | Add-Member -NotePropertyName "notaUtente" -NotePropertyValue "non-toccare"
   $custom | ConvertTo-Json -Depth 4 | Out-File -LiteralPath $cfg -Encoding utf8
   $r2 = Save-JsonConfigPreserving -Path $cfg `
-    -Defaults @{ allowedControlBotId = 0; controlChatId = 0 } `
-    -RequiredKeys @("allowedControlBotId", "controlChatId")
+    -Defaults @{ port = 43128; maxSkewSeconds = 300 } `
+    -RequiredKeys @("port")
   Assert-Equal $r2 "kept" "seconda scrittura = kept"
   $after = Get-Content -LiteralPath $cfg -Raw | ConvertFrom-Json
-  Assert-Equal $after.allowedControlBotId 12345 "valore utente preservato"
+  Assert-Equal $after.port 50000 "valore utente preservato"
   Assert-Equal $after.notaUtente "non-toccare" "chiavi extra preservate"
   # Corrupt file -> backup + defaults (merged), never crash.
   "zzz-non-json" | Out-File -LiteralPath $cfg -Encoding utf8
   $r3 = Save-JsonConfigPreserving -Path $cfg `
-    -Defaults @{ allowedControlBotId = 0; controlChatId = 0 } `
-    -RequiredKeys @("allowedControlBotId", "controlChatId")
+    -Defaults @{ port = 43128; maxSkewSeconds = 300 } `
+    -RequiredKeys @("port")
   Assert-Equal $r3 "merged" "file corrotto = backup + defaults"
-  $baks = Get-ChildItem -LiteralPath $TmpRoot -Filter "remote-auth.json.bak-*" -ErrorAction SilentlyContinue
+  $baks = Get-ChildItem -LiteralPath $TmpRoot -Filter "remote-server.json.bak-*" -ErrorAction SilentlyContinue
   Assert-True ((@($baks).Count -ge 1)) "backup creato prima di sovrascrivere"
 
   Write-Host "== download failure =="
@@ -145,6 +153,18 @@ try {
   try { $null = Invoke-HealthCheck -Paths $null -PiBin $null } catch { $threw = $true }
   Assert-True (-not $threw) "health check non lancia mai eccezioni"
 
+  Write-Host "== remote daemon probe (fail-closed, no throw) =="
+  $rd = Test-RemoteDaemon -Paths $bogus -TimeoutSec 3
+  Assert-True (-not $rd.Ok) "probe fallisce su installazione vuota (no HMAC)"
+  Assert-True (-not [string]::IsNullOrWhiteSpace($rd.Detail)) "probe spiega il motivo"
+  New-Item -ItemType Directory -Path $bogus.SecretsDir -Force | Out-Null
+  "unit-test-hmac-value" | Out-File -LiteralPath (Join-Path $bogus.SecretsDir "remote-hmac") -Encoding ascii -NoNewline
+  $rd2 = Test-RemoteDaemon -Paths $bogus -TimeoutSec 3
+  Assert-True (-not $rd2.Ok) "probe fallisce a demone spento (connessione rifiutata)"
+  $threw2 = $false
+  try { $null = Test-RemoteDaemon -Paths $null -TimeoutSec 3 } catch { $threw2 = $true }
+  Assert-True (-not $threw2) "probe non lancia mai eccezioni"
+
   Write-Host "== no secrets in logs =="
   $logf = Join-Path $TmpRoot "t.log"
   $fakeSecret = "sk-fakesecret-UNITTEST-987654321"
@@ -159,6 +179,8 @@ try {
     (Join-Path (Split-Path -Parent $PSScriptRoot) "PiServerLib.ps1"),
     (Join-Path (Split-Path -Parent $PSScriptRoot) "windows-installer.ps1"),
     (Join-Path (Split-Path -Parent $PSScriptRoot) "run-task.ps1")
+    (Join-Path (Split-Path -Parent $PSScriptRoot) "run-task.ps1"),
+    (Join-Path (Split-Path -Parent $PSScriptRoot) "run-remote.ps1")
   )
   $badOps = @()
   $inBlock = $false

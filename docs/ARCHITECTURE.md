@@ -10,61 +10,82 @@
   idempotent `/telegram-connect` after startup (re-acquires pi-telegram polling
   ownership after reboot), forwards SIGTERM/SIGINT, and exits with Pi's code so
   the supervisor restarts it.
-- **PM2** (Linux): app `pi-server` from `server/ecosystem.config.cjs`
-  (autorestart, restart delay, memory cap, dated logs under
-  `~/.pi/agent/logs/`). On Windows: **Task Scheduler** task `PiHomeServer`
-  (at-startup, SYSTEM, restart-on-failure) — PM2 is deliberately not used there.
+- **PM2** (Linux): apps `pi-server` and `pi-remote-server` from
+  `server/ecosystem.config.cjs` (autorestart, restart delay, memory caps, dated
+  logs under `<agent>/logs/`). On Windows: **Task Scheduler** tasks
+  `PiHomeServer` and `PiRemoteServer` (at-startup, SYSTEM, restart-on-failure) —
+  PM2 is deliberately not used there.
 - **`@llblab/pi-telegram`** (ServerBot): owns the **single** `getUpdates`
-  long-poll loop. Phone DMs arrive here; so do the signed remote messages from
-  the control group.
-- **`pi-remote-config`** (this repo): (A) local tools `server_config`,
-  `server_status`, `service_control`; (B) a Telegram update handler that
-  verifies + applies remote ops and replies in the control group.
+  long-poll loop. Phone DMs arrive here. Nothing else polls Telegram.
+- **`pi-remote-config`** (this repo): local tools `server_config`,
+  `server_status`, `service_control`. No Telegram handler, no polling —
+  the Mac never touches Telegram anymore.
+- **`pi-remote-server`** (this repo, `server/pi-remote-server/`): standalone
+  HTTP daemon for Mac remote control. Separate process on purpose: if Pi
+  crashes, remote status/control keeps answering (fault isolation).
 
 ### Mac
 
-- **Pi + `pi-remote`**: tools `remote_server_config` / `remote_server_status`
-  with trigger descriptions and prompt guidelines, so the model calls them on
-  natural-language requests. Sends via ControlBot token (HTTPS), waits for the
-  correlated signed reply (short-lived poll, `sequential` execution mode to
-  avoid two concurrent polls).
+- **Pi + `pi-remote`**: tools `remote_server_status` / `remote_server_config` /
+  `remote_module_enable` / `remote_module_disable` with trigger descriptions
+  and prompt guidelines, so the model calls them on natural-language requests.
+  Each tool reads the HMAC from Keychain, signs the request
+  (`X-Pi-Timestamp` / `X-Pi-Nonce` / `X-Pi-Signature`) and calls the daemon
+  over plain HTTP inside the tailnet.
 
-### Telegram
+### Tailscale tailnet
 
-- **ServerBot**: phone operator surface + remote-op receiver.
-- **ControlBot**: send-only identity for the Mac.
-- **Private control group** (ServerBot + ControlBot + owner, both bots admin).
+- Private WireGuard mesh joining Mac + server. The daemon **binds only the
+  tailnet IPv4** (validated `100.64.0.0/10`, never `0.0.0.0`): even with no
+  firewall rule, LAN hosts cannot reach the socket. Windows adds a firewall
+  rule scoped to the Tailscale interface as a second layer.
+- No open ports, no public IPs, no webhooks, no VPS.
 
 ## Message flow (Mac → server)
 
 1. User: "set the server interval to 30 minutes".
 2. Mac Pi calls `remote_server_config({module:"example-monitor", settings:{intervalMinutes:30}})`.
-3. Extension reads token+HMAC from Keychain, builds
-   `PI_REMOTE_V1 <b64url>.<hmac>`, `sendMessage` to the control group.
-4. ServerBot's `getUpdates` (pi-telegram) delivers the update; our handler
-   (registered via the public v1 registry) verifies: sender id → optional chat
-   check → HMAC (`timingSafeEqual`) → timestamp/skew → persisted nonce replay
-   → op/module whitelist → field schema → applies (backup + atomic write) →
-   replies `PI_REMOTE_RESP_V1 <...>` (same requestId) → returns `"consume"`.
-5. Mac correlates `requestId`, verifies the reply signature, returns the result
-   to the model, which answers in the user's language.
+3. Extension reads serverBaseUrl from `~/.pi/agent/remote-server.json` and the
+   HMAC from Keychain, builds `PATCH /v1/modules/example-monitor/config` with
+   `{patch:{intervalMinutes:30}}`, signs
+   `METHOD\nPATH\nTS\nNONCE\nSHA256(raw body)` and sends it over the tailnet.
+4. The daemon verifies: headers present+well-formed → signature
+   (`timingSafeEqual`) → timestamp freshness → persisted nonce replay →
+   route/module whitelist → field schema → applies (backup + atomic write) →
+   replies `{ok:true, body:{...}}`.
+5. The extension returns the result to the model, which answers in the user's
+   language. Timeouts surface as tool errors (default 30 s), never as hangs.
 
 Phone flow is direct: DM → ServerBot → Pi → `server_status`/`server_config`.
 
+## HTTP API (`pi-remote-server`)
+
+| Method + path | Auth | Effect |
+| --- | --- | --- |
+| `GET /v1/health` | none (supervisor liveness) | `{ok:true}` |
+| `GET /v1/ping` | signed | `{pong:true}` |
+| `GET /v1/status` | signed | hostname, app version, uptime, module list (no secrets) |
+| `GET /v1/modules` | signed | `[{name, description, config, enabled}]` |
+| `GET /v1/modules/:name/status` | signed | one module |
+| `PATCH /v1/modules/:name/config` | signed | `{patch}` → validated atomic write + backup |
+| `POST /v1/modules/:name/enable` | signed | flips `enabled` on |
+| `POST /v1/modules/:name/disable` | signed | flips `enabled` off |
+
+Auth (every `/v1/*` route except `/v1/health`), verification order:
+headers → signature (constant-time) → freshness → persisted anti-replay →
+route/schema. Bodies capped at 256 KiB; unknown routes → 404.
+
 ## Verified API facts (checked before building)
 
-- **pi-telegram companion API**: `registerTelegramUpdateHandler` from
-  `@llblab/pi-telegram/updates`, or the zero-coupling
-  `globalThis.__piTelegramUpdateHandlerRegistry__` v1 contract
-  (`{version:1, add, dispatch}`). We use the **zero-coupling** form so load
-  order never matters. Verdicts: `"consume"` skips default routing.
-  Source: pi-telegram `docs/updates.md` + `docs/public-api.md` (v0.45.4).
-- **No `pi.on("telegram:update")` event exists** — the companion registry above
-  is the real API; anything else would be invented.
-- **Bot-to-bot**: Telegram historically blocked all bot↔bot traffic. Since Bot
-  API 10.0 (May 2026) bots can exchange messages **only in groups/business
-  chats and only after each bot enables bot-to-bot mode in @BotFather**.
-  Direct bot DMs remain impossible — hence the private control group design.
+- **Tailscale CLI surface used**: `tailscale up [--auth-key=file:]`,
+  `tailscale ip -4`, `tailscale status`, MagicDNS names. Install: `winget`
+  (`Tailscale.Tailscale`, machine scope) or the official MSI
+  (`TS_NOLAUNCH=1`); on Linux the official `install.sh`.
+- **Node runs the daemon entry directly**: `server/pi-remote-server/index.ts`
+  is TypeScript executed by Node type-stripping (native ≥22.18, probed
+  `--experimental-strip-types` flag on older 22.x — probed once at install on
+  Windows via `node --check`, probed at load on Linux in `ecosystem.config.cjs`).
+  No build step, shared files imported relatively so the layout survives deploy.
 - **Pi headless**: `pi --mode rpc` is the official headless/daemon mode
   (docs/rpc.md). Extension `prompt` commands (e.g. `/telegram-connect`) work
   over RPC, which the daemon uses for post-boot ownership acquire.
@@ -77,24 +98,29 @@ Phone flow is direct: DM → ServerBot → Pi → `server_status`/`server_config
 
 ## Data on disk (server)
 
-- `~/.pi/agent/remote-auth.json` — `{allowedControlBotId, controlChatId?, maxSkewSeconds, allowedServices}` (0600)
-- `~/.pi/agent/secrets/{server-bot-token,remote-hmac}` (0600, dir 0700)
-- `~/.pi/agent/server-config/<module>.json` — one file per module, fixed names (0600)
-- `~/.pi/agent/remote-state.json` — nonce window + last remote update/error (0600)
-- `~/.pi/agent/telegram.json` — pi-telegram profile (ServerBot token, allowedUserId)
+- `<agent>/remote-server.json` — `{port, bindHost?, maxSkewSeconds, allowedServices}` (0600).
+  `port` default 43128; `maxSkewSeconds` clamped 30–3600 (default 300).
+- `<agent>/secrets/{server-bot-token,remote-hmac}` (0600, dir 0700).
+- `<agent>/server-config/<module>.json` — one file per module, fixed names (0600).
+- `<agent>/remote-state.json` — nonce window + last remote update/error (0600).
+- `<agent>/telegram.json` — pi-telegram profile (ServerBot token, allowedUserId).
+- Legacy `remote-auth.json` (ControlBot era) is migrated on daemon boot:
+  HMAC-preserving, `{port,maxSkewSeconds,allowedServices}` carried over,
+  dead Telegram fields dropped, original backed up to `*.bak-<ts>.migrated`.
 
 ### Windows one-click layout (`C:\PiServer`)
 
 Same files, different root: `C:\PiServer\data` **is** the agent dir
-(`PI_CODING_AGENT_DIR`, honored by Pi, pi-telegram and this extension).
+(`PI_CODING_AGENT_DIR`, honored by Pi, pi-telegram and this daemon).
 `C:\PiServer\app` holds versioned code + `runtime-env.json` (absolute
-`node.exe`/`pi.cmd`/daemon paths resolved at install time, because SYSTEM
+`node.exe`/`pi.cmd`/daemon paths plus probed `NodeArgs`, because SYSTEM
 PATH is minimal and the npm global bin is user-scoped). `C:\PiServer\logs`
-holds rotated `pi-server.log` / `pi-server-error.log` / `installer.log`.
-The `PiHomeServer` task runs as SYSTEM (at-startup, restart-on-failure,
-single instance, no time limit) via `app\run-task.ps1`, which sets the env,
-prepends node+npm-global to PATH, rotates logs and launches the daemon in
-the foreground so the task stays Running. Secrets ACL: SYSTEM+Administrators.
+holds rotated `pi-server.log` / `remote-server.log` / `installer.log`.
+The `PiHomeServer` + `PiRemoteServer` tasks run as SYSTEM (at-startup,
+restart-on-failure, single instance, no time limit) via `app\run-task.ps1` /
+`app\run-remote.ps1`, which set the env, prepend node+npm-global to PATH,
+rotate logs and launch the processes in the foreground so the tasks stay
+Running. Secrets ACL: SYSTEM+Administrators.
 Pi provider credentials: the interactive `/login` runs as the installing user,
 then `auth.json` is copied into the data dir (idempotent, backed up).
 

@@ -31,7 +31,8 @@ param(
   [string]$Version = "latest",
   [string]$ExpectedSha256 = "",
   [switch]$Update,
-  [string]$InstallRoot = "C:\PiServer"
+  [string]$InstallRoot = "C:\PiServer",
+  [string]$TailscaleAuthKey = ""
 )
 
 Set-StrictMode -Version 2.0
@@ -167,6 +168,9 @@ try {
     "-PayloadDir", "`"$payload`"", "-InstallRoot", "`"$InstallRoot`"")
   if ($Update) { $iArgs += "-Update" }
   if ($ExpectedSha256 -ne "") { $iArgs += @("-ExpectedSha256", "`"$ExpectedSha256`"") }
+  # Auth key travels only inside this already-elevated session (still visible
+  # in this process command line: prefer interactive login when shoulder-surfing matters).
+  if ($TailscaleAuthKey -ne "") { $iArgs += @("-TailscaleAuthKey", "`"$TailscaleAuthKey`"") }
   # Run in-process so output streams live; exit code propagates.
   & powershell.exe @iArgs
   $code = $LASTEXITCODE

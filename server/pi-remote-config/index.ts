@@ -1,20 +1,17 @@
 /**
  * pi-remote-config — server-side Pi extension (old PC, 24/7 node).
  *
- * A) Local tools for the on-server agent: server_config / server_status / service_control.
- *    Config writes only touch WHITELISTED fields of REGISTERED modules.
- *    There is deliberately NO remote shell, NO arbitrary paths, NO exec tool.
+ * Local tools for the on-server agent (used from the phone via ServerBot):
+ * server_config / server_status / service_control.
+ * Config writes only touch WHITELISTED fields of REGISTERED modules.
+ * There is deliberately NO remote shell, NO arbitrary paths, NO exec tool.
  *
- * B) Remote control from the Mac: intercepts special Telegram messages posted
- *    by the ControlBot into the private control group, verifies them
- *    (sender id + HMAC-SHA256 + timestamp + persisted anti-replay + op/module
- *    whitelist + field schema), applies them, and replies in the same chat.
- *
- * Polling rule: this file NEVER calls getUpdates. The single polling loop is
- * owned by @llblab/pi-telegram. We hook into its PUBLIC registry
- * (docs/updates.md: `registerTelegramUpdateHandler`, zero-coupling globalThis
- * contract v1) and return "consume" for every message that carries our
- * prefix — valid or invalid — so remote payloads never reach the model.
+ * Remote control from the Mac does NOT go through Telegram anymore: it is
+ * served by the standalone pi-remote-server HTTP daemon (server/
+ * pi-remote-server/) over the tailnet. This extension shares the module
+ * registry model (shared/modules.ts), the config files, and the replay-state
+ * file with that daemon — so the phone and the Mac always see the same
+ * truth — but this file never opens sockets and never polls Telegram.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -22,31 +19,27 @@ import { execFile } from "node:child_process";
 import { createRequire } from "node:module";
 import { existsSync, readFileSync } from "node:fs";
 import { freemem, loadavg, totalmem, uptime as osUptime } from "node:os";
+import { hostname as osHostname } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import {
-  REMOTE_PREFIX,
-  encodeResponse,
-  isRemoteOp,
-  verifySignedText,
-  type RemoteOp,
-} from "../../shared/protocol.ts";
-import {
   BUILTIN_MODULES,
-  isValidConfigFileName,
+  applyModulePatchFile,
+  configPathFor,
+  enabledOf,
   isValidModuleName,
-  validatePatch,
-  type ModuleDefinition,
+  readModuleConfigFile,
+  type ModuleRuntime,
   type PatchValue,
 } from "../../shared/modules.ts";
 import {
   ReplayStore,
   atomicWriteJson,
-  backupFile,
   ensureDir,
   readJsonFile,
   resolveAgentDir,
 } from "../../shared/store.ts";
+import { readAppVersion } from "../pi-remote-server/server.ts";
 
 const execFileAsync = promisify(execFile);
 const LOG = "[remote-config]";
@@ -55,20 +48,9 @@ const LOG = "[remote-config]";
 /* Paths & config                                                      */
 /* ------------------------------------------------------------------ */
 
-export interface RemoteAuth {
-  allowedControlBotId: number;
-  controlChatId?: number;
-  maxSkewSeconds?: number;
-  allowedServices?: string[];
-}
-
 interface Paths {
   agentDir: string;
-  authFile: string;
   configDir: string;
-  secretsDir: string;
-  hmacFile: string;
-  serverBotTokenFile: string;
   stateFile: string;
 }
 
@@ -76,113 +58,47 @@ function paths(): Paths {
   const agentDir = resolveAgentDir();
   return {
     agentDir,
-    authFile: join(agentDir, "remote-auth.json"),
     configDir: join(agentDir, "server-config"),
-    secretsDir: join(agentDir, "secrets"),
-    hmacFile: join(agentDir, "secrets", "remote-hmac"),
-    serverBotTokenFile: join(agentDir, "secrets", "server-bot-token"),
     stateFile: join(agentDir, "remote-state.json"),
   };
 }
 
-function loadAuth(p: Paths): RemoteAuth | null {
-  const raw = readJsonFile<Partial<RemoteAuth> | null>(p.authFile, null);
-  if (
-    !raw ||
-    typeof raw.allowedControlBotId !== "number" ||
-    !Number.isInteger(raw.allowedControlBotId)
-  )
-    return null;
-  return {
-    allowedControlBotId: raw.allowedControlBotId,
-    controlChatId:
-      typeof raw.controlChatId === "number" ? raw.controlChatId : undefined,
-    maxSkewSeconds:
-      typeof raw.maxSkewSeconds === "number"
-        ? Math.min(3600, Math.max(30, raw.maxSkewSeconds))
-        : 300,
-    allowedServices: Array.isArray(raw.allowedServices)
-      ? raw.allowedServices.filter(
-          (s: unknown): s is string => typeof s === "string",
-        )
-      : ["pi-server"],
-  };
-}
-
-function readSecretFile(file: string): string | null {
-  try {
-    if (!existsSync(file)) return null;
-    const v = readFileSync(file, "utf8").trim();
-    return v.length > 0 ? v : null;
-  } catch {
-    return null;
-  }
-}
-
-function resolveEnvRef(value: string): string {
-  const m =
-    /^\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))$/.exec(
-      value.trim(),
-    );
-  if (m) return process.env[m[1] ?? m[2] ?? ""] ?? "";
-  return value;
-}
-
-/** ServerBot token: secrets file first, then telegram.json profile (with $ENV support). */
-export function loadServerBotToken(p: Paths): string | null {
-  const fromFile = readSecretFile(p.serverBotTokenFile);
-  if (fromFile) return fromFile;
-  try {
-    const tg = readJsonFile<{
-      profiles?: Record<string, { botToken?: string }>;
-    }>(join(p.agentDir, "telegram.json"), {});
-    const tok = tg.profiles?.["default"]?.botToken;
-    if (typeof tok === "string" && tok.length > 0) {
-      const resolved = resolveEnvRef(tok);
-      return resolved.length > 0 ? resolved : null;
-    }
-  } catch {
-    // fall through
-  }
-  return null;
+/** Service allowlist for service_control (remote-server.json, same file the daemon reads). */
+function loadAllowedServices(p: Paths): string[] {
+  const raw = readJsonFile<{ allowedServices?: unknown }>(
+    join(p.agentDir, "remote-server.json"),
+    {},
+  );
+  if (!Array.isArray(raw.allowedServices)) return ["pi-server"];
+  const list = raw.allowedServices.filter(
+    (s): s is string => typeof s === "string",
+  );
+  return list.length > 0 ? list : ["pi-server"];
 }
 
 /* ------------------------------------------------------------------ */
 /* Module registry                                                     */
 /* ------------------------------------------------------------------ */
 
-export interface ModuleRuntime {
-  def: ModuleDefinition;
-  /** Called after a config file was applied. Throwing is caught and reported. */
-  onConfigApplied?: (
-    config: Record<string, PatchValue>,
-  ) => void | Promise<void>;
-  /** Extra status rows merged into server_status output. */
-  getStatus?: () =>
-    | Record<string, PatchValue | string>
-    | Promise<Record<string, PatchValue | string>>;
-}
-
 const registry = new Map<string, ModuleRuntime>();
 
 /**
- * Future-proof registration API for new modules (in-process companions):
- *   registerRemoteModule({ def: {...}, onConfigApplied, getStatus })
- * The definition alone determines what can be changed remotely.
+ * Registration API for new modules (in-process companions):
+ *   registerRemoteModule({
+ *     name: "...",            // via def.name
+ *     schema: ...,            // via def.schema
+ *     getStatus: ...,         // extra status rows (optional)
+ *     applyConfig: ...,       // via onConfigApplied(config)
+ *     enable: ... / disable: ...  // via onEnabledChange(enabled, config)
+ *   })
+ * As registerRemoteModule({ def: {...}, onConfigApplied, onEnabledChange,
+ * getStatus }). The definition alone determines what can be changed.
  */
 export function registerRemoteModule(runtime: ModuleRuntime): void {
   const def = runtime.def;
   if (!isValidModuleName(def.name))
     throw new Error(`[remote-config] invalid module name: ${String(def.name)}`);
-  if (!isValidConfigFileName(def.configFile))
-    throw new Error(
-      `[remote-config] invalid config file: ${String(def.configFile)}`,
-    );
-  if (
-    typeof def.schema !== "object" ||
-    def.schema === null ||
-    Object.keys(def.schema).length === 0
-  ) {
+  if (typeof def.schema !== "object" || def.schema === null || Object.keys(def.schema).length === 0) {
     throw new Error(
       `[remote-config] module ${def.name} must declare a non-empty schema`,
     );
@@ -190,29 +106,7 @@ export function registerRemoteModule(runtime: ModuleRuntime): void {
   registry.set(def.name, runtime);
 }
 
-function configPathFor(p: Paths, def: ModuleDefinition): string {
-  // Fixed file name inside configDir — never derived from remote input.
-  return join(p.configDir, def.configFile);
-}
-
-function readModuleConfig(
-  p: Paths,
-  def: ModuleDefinition,
-): Record<string, PatchValue> {
-  const current = readJsonFile<Record<string, unknown>>(
-    configPathFor(p, def),
-    {},
-  );
-  const merged: Record<string, PatchValue> = { ...def.defaults };
-  for (const [k, v] of Object.entries(current)) {
-    if (
-      k in def.schema &&
-      (typeof v === "string" || typeof v === "number" || typeof v === "boolean")
-    )
-      merged[k] = v;
-  }
-  return merged;
-}
+export type { ModuleRuntime };
 
 /** Validate + backup + atomically write a module config. Returns backup path (if any). */
 export function applyModulePatch(
@@ -222,52 +116,7 @@ export function applyModulePatch(
 ): { config: Record<string, PatchValue>; backup: string | null } {
   const runtime = registry.get(name);
   if (!runtime) throw new Error(`unknown_module:${name}`);
-  const current = readJsonFile<Record<string, unknown>>(
-    configPathFor(p, runtime.def),
-    {},
-  );
-  const result = validatePatch(runtime.def, current, patch);
-  if (!result.ok) throw new Error(`invalid_patch:${result.errors.join(",")}`);
-  const file = configPathFor(p, runtime.def);
-  ensureDir(p.configDir, 0o700);
-  const backup = existsSync(file) ? backupFile(file) : null;
-  atomicWriteJson(file, result.merged, 0o600);
-  return { config: result.merged ?? {}, backup };
-}
-
-/* ------------------------------------------------------------------ */
-/* Telegram send (HTTPS POST only — no polling here)                   */
-/* ------------------------------------------------------------------ */
-
-async function sendTelegram(
-  token: string,
-  chatId: number,
-  text: string,
-  replyTo?: number,
-): Promise<boolean> {
-  const url = `https://api.telegram.org/bot${token}/sendMessage`;
-  const body: Record<string, unknown> = {
-    chat_id: chatId,
-    text: text.slice(0, 4000),
-    disable_notification: true,
-  };
-  if (replyTo !== undefined) body["reply_parameters"] = { message_id: replyTo };
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      const res = await fetch(url, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(body),
-        signal: AbortSignal.timeout(15000),
-      });
-      if (res.ok) return true;
-      if (res.status >= 400 && res.status < 500) return false; // retrying won't help
-    } catch {
-      // network down — fall through to backoff
-    }
-    await new Promise((r) => setTimeout(r, 1000 * 2 ** attempt));
-  }
-  return false;
+  return applyModulePatchFile(p.configDir, runtime.def, patch);
 }
 
 /* ------------------------------------------------------------------ */
@@ -324,6 +173,8 @@ function fmtUptime(sec: number): string {
 export interface ServerStatus {
   online: true;
   at: string;
+  hostname: string;
+  appVersion: string;
   osUptime: string;
   piUptime: string;
   node: string;
@@ -341,6 +192,7 @@ export interface ServerStatus {
   modules: Array<{
     name: string;
     config: Record<string, PatchValue>;
+    enabled: boolean | null;
     extra?: Record<string, unknown>;
   }>;
   lastRemoteUpdate: unknown;
@@ -366,9 +218,11 @@ export async function collectStatus(
     } catch (err) {
       extra = { statusError: err instanceof Error ? err.message : "unknown" };
     }
+    const config = readModuleConfigFile(p.configDir, runtime.def);
     modules.push({
       name,
-      config: readModuleConfig(p, runtime.def),
+      config,
+      enabled: enabledOf(runtime.def, config),
       ...(extra ? { extra } : {}),
     });
   }
@@ -376,6 +230,8 @@ export async function collectStatus(
   return {
     online: true,
     at: new Date().toISOString(),
+    hostname: osHostname(),
+    appVersion: readAppVersion(join(resolveAgentDir(), "..", "app")),
     osUptime: fmtUptime(osUptime()),
     piUptime: fmtUptime(process.uptime()),
     node: process.version,
@@ -415,6 +271,7 @@ export async function collectStatus(
 function statusText(s: ServerStatus): string {
   const lines = [
     "🟢 server online",
+    `host ${s.hostname} | app ${s.appVersion}`,
     `os uptime: ${s.osUptime} | pi uptime: ${s.piUptime}`,
     `node ${s.node} | pi ${s.pi} | pi-telegram ${s.piTelegram}`,
     `mem: ${s.memory.usedPct}% used (${s.memory.freeMb}/${s.memory.totalMb} MB free) | load: ${s.load.join(" ")}`,
@@ -422,471 +279,6 @@ function statusText(s: ServerStatus): string {
     `modules: ${s.modules.map((m) => `${m.name} ${JSON.stringify(m.config)}`).join(" | ")}`,
   ];
   return lines.join("\n");
-}
-
-/* ------------------------------------------------------------------ */
-/* Remote update handling (single-polling safe)                        */
-/* ------------------------------------------------------------------ */
-
-type TelegramUpdateHandler = (
-  update: unknown,
-  execution?: { signal: AbortSignal },
-) => "consume" | "pass" | void | Promise<"consume" | "pass" | void>;
-
-const REGISTRY_KEY = "__piTelegramUpdateHandlerRegistry__";
-
-/** Zero-coupling attach to pi-telegram's public update registry (any load order). */
-function attachUpdateHandler(handler: TelegramUpdateHandler): void {
-  const g = globalThis as Record<string, unknown>;
-  const existing = g[REGISTRY_KEY] as
-    | { version?: unknown; add?: unknown }
-    | undefined;
-  if (
-    existing &&
-    existing.version === 1 &&
-    typeof existing.add === "function"
-  ) {
-    (existing.add as (h: TelegramUpdateHandler) => void)(handler);
-    return;
-  }
-  // pi-telegram not loaded (yet): create the full v1 contract so its runtime
-  // adopts our registry instead of replacing it (see pi-telegram docs/updates.md).
-  const handlers = new Set<TelegramUpdateHandler>();
-  const registryObj = {
-    version: 1 as const,
-    add(h: TelegramUpdateHandler) {
-      handlers.add(h);
-      return () => {
-        handlers.delete(h);
-      };
-    },
-    async dispatch(update: unknown, execution?: { signal: AbortSignal }) {
-      for (const h of handlers) {
-        try {
-          const r = await h(update, execution);
-          if (r === "consume") return "consume" as const;
-        } catch {
-          // never break polling because of a handler error
-        }
-      }
-      return "pass" as const;
-    },
-  };
-  g[REGISTRY_KEY] = registryObj;
-  registryObj.add(handler);
-}
-
-interface InboundMeta {
-  text: string;
-  fromId: number;
-  chatId: number;
-  messageId: number;
-}
-
-function extractInbound(update: unknown): InboundMeta | null {
-  if (typeof update !== "object" || update === null) return null;
-  const msg = (update as Record<string, unknown>)["message"];
-  if (typeof msg !== "object" || msg === null) return null;
-  const m = msg as Record<string, unknown>;
-  if (typeof m["text"] !== "string") return null;
-  const from = m["from"] as Record<string, unknown> | undefined;
-  const chat = m["chat"] as Record<string, unknown> | undefined;
-  if (
-    typeof from?.["id"] !== "number" ||
-    typeof chat?.["id"] !== "number" ||
-    typeof m["message_id"] !== "number"
-  )
-    return null;
-  return {
-    text: m["text"] as string,
-    fromId: from["id"] as number,
-    chatId: chat["id"] as number,
-    messageId: m["message_id"] as number,
-  };
-}
-
-// Reload guard: jiti /reload re-runs this module; the old handler stays in the
-// globalThis set, so stale generations must no-op instead of double-handling.
-function currentGeneration(): number {
-  const g = globalThis as unknown as Record<string, number | undefined>;
-  g["__piRemoteConfigGen"] = (g["__piRemoteConfigGen"] ?? 0) + 1;
-  return g["__piRemoteConfigGen"] as number;
-}
-function isCurrentGeneration(gen: number): boolean {
-  return (
-    (globalThis as unknown as Record<string, number | undefined>)[
-      "__piRemoteConfigGen"
-    ] === gen
-  );
-}
-
-interface OpContext {
-  p: Paths;
-  auth: RemoteAuth;
-  hmac: string;
-  token: string | null;
-  store: ReplayStore;
-  inbound: InboundMeta;
-}
-
-async function respond(
-  ctx: OpContext,
-  payload: {
-    requestId?: string;
-    ok: boolean;
-    body?: unknown;
-    error?: string;
-    message?: string;
-  },
-): Promise<void> {
-  if (!ctx.token) {
-    ctx.store.recordError("respond", "no_server_bot_token");
-    return;
-  }
-  const wire = encodeResponse(
-    {
-      requestId: payload.requestId,
-      ok: payload.ok,
-      body: payload.body,
-      error: payload.error,
-      message: payload.message,
-    },
-    ctx.hmac,
-  );
-  const sent = await sendTelegram(
-    ctx.token,
-    ctx.inbound.chatId,
-    wire,
-    ctx.inbound.messageId,
-  );
-  if (!sent) ctx.store.recordError("respond", "sendMessage_failed");
-}
-
-async function handleVerifiedOp(
-  ctx: OpContext,
-  env: Record<string, unknown>,
-): Promise<void> {
-  const op = env["op"] as RemoteOp;
-  const requestId =
-    typeof env["requestId"] === "string"
-      ? (env["requestId"] as string)
-      : undefined;
-  const now = Math.floor(Date.now() / 1000);
-
-  if (op === "ping") {
-    ctx.store.recordUpdate({ at: now, op, ok: true });
-    await respond(ctx, {
-      requestId,
-      ok: true,
-      body: { pong: true },
-      message: "pong",
-    });
-    return;
-  }
-  if (op === "get_status") {
-    try {
-      const status = await collectStatus(ctx.p, ctx.store);
-      ctx.store.recordUpdate({ at: now, op, ok: true });
-      await respond(ctx, {
-        requestId,
-        ok: true,
-        body: status,
-        message: statusText(status),
-      });
-    } catch (err) {
-      const message = err instanceof Error ? err.message : "status_failed";
-      ctx.store.recordUpdate({ at: now, op, ok: false, error: message });
-      await respond(ctx, {
-        requestId,
-        ok: false,
-        error: "status_failed",
-        message,
-      });
-    }
-    return;
-  }
-
-  // Mutating ops honor the core master switches.
-  const core = registry.get("core");
-  const coreCfg = core
-    ? readModuleConfig(ctx.p, core.def)
-    : { remoteControlEnabled: true, maintenanceMode: false };
-  if (coreCfg["remoteControlEnabled"] === false) {
-    ctx.store.recordUpdate({
-      at: now,
-      op,
-      ok: false,
-      error: "remote_disabled",
-    });
-    await respond(ctx, {
-      requestId,
-      ok: false,
-      error: "remote_disabled",
-      message: "Remote control is disabled (core.remoteControlEnabled=false).",
-    });
-    return;
-  }
-  if (coreCfg["maintenanceMode"] === true) {
-    ctx.store.recordUpdate({ at: now, op, ok: false, error: "maintenance" });
-    await respond(ctx, {
-      requestId,
-      ok: false,
-      error: "maintenance",
-      message: "Server is in maintenance mode.",
-    });
-    return;
-  }
-
-  if (op === "set_config") {
-    const module = env["module"];
-    if (!isValidModuleName(module) || !registry.has(module)) {
-      ctx.store.recordUpdate({
-        at: now,
-        op,
-        module: typeof module === "string" ? module : "?",
-        ok: false,
-        error: "unknown_module",
-      });
-      await respond(ctx, {
-        requestId,
-        ok: false,
-        error: "unknown_module",
-        message: `Unknown module. Registered: ${[...registry.keys()].join(", ")}`,
-      });
-      return;
-    }
-    try {
-      const { config } = applyModulePatch(ctx.p, module, env["patch"]);
-      const runtime = registry.get(module);
-      try {
-        await runtime?.onConfigApplied?.(config);
-      } catch (err) {
-        ctx.store.recordError(
-          "onConfigApplied",
-          err instanceof Error ? err.message : "hook_failed",
-        );
-      }
-      ctx.store.recordUpdate({ at: now, op, module, ok: true });
-      await respond(ctx, {
-        requestId,
-        ok: true,
-        body: { module, config },
-        message: `✅ ${module} updated: ${JSON.stringify(config)}`,
-      });
-    } catch (err) {
-      const message = err instanceof Error ? err.message : "apply_failed";
-      ctx.store.recordUpdate({
-        at: now,
-        op,
-        module,
-        ok: false,
-        error: message,
-      });
-      await respond(ctx, {
-        requestId,
-        ok: false,
-        error: "invalid_patch",
-        message: `Refused: ${message}`,
-      });
-    }
-    return;
-  }
-
-  if (op === "service") {
-    const service = env["service"];
-    const action = env["action"];
-    if (
-      typeof service !== "string" ||
-      !(ctx.auth.allowedServices ?? []).includes(service)
-    ) {
-      ctx.store.recordUpdate({
-        at: now,
-        op,
-        ok: false,
-        error: "service_not_allowed",
-      });
-      await respond(ctx, {
-        requestId,
-        ok: false,
-        error: "service_not_allowed",
-        message: `Service not allowed. Allowed: ${(ctx.auth.allowedServices ?? []).join(", ")}`,
-      });
-      return;
-    }
-    if (action === "status") {
-      const list = await pm2List();
-      const found = list.find((s) => String(s["name"]) === service);
-      const pm2Env = found?.["pm2_env"] as Record<string, unknown> | undefined;
-      const status =
-        typeof pm2Env?.["status"] === "string" ? pm2Env["status"] : "unknown";
-      ctx.store.recordUpdate({ at: now, op, ok: true });
-      await respond(ctx, {
-        requestId,
-        ok: true,
-        body: { service, status },
-        message: `${service}: ${status}`,
-      });
-      return;
-    }
-    if (action === "restart") {
-      const out = await runCmd("pm2", ["restart", service], 30000);
-      const ok = out !== null;
-      ctx.store.recordUpdate({
-        at: now,
-        op,
-        ok,
-        error: ok ? undefined : "restart_failed",
-      });
-      await respond(ctx, {
-        requestId,
-        ok,
-        body: { service, restarted: ok },
-        error: ok ? undefined : "restart_failed",
-        message: ok
-          ? `🔄 ${service} restart requested`
-          : `Restart of ${service} failed`,
-      });
-      return;
-    }
-    ctx.store.recordUpdate({ at: now, op, ok: false, error: "bad_action" });
-    await respond(ctx, {
-      requestId,
-      ok: false,
-      error: "bad_action",
-      message: "Action must be status|restart.",
-    });
-    return;
-  }
-
-  ctx.store.recordUpdate({
-    at: now,
-    op: String(env["op"]),
-    ok: false,
-    error: "bad_op",
-  });
-  await respond(ctx, {
-    requestId,
-    ok: false,
-    error: "bad_op",
-    message: "Unknown operation.",
-  });
-}
-
-function makeRemoteHandler(gen: number): TelegramUpdateHandler {
-  return async (update) => {
-    if (!isCurrentGeneration(gen)) return "pass";
-    const inbound = extractInbound(update);
-    if (!inbound) return "pass";
-    if (!inbound.text.startsWith(REMOTE_PREFIX + " ")) return "pass";
-
-    // From here on: ALWAYS consume. An invalid prefixed message must never
-    // become a normal LLM prompt.
-    try {
-      const p = paths();
-      const auth = loadAuth(p);
-      const hmac = readSecretFile(p.hmacFile);
-      if (!auth || !hmac) {
-        // Configured later via setup; swallow quietly (no token to reply with).
-        return "consume";
-      }
-      const store = new ReplayStore(
-        p.stateFile,
-        (auth.maxSkewSeconds ?? 300) * 2,
-      );
-      const token = loadServerBotToken(p);
-      const ctx: OpContext = { p, auth, hmac, token, store, inbound };
-
-      if (inbound.fromId !== auth.allowedControlBotId) {
-        store.recordUpdate({
-          at: Math.floor(Date.now() / 1000),
-          op: "rejected",
-          ok: false,
-          error: "bad_sender",
-        });
-        return "consume"; // silent: do not confirm anything to strangers
-      }
-      if (
-        auth.controlChatId !== undefined &&
-        inbound.chatId !== auth.controlChatId
-      ) {
-        store.recordUpdate({
-          at: Math.floor(Date.now() / 1000),
-          op: "rejected",
-          ok: false,
-          error: "bad_chat",
-        });
-        return "consume";
-      }
-
-      const verified = verifySignedText(inbound.text, REMOTE_PREFIX, {
-        secret: hmac,
-        maxSkewSeconds: auth.maxSkewSeconds ?? 300,
-      });
-      if (!verified.ok) {
-        store.recordUpdate({
-          at: Math.floor(Date.now() / 1000),
-          op: "rejected",
-          ok: false,
-          error: verified.error,
-        });
-        await respond(ctx, {
-          ok: false,
-          error: verified.error,
-          message: `Remote message rejected: ${verified.error}`,
-        });
-        return "consume";
-      }
-      const env = verified.payload;
-      const now = Math.floor(Date.now() / 1000);
-      const nonce = env["nonce"] as string;
-      if (store.has(nonce, now)) {
-        store.recordUpdate({
-          at: now,
-          op: "rejected",
-          ok: false,
-          error: "replay",
-        });
-        await respond(ctx, {
-          requestId:
-            typeof env["requestId"] === "string" ? env["requestId"] : undefined,
-          ok: false,
-          error: "replay",
-          message: "Duplicate message (replay). Ignored.",
-        });
-        return "consume";
-      }
-      store.add(nonce, env["ts"] as number, now);
-
-      if (!isRemoteOp(env["op"])) {
-        store.recordUpdate({
-          at: now,
-          op: "rejected",
-          ok: false,
-          error: "bad_op",
-        });
-        await respond(ctx, {
-          requestId:
-            typeof env["requestId"] === "string" ? env["requestId"] : undefined,
-          ok: false,
-          error: "bad_op",
-          message: "Unknown operation.",
-        });
-        return "consume";
-      }
-      await handleVerifiedOp(ctx, env);
-    } catch (err) {
-      try {
-        const p = paths();
-        new ReplayStore(p.stateFile, 600).recordError(
-          "remote_handler",
-          err instanceof Error ? err.message : "unknown",
-        );
-      } catch {
-        // last resort: never throw out of a Telegram handler
-      }
-    }
-    return "consume";
-  };
 }
 
 /* ------------------------------------------------------------------ */
@@ -903,19 +295,30 @@ const PatchSchema = Type.Record(
   Type.Union([Type.String(), Type.Number(), Type.Boolean()]),
 );
 
+async function runEnabledHook(
+  name: string,
+  enabled: boolean,
+  config: Record<string, PatchValue>,
+): Promise<string | null> {
+  try {
+    await registry.get(name)?.onEnabledChange?.(enabled, config);
+    return null;
+  } catch (err) {
+    return err instanceof Error ? err.message : "hook_failed";
+  }
+}
+
 export default function remoteConfigExtension(pi: ExtensionAPI): void {
-  const gen = currentGeneration();
   for (const def of BUILTIN_MODULES) {
     if (!registry.has(def.name)) registerRemoteModule({ def });
   }
-  attachUpdateHandler(makeRemoteHandler(gen));
 
   pi.on("session_start", async (_event, ctx) => {
     try {
       const p = paths();
       ensureDir(p.configDir, 0o700);
       for (const runtime of registry.values()) {
-        const file = configPathFor(p, runtime.def);
+        const file = configPathFor(p.configDir, runtime.def);
         if (!existsSync(file))
           atomicWriteJson(file, runtime.def.defaults, 0o600);
       }
@@ -936,7 +339,8 @@ export default function remoteConfigExtension(pi: ExtensionAPI): void {
     label: "Server Config",
     description:
       "Inspect or change whitelisted settings of registered server modules (e.g. core, example-monitor). " +
-      "Actions: list (show modules + current values), get (one module), set (apply a patch of KNOWN fields only; unknown fields, wrong types and out-of-range values are rejected).",
+      "Actions: list (show modules + current values), get (one module), set (apply a patch of KNOWN fields only; unknown fields, wrong types and out-of-range values are rejected). " +
+      "To enable/disable a module, set its \"enabled\" field (e.g. {enabled:false}).",
     promptSnippet:
       "server_config lists/gets/sets whitelisted module settings on this server node",
     promptGuidelines: [
@@ -959,12 +363,16 @@ export default function remoteConfigExtension(pi: ExtensionAPI): void {
       const p = paths();
       const action = params.action as "list" | "get" | "set";
       if (action === "list") {
-        const mods = [...registry.values()].map((r) => ({
-          name: r.def.name,
-          description: r.def.description,
-          config: readModuleConfig(p, r.def),
-          fields: r.def.schema,
-        }));
+        const mods = [...registry.values()].map((r) => {
+          const config = readModuleConfigFile(p.configDir, r.def);
+          return {
+            name: r.def.name,
+            description: r.def.description,
+            config,
+            enabled: enabledOf(r.def, config),
+            fields: r.def.schema,
+          };
+        });
         return {
           content: [
             {
@@ -992,9 +400,11 @@ export default function remoteConfigExtension(pi: ExtensionAPI): void {
           details: { error: "unknown_module" },
         };
       }
+      const runtime = registry.get(name);
       if (action === "get") {
-        const runtime = registry.get(name);
-        const config = runtime ? readModuleConfig(p, runtime.def) : {};
+        const config = runtime
+          ? readModuleConfigFile(join(p.configDir), runtime.def)
+          : {};
         return {
           content: [
             { type: "text", text: `${name}: ${JSON.stringify(config)}` },
@@ -1016,6 +426,28 @@ export default function remoteConfigExtension(pi: ExtensionAPI): void {
             ],
             details: { module: name, config, hookError: true },
           };
+        }
+        const patchObj = (params.patch ?? {}) as Record<string, unknown>;
+        if (
+          typeof patchObj["enabled"] === "boolean" &&
+          runtime?.def.schema["enabled"]?.type === "boolean"
+        ) {
+          const hookErr = await runEnabledHook(
+            name,
+            patchObj["enabled"] as boolean,
+            config,
+          );
+          if (hookErr) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `${name} saved but enable/disable hook failed: ${hookErr}`,
+                },
+              ],
+              details: { module: name, config, hookError: true },
+            };
+          }
         }
         return {
           content: [
@@ -1040,11 +472,11 @@ export default function remoteConfigExtension(pi: ExtensionAPI): void {
     name: "server_status",
     label: "Server Status",
     description:
-      "Report this server node's health: online state, OS/Pi uptime, Node/Pi/pi-telegram versions, PM2 processes, memory, registered modules with their essential config, last remote update and last known error. Use it when the user asks how the server is doing.",
+      "Report this server node's health: online state, hostname, uptimes, Node/Pi/pi-telegram versions, memory, registered modules with their essential config, last remote request and last known error. Use it when the user asks how the server is doing.",
     promptSnippet:
-      "server_status reports this node health: uptime, versions, PM2, memory, modules, last remote update",
+      "server_status reports this node health: uptime, versions, memory, modules, last remote request",
     promptGuidelines: [
-      "Use server_status for any 'how is the server / stato server / are services running' question before answering from memory.",
+      "Use server_status for any 'how is the server / server status / are services running' question before answering from memory.",
     ],
     parameters: Type.Object({}),
     async execute(): Promise<TextResult> {
@@ -1074,7 +506,7 @@ export default function remoteConfigExtension(pi: ExtensionAPI): void {
     name: "service_control",
     label: "Service Control",
     description:
-      "Query or restart an explicitly allowed local service via PM2 (e.g. pi-server). Actions: status, restart. Only service names listed in remote-auth.json allowedServices are accepted; anything else is refused. This is NOT a shell: no commands, paths or scripts can be passed.",
+      "Query or restart an explicitly allowed local service via PM2 (e.g. pi-server). Actions: status, restart. Only service names listed in remote-server.json allowedServices are accepted; anything else is refused. This is NOT a shell: no commands, paths or scripts can be passed.",
     promptSnippet:
       "service_control checks/restarts explicitly allowed PM2 services only",
     promptGuidelines: [
@@ -1088,8 +520,7 @@ export default function remoteConfigExtension(pi: ExtensionAPI): void {
     }),
     async execute(_toolCallId, params): Promise<TextResult> {
       const p = paths();
-      const auth = loadAuth(p);
-      const allowed = auth?.allowedServices ?? ["pi-server"];
+      const allowed = loadAllowedServices(p);
       const service = params.service as string;
       const action = params.action as "status" | "restart";
       if (!allowed.includes(service)) {
@@ -1127,7 +558,9 @@ export default function remoteConfigExtension(pi: ExtensionAPI): void {
           details: { error: "restart_failed" },
         };
       return {
-        content: [{ type: "text", text: `🔄 ${service} restart requested.` }],
+        content: [
+          { type: "text", text: `🔄 ${service} restart requested.` },
+        ],
         details: { service, restarted: true },
       };
     },

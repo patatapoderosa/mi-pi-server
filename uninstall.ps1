@@ -75,6 +75,7 @@ try {
   Write-Host "     PI HOME SERVER UNINSTALL" -ForegroundColor Cyan
   Write-Host "====================================" -ForegroundColor Cyan
 
+  $task2 = Get-ScheduledTask -TaskName "PiRemoteServer" -ErrorAction SilentlyContinue
   $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
   if ($null -ne $task) {
     Write-Host "Fermo il task $TaskName..."
@@ -90,6 +91,22 @@ try {
     } catch { }
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
     Write-Host "Task rimosso." -ForegroundColor Green
+  if ($null -ne $task2) {
+    Write-Host "Fermo il task PiRemoteServer..."
+    try { Stop-ScheduledTask -TaskName "PiRemoteServer" -ErrorAction SilentlyContinue } catch { }
+    Start-Sleep -Seconds 3
+    try {
+      Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -match "pi-remote-server" } |
+        ForEach-Object {
+          try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch { }
+        }
+    } catch { }
+    Unregister-ScheduledTask -TaskName "PiRemoteServer" -Confirm:$false
+    Write-Host "Task PiRemoteServer rimosso." -ForegroundColor Green
+  } else {
+    Write-Host "Task PiRemoteServer assente (niente da fermare)."
+  }
   } else {
     Write-Host "Task $TaskName assente (niente da fermare)."
   }

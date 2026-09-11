@@ -7,7 +7,21 @@
  *
  * The model can only send { module, patch } with KNOWN fields; unknown
  * fields, wrong types and out-of-range values are rejected before any write.
+ *
+ * File helpers below take an EXPLICIT config dir and a validated definition,
+ * so both the Pi extension (in-process) and the standalone HTTP remote daemon
+ * share one validation + write path. There is deliberately no way to address
+ * an arbitrary file: the file name always comes from the registered def.
  */
+import { join } from "node:path";
+import { existsSync } from "node:fs";
+import {
+  atomicWriteJson,
+  backupFile,
+  ensureDir,
+  readJsonFile,
+} from "./store.ts";
+
 export type FieldType = "boolean" | "integer" | "number" | "string";
 export type PatchValue = string | number | boolean;
 
@@ -31,6 +45,28 @@ export interface ModuleDefinition {
   schema: Record<string, FieldSchema>;
   /** Services this module is allowed to inspect via service_control. */
   services?: string[];
+}
+
+/**
+ * Runtime registration for in-process companions (Pi extension side).
+ * The HTTP daemon cannot run these hooks (separate process): it only reads
+ * and writes the same config files through the helpers below.
+ */
+export interface ModuleRuntime {
+  def: ModuleDefinition;
+  /** Called after a config file was applied. Throwing is caught and reported. */
+  onConfigApplied?: (
+    config: Record<string, PatchValue>,
+  ) => void | Promise<void>;
+  /** Called after an enable/disable flip was applied. */
+  onEnabledChange?: (
+    enabled: boolean,
+    config: Record<string, PatchValue>,
+  ) => void | Promise<void>;
+  /** Extra status rows merged into server_status output. */
+  getStatus?: () =>
+    | Record<string, PatchValue | string>
+    | Promise<Record<string, PatchValue | string>>;
 }
 
 export function isValidModuleName(name: unknown): name is string {
@@ -133,6 +169,67 @@ function checkField(
   }
 }
 
+/** Effective on/off state. Null when the module has no boolean "enabled" field. */
+export function enabledOf(
+  def: ModuleDefinition,
+  config: Record<string, PatchValue>,
+): boolean | null {
+  const field = def.schema["enabled"];
+  if (!field || field.type !== "boolean") return null;
+  const v = config["enabled"] ?? def.defaults["enabled"];
+  return typeof v === "boolean" ? v : null;
+}
+
+/** Config file path. The file name ALWAYS comes from the registered def. */
+export function configPathFor(
+  configDir: string,
+  def: ModuleDefinition,
+): string {
+  return join(configDir, def.configFile);
+}
+
+/** Read + sanitize a module config (defaults + known on-disk fields). */
+export function readModuleConfigFile(
+  configDir: string,
+  def: ModuleDefinition,
+): Record<string, PatchValue> {
+  const current = readJsonFile<Record<string, unknown>>(
+    configPathFor(configDir, def),
+    {},
+  );
+  const merged: Record<string, PatchValue> = { ...def.defaults };
+  for (const [k, v] of Object.entries(current)) {
+    if (
+      k in def.schema &&
+      (typeof v === "string" || typeof v === "number" || typeof v === "boolean")
+    )
+      merged[k] = v;
+  }
+  return merged;
+}
+
+/**
+ * Validate + backup + atomically write a module config.
+ * Shared by the Pi extension and the HTTP remote daemon.
+ */
+export function applyModulePatchFile(
+  configDir: string,
+  def: ModuleDefinition,
+  patch: unknown,
+): { config: Record<string, PatchValue>; backup: string | null } {
+  const current = readJsonFile<Record<string, unknown>>(
+    configPathFor(configDir, def),
+    {},
+  );
+  const result = validatePatch(def, current, patch);
+  if (!result.ok) throw new Error(`invalid_patch:${result.errors.join(",")}`);
+  const file = configPathFor(configDir, def);
+  ensureDir(configDir, 0o700);
+  const backup = existsSync(file) ? backupFile(file) : null;
+  atomicWriteJson(file, result.merged, 0o600);
+  return { config: result.merged ?? {}, backup };
+}
+
 /** Built-in modules shipped with pi-remote-config. */
 export const BUILTIN_MODULES: ModuleDefinition[] = [
   {
@@ -145,7 +242,7 @@ export const BUILTIN_MODULES: ModuleDefinition[] = [
       maintenanceMode: {
         type: "boolean",
         description:
-          "When true, set_config ops are refused (status/ping still answer).",
+          "When true, mutating remote ops are refused (status/ping still answer).",
       },
       remoteControlEnabled: {
         type: "boolean",

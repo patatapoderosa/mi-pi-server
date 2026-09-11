@@ -2,19 +2,17 @@
  * pi-remote — Mac-side Pi extension.
  *
  * Registers tools the Mac agent uses AUTONOMOUSLY when the user speaks about
- * the server in natural language ("cambia l'intervallo sul server a 30
- * minuti", "dammi lo stato del server", ...). The user never types commands.
+ * the server in natural language ("set the interval on the server to 30
+ * minutes", "server status", ...). The user never types commands.
  *
- * Transport (verified Bot API reality): Telegram bots cannot DM each other,
- * so the Mac posts a signed envelope into the PRIVATE control group with the
- * ControlBot token over plain HTTPS (sendMessage). The server's ServerBot
- * observes it through pi-telegram's single getUpdates loop and replies in
- * the same chat. This extension then waits for the correlated reply with a
- * SHORT-LIVED getUpdates poll on the ControlBot token (nothing else polls
- * that bot, so there is no polling conflict).
+ * Transport: plain HTTPS-style fetch() to the Windows box over Tailscale
+ * (WireGuard encrypts the wire). Every request carries HMAC-SHA256 auth
+ * headers (X-Pi-Timestamp / X-Pi-Nonce / X-Pi-Signature) over
+ * METHOD + LF + PATH + LF + TS + LF + NONCE + LF + SHA256(body).
+ * See shared/protocol.ts. Telegram is NOT involved anymore.
  *
- * Secrets (ControlBot token, HMAC) live in macOS Keychain — never in files,
- * never in logs. Only non-sensitive routing lives in remote-server.json.
+ * Secrets: only the HMAC lives in macOS Keychain — never in files, never in
+ * logs. Routing (serverBaseUrl) lives in remote-server.json (non-sensitive).
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -23,10 +21,9 @@ import { promisify } from "node:util";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import {
-  RESPONSE_PREFIX,
   createNonce,
-  encodeEnvelope,
-  verifySignedText,
+  sha256Hex,
+  signRequest,
 } from "../../shared/protocol.ts";
 import { readJsonFile } from "../../shared/store.ts";
 
@@ -34,12 +31,10 @@ const execFileAsync = promisify(execFile);
 const LOG = "[pi-remote]";
 
 interface MacConfig {
-  controlChatId: number;
+  serverBaseUrl: string;
   keychainAccount: string;
-  controlBotTokenService: string;
   hmacService: string;
-  serverBotUsername?: string;
-  responseTimeoutSeconds?: number;
+  timeoutSeconds?: number;
 }
 
 function macConfigPath(): string {
@@ -51,27 +46,28 @@ function macConfigPath(): string {
   return join(agentDir, "remote-server.json");
 }
 
+function normalizeBaseUrl(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  const v = raw.trim().replace(/\/+$/, "");
+  if (!/^https?:\/\/[^\s/]+(:\d+)?$/.test(v)) return null;
+  return v;
+}
+
 function loadMacConfig(): MacConfig | null {
   const raw = readJsonFile<Partial<MacConfig> | null>(macConfigPath(), null);
-  if (!raw || typeof raw.controlChatId !== "number") return null;
+  if (!raw) return null;
+  const serverBaseUrl = normalizeBaseUrl(raw.serverBaseUrl);
+  if (!serverBaseUrl) return null;
   return {
-    controlChatId: raw.controlChatId,
+    serverBaseUrl,
     keychainAccount:
       typeof raw.keychainAccount === "string" ? raw.keychainAccount : "default",
-    controlBotTokenService:
-      typeof raw.controlBotTokenService === "string"
-        ? raw.controlBotTokenService
-        : "pi-remote-control-bot",
     hmacService:
       typeof raw.hmacService === "string" ? raw.hmacService : "pi-remote-hmac",
-    serverBotUsername:
-      typeof raw.serverBotUsername === "string"
-        ? raw.serverBotUsername
-        : undefined,
-    responseTimeoutSeconds:
-      typeof raw.responseTimeoutSeconds === "number"
-        ? Math.min(180, Math.max(30, raw.responseTimeoutSeconds))
-        : 90,
+    timeoutSeconds:
+      typeof raw.timeoutSeconds === "number"
+        ? Math.min(120, Math.max(5, raw.timeoutSeconds))
+        : 30,
   };
 }
 
@@ -93,166 +89,97 @@ async function readKeychain(service: string, account: string): Promise<string> {
   }
 }
 
-async function telegramApi<T>(
-  token: string,
-  method: string,
-  params: Record<string, unknown>,
-  timeoutMs: number,
-): Promise<T> {
-  const res = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(params),
-    signal: AbortSignal.timeout(timeoutMs),
-  });
-  if (!res.ok) throw new Error(`telegram_${method}_http_${res.status}`);
-  const data = (await res.json()) as {
-    ok?: boolean;
-    result?: T;
-    description?: string;
-  };
-  if (!data.ok)
-    throw new Error(
-      `telegram_${method}_failed:${(data.description ?? "unknown").slice(0, 120)}`,
-    );
-  return data.result as T;
-}
-
-interface TgUpdate {
-  update_id: number;
-  message?: {
-    message_id?: number;
-    text?: string;
-    chat?: { id?: number };
-    from?: { id?: number };
-  };
+interface ServerReply {
+  ok: boolean;
+  body?: unknown;
+  error?: string;
+  message?: string;
 }
 
 /**
- * Wait for the server's signed reply correlated by requestId.
- * Short-lived long-polling on the ControlBot token; exits on match/timeout
- * so there is never a second permanent polling loop.
+ * One signed request to the remote daemon. Throws on transport errors
+ * (server offline, timeout); returns the decoded envelope otherwise.
  */
-async function awaitResponse(opts: {
-  token: string;
-  hmac: string;
-  requestId: string;
-  timeoutMs: number;
-  startAfter: number;
-}): Promise<{ ok: boolean; body?: unknown; error?: string; message?: string }> {
-  const deadline = Date.now() + opts.timeoutMs;
-  let offset = opts.startAfter;
-  while (Date.now() < deadline) {
-    const waitSec = Math.max(
-      1,
-      Math.min(30, Math.ceil((deadline - Date.now()) / 1000)),
-    );
-    const updates = await telegramApi<TgUpdate[]>(
-      opts.token,
-      "getUpdates",
-      { offset, limit: 20, timeout: waitSec },
-      (waitSec + 15) * 1000,
-    ).catch(() => [] as TgUpdate[]);
-    for (const u of updates) {
-      offset = Math.max(offset, (u.update_id ?? 0) + 1);
-      const text = u.message?.text;
-      if (typeof text !== "string" || !text.startsWith(RESPONSE_PREFIX + " "))
-        continue;
-      const verified = verifySignedText(text, RESPONSE_PREFIX, {
-        secret: opts.hmac,
-        checkEnvelope: false,
-      });
-      if (!verified.ok) continue;
-      const payload = verified.payload;
-      if (payload["requestId"] !== opts.requestId) continue;
-      return {
-        ok: payload["ok"] === true,
-        body: payload["body"],
-        error:
-          typeof payload["error"] === "string" ? payload["error"] : undefined,
-        message:
-          typeof payload["message"] === "string"
-            ? payload["message"]
-            : undefined,
-      };
-    }
-  }
-  throw new Error("response_timeout");
-}
-
-interface RemoteCall {
-  cfg: MacConfig;
-  token: string;
-  hmac: string;
-}
-
-/** Result envelope returned to the model (never contains secrets). */
-interface CallResult {
-  text: string;
-  details: Record<string, unknown>;
-}
-
-async function setupCall(): Promise<RemoteCall> {
-  const cfg = loadMacConfig();
-  if (!cfg)
-    throw new Error(`Missing ${macConfigPath()}. Run mac/setup-mac.sh first.`);
-  const [token, hmac] = await Promise.all([
-    readKeychain(cfg.controlBotTokenService, cfg.keychainAccount),
-    readKeychain(cfg.hmacService, cfg.keychainAccount),
-  ]);
-  return { cfg, token, hmac };
-}
-
-/**
- * Send a signed envelope to the control group and wait for the correlated
- * server reply. Both directions are HMAC-verified; secrets never leave
- * Keychain/HTTPS except inside the HMAC computation.
- */
-export async function remoteCall(
-  op: "set_config" | "get_status" | "ping",
-  fields: Record<string, unknown>,
+async function remoteCall(
+  cfg: MacConfig,
+  hmac: string,
+  method: "GET" | "PATCH" | "POST",
+  path: string,
+  body: unknown,
   timeoutOverrideSec?: number,
-): Promise<CallResult> {
-  const { cfg, token, hmac } = await setupCall();
-  const requestId = `mac-${Date.now().toString(36)}-${createNonce().slice(0, 8)}`;
-  // Pin the inbox cursor BEFORE sending: a fast server reply must not be skipped.
-  const seen = await telegramApi<TgUpdate[]>(
-    token,
-    "getUpdates",
-    { limit: 1, timeout: 0 },
-    20000,
-  ).catch(() => [] as TgUpdate[]);
-  const startAfter =
-    seen.length > 0 ? (seen[seen.length - 1]?.update_id ?? 0) + 1 : 1;
-  const wire = encodeEnvelope(
-    { op, requestId, ...fields } as Parameters<typeof encodeEnvelope>[0],
-    hmac,
-  );
-  await telegramApi(
-    token,
-    "sendMessage",
-    { chat_id: cfg.controlChatId, text: wire, disable_notification: true },
-    20000,
-  );
-  const timeoutMs =
-    (timeoutOverrideSec ?? cfg.responseTimeoutSeconds ?? 90) * 1000;
-  const resp = await awaitResponse({
-    token,
-    hmac,
-    requestId,
-    timeoutMs,
-    startAfter,
+): Promise<ServerReply> {
+  const rawBody = body === undefined ? "" : JSON.stringify(body);
+  const ts = Math.floor(Date.now() / 1000);
+  const nonce = createNonce();
+  const signature = signRequest(hmac, {
+    method,
+    path,
+    ts,
+    nonce,
+    bodyHash: sha256Hex(rawBody),
   });
-  if (resp.ok) {
+  const timeoutMs =
+    (timeoutOverrideSec ?? cfg.timeoutSeconds ?? 30) * 1000;
+  let res: Response;
+  try {
+    res = await fetch(cfg.serverBaseUrl + path, {
+      method,
+      headers: {
+        "content-type": "application/json",
+        "x-pi-timestamp": String(ts),
+        "x-pi-nonce": nonce,
+        "x-pi-signature": signature,
+      },
+      body: method === "GET" ? undefined : rawBody,
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "fetch_failed";
+    if (/aborted|timeout/i.test(message)) {
+      throw new Error(
+        `server unreachable (timeout after ${Math.round(timeoutMs / 1000)}s): is Tailscale up and the daemon online?`,
+      );
+    }
+    throw new Error(
+      `server unreachable (${message}): is Tailscale up and the daemon online?`,
+    );
+  }
+  let data: Record<string, unknown>;
+  try {
+    data = (await res.json()) as Record<string, unknown>;
+  } catch {
+    throw new Error(`server returned HTTP ${res.status} with a non-JSON body`);
+  }
+  if (!res.ok || data["ok"] !== true) {
+    const error =
+      typeof data["error"] === "string" ? data["error"] : `http_${res.status}`;
+    const message =
+      typeof data["message"] === "string" ? data["message"] : undefined;
     return {
-      text: resp.message ?? "✅ Server confirmed.",
-      details: { ok: true, requestId, body: resp.body ?? null },
+      ok: false,
+      error,
+      message,
+      body: data["body"],
     };
   }
   return {
-    text: `❌ Server refused: ${resp.error ?? "unknown"}${resp.message ? ` — ${resp.message}` : ""}`,
-    details: { ok: false, requestId, error: resp.error },
+    ok: true,
+    body: data["body"],
+    message: typeof data["message"] === "string" ? data["message"] : undefined,
   };
+}
+
+interface Ctx2 {
+  cfg: MacConfig;
+  hmac: string;
+}
+
+async function setupCall(): Promise<Ctx2> {
+  const cfg = loadMacConfig();
+  if (!cfg)
+    throw new Error(`Missing ${macConfigPath()}. Run mac/setup-mac.sh first.`);
+  const hmac = await readKeychain(cfg.hmacService, cfg.keychainAccount);
+  return { cfg, hmac };
 }
 
 interface TextResult {
@@ -260,9 +187,33 @@ interface TextResult {
   details: Record<string, unknown>;
 }
 
+function failResult(prefix: string, err: unknown): TextResult {
+  const message = err instanceof Error ? err.message : "remote_call_failed";
+  return {
+    content: [{ type: "text", text: `❌ ${prefix}: ${message}` }],
+    details: { ok: false, error: message },
+  };
+}
+
+function summarizeModules(body: unknown): string {
+  const mods = (body as { modules?: Array<{ name: string; enabled: boolean | null; config: unknown }> })
+    ?.modules;
+  if (!Array.isArray(mods)) return "No module list in reply.";
+  return mods
+    .map(
+      (m) =>
+        `- ${m.name}${m.enabled === null ? "" : m.enabled ? " (enabled)" : " (disabled)"}: ${JSON.stringify(m.config)}`,
+    )
+    .join("\n");
+}
+
 const SettingsSchema = Type.Record(
   Type.String(),
   Type.Union([Type.String(), Type.Number(), Type.Boolean()]),
+);
+
+const TimeoutSchema = Type.Optional(
+  Type.Number({ description: "Request timeout, 5-120s. Default 30." }),
 );
 
 export default function piRemoteExtension(pi: ExtensionAPI): void {
@@ -270,13 +221,10 @@ export default function piRemoteExtension(pi: ExtensionAPI): void {
     try {
       const cfg = loadMacConfig();
       if (!cfg) {
-        ctx.ui.notify(
-          `${LOG} not configured yet — run mac/setup-mac.sh`,
-          "warning",
-        );
+        ctx.ui.notify(`${LOG} not configured yet — run mac/setup-mac.sh`, "warning");
         return;
       }
-      ctx.ui.notify(`${LOG} ready (control chat configured)`, "info");
+      ctx.ui.notify(`${LOG} ready (${cfg.serverBaseUrl})`, "info");
     } catch (err) {
       ctx.ui.notify(
         `${LOG} init failed: ${err instanceof Error ? err.message : "unknown"}`,
@@ -286,19 +234,71 @@ export default function piRemoteExtension(pi: ExtensionAPI): void {
   });
 
   pi.registerTool({
+    name: "remote_server_status",
+    label: "Remote Server Status",
+    description:
+      "Ask the 24/7 Pi server node (Windows, over Tailscale) how it is doing: online state, hostname, uptimes, versions, memory, active modules and their config, last remote request. " +
+      "Use this automatically when the user asks — in any language — about the server state: " +
+      "'server status', 'how is the server?', 'which modules are active?', 'stato server?'.",
+    promptSnippet:
+      "remote_server_status fetches live health from the 24/7 server node over Tailscale",
+    promptGuidelines: [
+      "Whenever the user asks about the server state, health, active modules or running services, call remote_server_status — do not answer from memory.",
+      "Summarize the reply in the user's language; include module configs and any reported error.",
+    ],
+    parameters: Type.Object({ timeoutSeconds: TimeoutSchema }),
+    executionMode: "sequential",
+    async execute(_toolCallId, params): Promise<TextResult> {
+      try {
+        const { cfg, hmac } = await setupCall();
+        const timeout =
+          typeof params.timeoutSeconds === "number"
+            ? Math.min(120, Math.max(5, params.timeoutSeconds))
+            : undefined;
+        const resp = await remoteCall(cfg, hmac, "GET", "/v1/status", undefined, timeout);
+        if (!resp.ok) {
+          return {
+            content: [
+              { type: "text", text: `❌ Server refused: ${resp.error ?? "unknown"}` },
+            ],
+            details: { ok: false, error: resp.error },
+          };
+        }
+        const body = resp.body as {
+          hostname?: string;
+          appVersion?: string;
+          osUptime?: string;
+          modules?: unknown;
+        };
+        const lines = [
+          `🟢 server online (${body.hostname ?? "?"} | app ${body.appVersion ?? "?"})`,
+          `os uptime: ${body.osUptime ?? "?"}`,
+          summarizeModules(resp.body),
+        ];
+        return {
+          content: [{ type: "text", text: lines.join("\n") }],
+          details: { ok: true, body: resp.body },
+        };
+      } catch (err) {
+        return failResult("Remote status failed", err);
+      }
+    },
+  });
+
+  pi.registerTool({
     name: "remote_server_config",
     label: "Remote Server Config",
     description:
-      "Change a setting on the 24/7 Pi server node (old PC) over Telegram. " +
-      "Use this automatically when the user asks — in any language — to change, enable, disable or tune something on the server: " +
-      "'cambia l'intervallo sul server a 30 minuti', 'disattiva il modulo X sul server', 'riattiva il monitor', " +
-      "'change the server interval to 30 minutes', 'disable module X on the server'. " +
+      "Change a setting on the 24/7 Pi server node (Windows, over Tailscale). " +
+      "Use this automatically when the user asks — in any language — to change or tune something on the server: " +
+      "'set the interval to 30 minutes', 'metti il modulo X ogni 30 minuti', 'change the server interval'. " +
       "Args: module (e.g. core, example-monitor) and settings (object with KNOWN fields only, e.g. {intervalMinutes: 30}). " +
-      "Only whitelisted fields of registered modules are accepted; anything else is refused by the server.",
+      "Only whitelisted fields of registered modules are accepted; anything else is refused by the server. " +
+      "To enable/disable a whole module, prefer remote_module_enable / remote_module_disable.",
     promptSnippet:
-      "remote_server_config changes whitelisted settings on the 24/7 server node via signed Telegram message",
+      "remote_server_config changes whitelisted settings on the 24/7 server node via signed HTTPS",
     promptGuidelines: [
-      "Whenever the user wants to change/enable/disable something ON THE SERVER, call remote_server_config with the right module and settings — do not ask for confirmation commands or slash commands.",
+      "Whenever the user wants to change or tune something ON THE SERVER, call remote_server_config with the right module and settings.",
       "Module names: core (maintenanceMode, remoteControlEnabled), example-monitor (enabled, intervalMinutes). Ask the user which module only if it is truly ambiguous.",
       "After the call, report the server confirmation (or refusal reason) in the user's language.",
     ],
@@ -307,85 +307,143 @@ export default function piRemoteExtension(pi: ExtensionAPI): void {
         description: "Server module name, e.g. core or example-monitor",
       }),
       settings: SettingsSchema,
-      timeoutSeconds: Type.Optional(
-        Type.Number({
-          description: "Reply wait timeout, 30-180s. Default 90.",
-        }),
-      ),
+      timeoutSeconds: TimeoutSchema,
     }),
     executionMode: "sequential",
     async execute(_toolCallId, params): Promise<TextResult> {
-      const module = params.module as string;
-      const settings = (params.settings ?? {}) as Record<
-        string,
-        string | number | boolean
-      >;
-      const timeout =
-        typeof params.timeoutSeconds === "number"
-          ? Math.min(180, Math.max(30, params.timeoutSeconds))
-          : undefined;
       try {
-        const result = await remoteCall(
-          "set_config",
-          { module, patch: settings },
+        const { cfg, hmac } = await setupCall();
+        const module = params.module as string;
+        const settings = (params.settings ?? {}) as Record<
+          string,
+          string | number | boolean
+        >;
+        const timeout =
+          typeof params.timeoutSeconds === "number"
+            ? Math.min(120, Math.max(5, params.timeoutSeconds))
+            : undefined;
+        const resp = await remoteCall(
+          cfg,
+          hmac,
+          "PATCH",
+          `/v1/modules/${encodeURIComponent(module)}/config`,
+          { patch: settings },
           timeout,
         );
-        return {
-          content: [{ type: "text", text: result.text }],
-          details: result.details,
-        };
-      } catch (err) {
-        const message =
-          err instanceof Error ? err.message : "remote_call_failed";
+        if (!resp.ok) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `❌ Server refused (${resp.error ?? "unknown"}): ${resp.message ?? "no detail"}`,
+              },
+            ],
+            details: { ok: false, error: resp.error },
+          };
+        }
+        const body = resp.body as { config?: unknown };
         return {
           content: [
-            { type: "text", text: `❌ Remote config failed: ${message}` },
+            {
+              type: "text",
+              text: `✅ ${module} updated: ${JSON.stringify(body.config ?? {})}`,
+            },
           ],
-          details: { ok: false, error: message },
+          details: { ok: true, body: resp.body },
         };
+      } catch (err) {
+        return failResult("Remote config failed", err);
       }
     },
   });
 
-  pi.registerTool({
-    name: "remote_server_status",
-    label: "Remote Server Status",
-    description:
-      "Ask the 24/7 Pi server node (old PC) how it is doing: online state, uptimes, versions, PM2 processes, memory, active modules and their config, last remote update. " +
-      "Use this automatically when the user asks — in any language — about the server state: " +
-      "'dammi lo stato del server', 'come sta il server?', 'quali moduli sono attivi?', 'are services running?', 'server status?'.",
-    promptSnippet:
-      "remote_server_status fetches live health from the 24/7 server node via signed Telegram request/response",
-    promptGuidelines: [
-      "Whenever the user asks about the server state, health, active modules or running services, call remote_server_status — do not answer from memory.",
-      "Summarize the reply in the user's language; include module configs and any reported error.",
-    ],
-    parameters: Type.Object({
-      timeoutSeconds: Type.Optional(
-        Type.Number({
-          description: "Reply wait timeout, 30-180s. Default 90.",
-        }),
-      ),
-    }),
-    executionMode: "sequential",
-    async execute(): Promise<TextResult> {
-      try {
-        const timeout = undefined; // default from config
-        const result = await remoteCall("get_status", {}, timeout);
-        return {
-          content: [{ type: "text", text: result.text }],
-          details: result.details,
-        };
-      } catch (err) {
-        const message =
-          err instanceof Error ? err.message : "remote_call_failed";
+  async function toggleModule(
+    module: string,
+    want: boolean,
+    timeout?: number,
+  ): Promise<TextResult> {
+    try {
+      const { cfg, hmac } = await setupCall();
+      const resp = await remoteCall(
+        cfg,
+        hmac,
+        "POST",
+        `/v1/modules/${encodeURIComponent(module)}/${want ? "enable" : "disable"}`,
+        {},
+        timeout,
+      );
+      if (!resp.ok) {
         return {
           content: [
-            { type: "text", text: `❌ Remote status failed: ${message}` },
+            {
+              type: "text",
+              text: `❌ Server refused (${resp.error ?? "unknown"}): ${resp.message ?? "no detail"}`,
+            },
           ],
-          details: { ok: false, error: message },
+          details: { ok: false, error: resp.error },
         };
       }
+      return {
+        content: [
+          {
+            type: "text",
+            text: want ? `✅ ${module} enabled.` : `✅ ${module} disabled.`,
+          },
+        ],
+        details: { ok: true, body: resp.body },
+      };
+    } catch (err) {
+      return failResult(want ? "Remote enable failed" : "Remote disable failed", err);
+    }
+  }
+
+  const ModuleParam = Type.Object({
+    module: Type.String({
+      description: "Server module name, e.g. example-monitor",
+    }),
+    timeoutSeconds: TimeoutSchema,
+  });
+
+  pi.registerTool({
+    name: "remote_module_enable",
+    label: "Remote Module Enable",
+    description:
+      "Enable a module on the 24/7 Pi server node (Windows, over Tailscale). " +
+      "Use automatically for 'enable module X', 'attiva il modulo X', 'riattiva il monitor'.",
+    promptSnippet: "remote_module_enable flips a module's enabled flag on via signed HTTPS",
+    promptGuidelines: [
+      "Prefer this over remote_server_config when the user says enable/activate/riattiva.",
+    ],
+    parameters: ModuleParam,
+    executionMode: "sequential",
+    async execute(_toolCallId, params): Promise<TextResult> {
+      const timeout =
+        typeof params.timeoutSeconds === "number"
+          ? Math.min(120, Math.max(5, params.timeoutSeconds))
+          : undefined;
+      return toggleModule(params.module as string, true, timeout);
+    },
+  });
+
+  pi.registerTool({
+    name: "remote_module_disable",
+    label: "Remote Module Disable",
+    description:
+      "Disable a module on the 24/7 Pi server node (Windows, over Tailscale). " +
+      "Use automatically for 'disable module X', 'disattiva il modulo X', 'spegni il monitor'.",
+    promptSnippet:
+      "remote_module_disable flips a module's enabled flag off via signed HTTPS",
+    promptGuidelines: [
+      "Prefer this over remote_server_config when the user says disable/deactivate/disattiva.",
+    ],
+    parameters: ModuleParam,
+    executionMode: "sequential",
+    async execute(_toolCallId, params): Promise<TextResult> {
+      const timeout =
+        typeof params.timeoutSeconds === "number"
+          ? Math.min(120, Math.max(5, params.timeoutSeconds))
+          : undefined;
+      return toggleModule(params.module as string, false, timeout);
     },
   });
 }

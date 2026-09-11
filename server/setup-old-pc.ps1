@@ -103,7 +103,7 @@ $LogDir    = Join-Path $AgentDir "logs"
 icacls $Secrets /inheritance:r /grant:r "$($env:USERNAME):(OI)(CI)F" | Out-Null
 
 # ------------------------------------------------------ hidden inputs ---
-Info "steps 5-7: Telegram identities (see docs/INSTALL.md for the bot-to-bot group)"
+Info "steps 5-6: ServerBot identity (no second bot: Mac talks over Tailscale, see docs/INSTALL.md)"
 $botToken = $env:PI_SERVER_BOT_TOKEN
 if (-not $botToken) { $botToken = Read-Hidden "ServerBot token (hidden)" }
 if (-not $botToken) { Fatal "ServerBot token is required" }
@@ -111,14 +111,6 @@ if (-not $botToken) { Fatal "ServerBot token is required" }
 $ownerId = $env:PI_OWNER_ID
 if (-not $ownerId) { $ownerId = Read-Host "Owner Telegram user id (digits, from @userinfobot)" }
 if ($ownerId -notmatch '^\d+$') { Fatal "owner id must be numeric" }
-
-$controlBotId = $env:PI_CONTROL_BOT_ID
-if (-not $controlBotId) { $controlBotId = Read-Host "ControlBot numeric id" }
-if ($controlBotId -notmatch '^\d+$') { Fatal "control bot id must be numeric" }
-
-$controlChatId = $env:PI_CONTROL_CHAT_ID
-if (-not $controlChatId) { $controlChatId = Read-Host "Control group chat id (negative number)" }
-if ($controlChatId -notmatch '^-?\d+$') { Fatal "control chat id must be numeric" }
 
 $hmac = $env:PI_REMOTE_HMAC
 if (-not $hmac) { $hmac = Read-Hidden "HMAC secret (ENTER to generate random)" }
@@ -148,16 +140,23 @@ if (-not $tg.profiles) { $tg.profiles = @{} }
 $tg.profiles["default"] = @{ botToken = $botToken; allowedUserId = [long]$ownerId }
 $tg | ConvertTo-Json -Depth 6 | Out-File -Encoding utf8 $tgJson
 
-# ------------------------------------------------------ remote-auth.json ---
-Info "step 10: remote-auth.json"
-$authJson = Join-Path $AgentDir "remote-auth.json"
-Backup-IfExists $authJson
+# ----------------------------------------------- remote-server.json ---
+# No Telegram IDs here anymore: Mac<->Windows goes over Tailscale + HMAC HTTP.
+# The remote daemon migrates legacy remote-auth.json on boot (backup + convert).
+Info "step 10: remote-server.json"
+$serverCfg = Join-Path $AgentDir "remote-server.json"
+Backup-IfExists $serverCfg
+$remotePort = $env:PI_REMOTE_PORT
+if ([string]::IsNullOrWhiteSpace($remotePort)) {
+  $remotePort = Read-Host "Remote API port [43128]"
+  if ([string]::IsNullOrWhiteSpace($remotePort)) { $remotePort = "43128" }
+}
+if ($remotePort -notmatch '^\d+$' -or [int]$remotePort -lt 1 -or [int]$remotePort -gt 65535) { Fatal "Port must be 1-65535." }
 @{
-  allowedControlBotId = [long]$controlBotId
-  controlChatId       = [long]$controlChatId
-  maxSkewSeconds      = 300
-  allowedServices     = @("pi-server")
-} | ConvertTo-Json -Depth 4 | Out-File -Encoding utf8 $authJson
+  port = [int]$remotePort
+  maxSkewSeconds = 300
+  allowedServices = @("pi-server")
+} | ConvertTo-Json -Depth 4 | Out-File -Encoding utf8 $serverCfg
 
 # ---------------------------------------------------- server-config/... ---
 Info "step 11: server-config defaults"
@@ -188,8 +187,54 @@ if (Test-Path $sharedDst) { Remove-Item $sharedDst -Recurse -Force }
 Copy-Item $sharedSrc $sharedDst -Recurse
 Info "extension copied to $dst"
 
+# ------------------------------------------------------------ tailscale ---
+Info "step 13: Tailscale (private Mac<->Windows network)"
+$tsExe = (Get-Command tailscale -ErrorAction SilentlyContinue).Source
+if (-not $tsExe) {
+  $tsExe = Join-Path ${env:ProgramFiles} "Tailscale\tailscale.exe"
+  if (-not (Test-Path -LiteralPath $tsExe)) { $tsExe = $null }
+}
+if ($null -eq $tsExe) {
+  Info "installing Tailscale..."
+  if (Get-Command winget -ErrorAction SilentlyContinue) {
+    winget install -e --id Tailscale.Tailscale --scope machine --accept-source-agreements --accept-package-agreements --silent --disable-interactivity
+  } else {
+    $msiUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+    $msi = Join-Path $env:TEMP ("tailscale-setup-" + [Guid]::NewGuid().ToString("N") + ".msi")
+    Invoke-WebRequest -Uri $msiUrl -OutFile $msi -TimeoutSec 300
+    Start-Process msiexec.exe -ArgumentList @("/i", "`"$msi`"", "/quiet", "/norestart", "TS_NOLAUNCH=1") -Wait
+    Remove-Item -LiteralPath $msi -Force -ErrorAction SilentlyContinue
+  }
+  Start-Sleep -Seconds 5
+  $tsExe = Join-Path ${env:ProgramFiles} "Tailscale\tailscale.exe"
+  if (-not (Test-Path -LiteralPath $tsExe)) { $tsExe = (Get-Command tailscale -ErrorAction SilentlyContinue).Source }
+  if ($null -eq $tsExe) { Fatal "Tailscale installed but tailscale.exe not found." }
+}
+$tsUp = $false
+try { & $tsExe status 2>&1 | Out-Null; if ($LASTEXITCODE -eq 0) { $tsUp = $true } } catch { }
+if (-not $tsUp) {
+  if (-not [string]::IsNullOrWhiteSpace($env:PI_TAILSCALE_AUTHKEY)) {
+    $keyFile = Join-Path $env:TEMP ("tskey-" + [Guid]::NewGuid().ToString("N") + ".txt")
+    try {
+      $env:PI_TAILSCALE_AUTHKEY | Out-File -LiteralPath $keyFile -Encoding ascii -NoNewline
+      & $tsExe up --auth-key=file:$keyFile 2>&1 | Out-Null
+    } finally { Remove-Item -LiteralPath $keyFile -Force -ErrorAction SilentlyContinue }
+  } else {
+    Write-Host "[!] Apri il link Tailscale e autorizza questo PC." -ForegroundColor Yellow
+    try { & $tsExe up } catch { }
+    Write-Host "Premi INVIO quando hai autorizzato questo PC..."
+    [void](Read-Host)
+  }
+  try { & $tsExe status 2>&1 | Out-Null; if ($LASTEXITCODE -eq 0) { $tsUp = $true } } catch { }
+  if (-not $tsUp) { Fatal "Tailscale non connesso. Rilancia dopo il login." }
+}
+$tsIp = ""
+try { $tsIp = ((& $tsExe ip -4 2>$null | Out-String).Trim().Split("`n")[0]).Trim() } catch { }
+if ($tsIp -notmatch "^100\.(6[4-9]|[78]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}$") { Fatal "IP Tailscale non valido o assente." }
+Info "tailnet OK (this node: $tsIp)"
+
 # --------------------------------------------------- scheduled task ---
-Info "step 13: Task Scheduler (start at boot, no login required)"
+Info "step 14: Task Scheduler (start at boot, no login required)"
 $daemon = Join-Path $SystemDir "server\pi-daemon.mjs"
 if (-not (Test-Path $daemon)) { $daemon = Join-Path $SystemDir "server/pi-daemon.mjs" }
 $nodeExe = (Get-Command node).Source
@@ -209,12 +254,47 @@ try {
     -Description "24/7 Pi Coding Agent node (pi --mode rpc via pi-daemon.mjs)" | Out-Null
   Start-ScheduledTask -TaskName "PiServer"
   Info "PiServer task registered and started"
+  # Second task: HTTP remote daemon (fault isolation from Pi).
+  # Type-stripping probe: older Node 22 needs the explicit flag for .ts entries.
+  $remoteEntry = Join-Path $SystemDir "server\pi-remote-server\index.ts"
+  $nodeStripArgs = @()
+  $stripped = $false
+  foreach ($cand in @(@(), @("--experimental-strip-types"))) {
+    try {
+      & $nodeExe @cand --check $remoteEntry 2>&1 | Out-Null
+      if ($LASTEXITCODE -eq 0) { $nodeStripArgs = $cand; $stripped = $true; break }
+    } catch { }
+  }
+  if (-not $stripped) { Fatal "Node cannot run the remote daemon entry (node --check failed). Upgrade Node 22." }
+  $runRemote = Join-Path $SystemDir "installer\run-remote.ps1"
+  $remoteArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$runRemote`"", "-AgentDir", "`"$AgentDir`"", "-EntryScript", "`"$remoteEntry`"", "-NodeExe", "`"$nodeExe`"", "-LogDir", "`"$LogDir`"")
+  foreach ($a in $nodeStripArgs) { $remoteArgs += @("-NodeArgs", $a) }
+  $remoteAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument ($remoteArgs -join " ") `
+    -WorkingDirectory (Split-Path $remoteEntry)
+  if (Get-ScheduledTask -TaskName "PiRemoteServer" -ErrorAction SilentlyContinue) {
+    Unregister-ScheduledTask -TaskName "PiRemoteServer" -Confirm:$false
+  }
+  Register-ScheduledTask -TaskName "PiRemoteServer" -Action $remoteAction -Trigger $trigger `
+    -Principal $principal -Settings $settings `
+    -Description "PiServer remote API daemon (HMAC HTTP over Tailscale)" | Out-Null
+  Start-ScheduledTask -TaskName "PiRemoteServer"
+  Info "PiRemoteServer task registered and started"
+  try {
+    Remove-NetFirewallRule -DisplayName "PiServer remote (Tailscale only)" -ErrorAction SilentlyContinue | Out-Null
+    $tsNic = Get-NetAdapter -ErrorAction Stop | Where-Object { $_.InterfaceDescription -match "Tailscale" } | Select-Object -First 1
+    if ($null -ne $tsNic) {
+      New-NetFirewallRule -DisplayName "PiServer remote (Tailscale only)" -Direction Inbound `
+        -Protocol TCP -LocalPort $remotePort -InterfaceAlias $tsNic.InterfaceAlias `
+        -Action Allow -Profile Any | Out-Null
+      Info "firewall: remote port Tailscale-only" "OK"
+    }
+  } catch { WarnM "firewall rule skipped (bind stays tailnet-only): $($_.Exception.Message)" }
 } catch {
   Fatal "Task Scheduler setup failed (elevated shell required): $($_.Exception.Message)"
 }
 
 # ------------------------------------------------------ sleep/hibernate ---
-Info "step 14: disable sleep/hibernate"
+Info "step 15: disable sleep/hibernate"
 try {
   powercfg /change standby-timeout-ac 0
   powercfg /change standby-timeout-dc 0
@@ -223,7 +303,7 @@ try {
 } catch { WarnM "powercfg failed: $($_.Exception.Message)" }
 
 # --------------------------------------------------------------- verify ---
-Info "step 15: verification"
+Info "step 16: verification"
 Start-Sleep -Seconds 8
 Get-ScheduledTask -TaskName "PiServer" | Select-Object TaskName, State | Format-Table | Out-String | Write-Host
 try {
@@ -236,8 +316,8 @@ Write-Host "================ DONE ================" -ForegroundColor Green
 Write-Host "Remaining once-only steps:"
 Write-Host "  1. Pair Telegram: run `pi`, then /telegram-setup (if needed) + /telegram-connect"
 Write-Host "  2. Phone: open the ServerBot DM and pair."
-Write-Host "  3. Both bots: bot-to-bot mode ON (@BotFather), both admins in the control group."
-Write-Host "  4. Mac: run mac/setup-mac.sh (ControlBot token + SAME HMAC)."
+Write-Host "  3. Tailscale: this PC shows an IP via `tailscale ip -4` (done above)."
+Write-Host "  4. Mac: run mac/setup-mac.sh (server Tailscale host + SAME HMAC from secrets\remote-hmac)."
 Write-Host "  5. Reboot test: the PiServer task must be Running with no login."
 Write-Host "NOTE: the extension was COPIED (Windows-safe). Re-run this script"
 Write-Host "after `git pull` to refresh the copy."

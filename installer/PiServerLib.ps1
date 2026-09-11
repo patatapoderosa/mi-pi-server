@@ -19,7 +19,12 @@ $script:ReleaseManifest = @(
   "shared\modules.ts",
   "shared\store.ts",
   "installer\run-task.ps1",
-  "installer\windows-installer.ps1"
+  "installer\run-remote.ps1",
+  "installer\windows-installer.ps1",
+  "server\pi-remote-server\index.ts",
+  "server\pi-remote-server\server.ts",
+  "server\pi-remote-server\migrate.ts",
+  "server\pi-remote-server\tailscale.ts"
 )
 
 function Test-IsAdmin {
@@ -58,12 +63,18 @@ function Get-PiServerPaths {
     ConfigDir = Join-Path $data "server-config"
     Daemon = Join-Path $app "server\pi-daemon.mjs"
     RunTask = Join-Path $app "run-task.ps1"
+    RemoteEntry = Join-Path $app "server\pi-remote-server\index.ts"
+    RunRemote = Join-Path $app "run-remote.ps1"
     RuntimeEnv = Join-Path $app "runtime-env.json"
     VersionFile = Join-Path $app "VERSION"
     InstallerLog = Join-Path $logs "installer.log"
     ServerLog = Join-Path $logs "pi-server.log"
     ServerErrLog = Join-Path $logs "pi-server-error.log"
+    RemoteLog = Join-Path $logs "remote-server.log"
+    RemoteErrLog = Join-Path $logs "remote-server-error.log"
     TaskName = "PiHomeServer"
+    RemoteTaskName = "PiRemoteServer"
+    RemotePortDefault = 43128
   }
 }
 
@@ -289,7 +300,7 @@ function Invoke-HealthCheck {
         $script:hcFail += "shared mancante: $sf"
       }
     }
-    foreach ($f in @((Join-Path $Paths.AgentDir "remote-auth.json"), (Join-Path $Paths.SecretsDir "server-bot-token"), (Join-Path $Paths.SecretsDir "remote-hmac"))) {
+    foreach ($f in @((Join-Path $Paths.AgentDir "remote-server.json"), (Join-Path $Paths.SecretsDir "server-bot-token"), (Join-Path $Paths.SecretsDir "remote-hmac"))) {
       if (-not (Test-Path -LiteralPath $f)) { $script:hcFail += "config/secret mancante: $f" }
     }
     if (-not (Test-WindowsOS)) {
@@ -317,6 +328,17 @@ function Invoke-HealthCheck {
         if (($null -eq $procs) -or (@($procs).Count -eq 0)) {
           $script:hcFail += "processo pi-daemon.mjs non in esecuzione"
         }
+        $rt = Get-ScheduledTask -TaskName $Paths.RemoteTaskName -ErrorAction SilentlyContinue
+        if ($null -eq $rt) {
+          $script:hcFail += "task $($Paths.RemoteTaskName) assente"
+        } else {
+          $rprocs = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_ -match "pi-remote-server" }
+          if (($null -eq $rprocs) -or (@($rprocs).Count -eq 0)) {
+            $script:hcFail += "processo pi-remote-server non in esecuzione"
+          }
+          $rp = Test-RemoteDaemon -Paths $Paths -TimeoutSec 10
+          if (-not $rp.Ok) { $script:hcFail += "remote daemon: $($rp.Detail)" }
+        }
       }
     }
     if (-not [string]::IsNullOrWhiteSpace($PiBin)) {
@@ -334,4 +356,81 @@ function Invoke-HealthCheck {
   $res = $script:hcFail
   $script:hcFail = $null
   return @{ Ok = ($res.Count -eq 0); Failures = $res }
+}
+
+<#
+.SYNOPSIS
+  Authenticated liveness probe of the remote daemon (HMAC-signed GET /v1/ping).
+.DESCRIPTION
+  Reads the HMAC from the secrets dir (installer runs elevated, ACL allows
+  it) and signs exactly like the Mac client. Never throws: returns
+  @{ Ok, Detail }. Never logs the HMAC or the signature.
+#>
+function Test-RemoteDaemon {
+  param($Paths, [int]$TimeoutSec = 10)
+  try {
+    $cfgPath = Join-Path $Paths.AgentDir "remote-server.json"
+    $port = $Paths.RemotePortDefault
+    if (Test-Path -LiteralPath $cfgPath) {
+      try {
+        $cfg = Get-Content -LiteralPath $cfgPath -Raw -ErrorAction Stop | ConvertFrom-Json
+        if ($cfg.port -is [int] -and $cfg.port -ge 1 -and $cfg.port -le 65535) { $port = $cfg.port }
+      } catch { }
+    }
+    $hmacFile = Join-Path $Paths.SecretsDir "remote-hmac"
+    if (-not (Test-Path -LiteralPath $hmacFile)) { return @{ Ok = $false; Detail = "HMAC file missing" } }
+    $hmac = (Get-Content -LiteralPath $hmacFile -Raw -ErrorAction Stop).Trim()
+    if ([string]::IsNullOrWhiteSpace($hmac)) { return @{ Ok = $false; Detail = "HMAC file empty" } }
+    $bind = "127.0.0.1"
+    try {
+      $tsOut = & tailscale ip -4 2>$null
+      $tip = ($tsOut | ForEach-Object { "$_".Trim() } | Where-Object { $_ -match "^100\.(6[4-9]|[78]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}$" } | Select-Object -First 1)
+      if (-not [string]::IsNullOrWhiteSpace($tip)) { $bind = $tip }
+    } catch { }
+    $ts = [string][int](Get-Date -UFormat %s)
+    $nonce = [Guid]::NewGuid().ToString("N")
+    $emptyHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    $base = "GET`n/v1/ping`n$ts`n$nonce`n$emptyHash"
+    $key = [Text.Encoding]::UTF8.GetBytes($hmac)
+    $h = New-Object Security.Cryptography.HMACSHA256(, $key)
+    try {
+      $sig = ($h.ComputeHash([Text.Encoding]::UTF8.GetBytes($base)) | ForEach-Object { $_.ToString("x2") }) -join ""
+    } finally { $h.Dispose() }
+    $url = "http://${bind}:$port/v1/ping"
+    $r = Invoke-WebRequest -Uri $url -TimeoutSec $TimeoutSec -UseBasicParsing -ErrorAction Stop `
+      -Headers @{ "x-pi-timestamp" = $ts; "x-pi-nonce" = $nonce; "x-pi-signature" = $sig }
+    $j = $r.Content | ConvertFrom-Json
+    if ($j.ok -eq $true) { return @{ Ok = $true; Detail = "pong via $bind" } }
+    return @{ Ok = $false; Detail = "refused: $($j.error)" }
+  } catch {
+    return @{ Ok = $false; Detail = $_.Exception.Message }
+  }
+}
+
+<#
+.SYNOPSIS
+  Our tailnet IPv4 (100.64.0.0/10) or empty when Tailscale is down.
+#>
+function Get-TailscaleIpv4 {
+  try {
+    $out = & tailscale ip -4 2>$null
+    foreach ($line in @($out)) {
+      $t = "$line".Trim()
+      if ($t -match "^100\.(6[4-9]|[78]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}$") { return $t }
+    }
+  } catch { }
+  return ""
+}
+
+<#
+.SYNOPSIS
+  Tailscale interface alias for scoped firewall rules (empty when absent).
+#>
+function Get-TailscaleInterfaceAlias {
+  try {
+    $nics = Get-NetAdapter -ErrorAction Stop | Where-Object { $_.InterfaceDescription -match "Tailscale" }
+    $first = @($nics) | Select-Object -First 1
+    if ($null -ne $first) { return [string]$first.InterfaceAlias }
+  } catch { }
+  return ""
 }

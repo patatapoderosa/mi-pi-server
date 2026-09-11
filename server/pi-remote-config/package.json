@@ -1,8 +1,8 @@
 {
   "name": "pi-remote-config",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
-  "description": "Server-side Pi extension: whitelisted local config tools + secure Telegram remote control (single-polling safe).",
+  "description": "Server-side Pi extension: whitelisted local config tools (server_config, server_status, service_control).",
   "type": "module",
   "pi": {
     "extensions": ["./index.ts"]
