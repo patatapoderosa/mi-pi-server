@@ -113,11 +113,11 @@ export class ReplayStore {
 
   /** True when the nonce was seen inside the replay window. Cleans expired entries. */
   has(nonce: string, nowSec: number): boolean {
+    // Invalid input can never throw: fail closed (treat as already seen).
+    if (typeof nonce !== "string" || typeof nowSec !== "number" || !Number.isFinite(nowSec)) {
+      return true;
+    }
     try {
-      // Invalid input can never throw: fail closed (treat as already seen).
-      if (typeof nonce !== "string" || typeof nowSec !== "number" || !Number.isFinite(nowSec)) {
-        return true;
-      }
       this.prune(nowSec);
       return this.seen(nonce);
     } catch {

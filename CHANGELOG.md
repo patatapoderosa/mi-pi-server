@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.2.1 — 2026-09-11
+
+### Fixed
+
+- Fixed SHA256SUMS parsing on Windows PowerShell 5.1: the bootstrap and
+  the installer downloaded the file but parsed the in-memory
+  `Invoke-WebRequest` `.Content` (IE-engine dependent, silently empty).
+  Both now download `SHA256SUMS.txt` with `-OutFile` and run it through
+  a single strict parser (`Get-ReleaseChecksum`, mirrored byte-identical
+  in `setup.ps1` and `installer/PiServerLib.ps1`): file must exist and be
+  non-empty, BOM stripped, CRLF normalized, exact 64-hex hash for the exact
+  asset name (`HASH[ ][*]mi-pi-server-windows.zip`), conflicting duplicates
+  fail closed, useful diagnostics (tag, asset names, URL, file size).
+- Fixed Windows staging deployment failing with
+  "Cannot copy container onto existing leaf item": stage subdirectories
+  (`server/`, `shared/`, `installer/`) are now created before the wildcard
+  `Copy-Item`. Staging lives in `Invoke-AppStaging` (lib):
+  payload → stage → in-stage manifest validation → swap (backup in update
+  mode), best-effort backup restore if the swap itself fails, failed stages
+  always removed, live app untouched.
+- Added regression tests for Windows checksum parsing and staged deploy
+  (34 new smoke assertions) and a Windows PowerShell 5.1 CI job
+  (`powershell.exe` parser + smoke tests on `windows-latest`).
+
+### Upgrade notes
+
+- No migration needed: rerun the one-liner (it resolves `latest` → v0.2.1)
+  or `setup.ps1 -Update`. Pinned installs keep working:
+  `setup.ps1 -Version v0.2.1 -ExpectedSha256 <hash>`.
+
+
 ## v0.2.0 — 2026-09-11
 
 ### Major changes

@@ -317,7 +317,7 @@ try {
       $want = $ExpectedSha256
       if ([string]::IsNullOrWhiteSpace($want)) { $want = $dl.Sha256 }
       if ([string]::IsNullOrWhiteSpace($want)) {
-        Fail "Nessun checksum disponibile per questa release (né -ExpectedSha256 né SHA256SUMS.txt). Fail closed: crea una release con SHA256SUMS.txt o passa -ExpectedSha256."
+        Fail ("Nessun checksum disponibile per questa release (né -ExpectedSha256 né SHA256SUMS.txt: " + $dl.SumsError + "). Fail closed: crea una release con SHA256SUMS.txt o passa -ExpectedSha256.")
       }
       if (-not (Test-FileChecksum -Path $zipPath -ExpectedSha256 $want)) {
         Fail "Checksum release non coincide. File scartato (fail closed)."
@@ -343,35 +343,15 @@ try {
       New-Item -ItemType Directory -Path $d -Force | Out-Null
     }
   }
-  # Stage the new app FIRST: a failed copy must never leave live app/ half-written.
-  # (On failure the previous app/ is untouched, so no rollback is needed here.)
-  $stageNew = $Paths.App + ".new-" + (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssZ")
-  if (Test-Path -LiteralPath $stageNew) {
-    Remove-Item -LiteralPath $stageNew -Recurse -Force
-  }
-  New-Item -ItemType Directory -Path $stageNew -Force | Out-Null
-  try {
-    foreach ($sub in @("server", "shared", "installer")) {
-      $src = Join-Path $payload $sub
-      if (Test-Path -LiteralPath $src) {
-        Copy-Item -Path (Join-Path $src "*") -Destination (Join-Path $stageNew $sub) -Recurse -Force
-      }
-    }
-    $ver = $Version
-    if ($ver -eq "latest") { $ver = "latest@$(Get-Date -Format 'yyyyMMdd')" }
-    $ver | Out-File -LiteralPath (Join-Path $stageNew "VERSION") -Encoding ascii -NoNewline
-  } catch {
-    Remove-Item -LiteralPath $stageNew -Recurse -Force -ErrorAction SilentlyContinue
-    throw "Deploy staging fallito (app esistente intatta): $($_.Exception.Message)"
-  }
-  if ((Test-Path -LiteralPath $Paths.App) -and ($Mode -eq "update")) {
-    $appBackup = $Paths.App + ".backup-" + (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssZ")
-    L "backup app -> $appBackup"
-    Move-Item -LiteralPath $Paths.App -Destination $appBackup -Force
-  } elseif (Test-Path -LiteralPath $Paths.App) {
-    Remove-Item -LiteralPath $Paths.App -Recurse -Force
-  }
-  Move-Item -LiteralPath $stageNew -Destination $Paths.App -Force
+  # Stage the new app FIRST via Invoke-AppStaging (lib): payload -> stage ->
+  # validate -> swap. A failed staging never touches the live app/ (no rollback
+  # needed here); in update mode the previous app/ is preserved as backup.
+  $ver = $Version
+  if ($ver -eq "latest") { $ver = "latest@$(Get-Date -Format 'yyyyMMdd')" }
+  $st = Invoke-AppStaging -PayloadDir $payload -AppPath $Paths.App -Mode $Mode -VersionLabel $ver
+  if (-not $st.Ok) { Fail ("Deploy staging fallito (app esistente intatta): " + $st.Error) }
+  $appBackup = $st.BackupPath
+  if ($null -ne $appBackup) { L "backup app -> $appBackup" }
   L "app deployata (VERSION=$ver)" "OK"
 
   # Extension + shared into the agent dir, preserving ../../shared layout.

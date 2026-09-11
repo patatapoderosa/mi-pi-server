@@ -1,0 +1,58 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  node:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install --no-audit --no-fund
+      - run: npm test
+      - run: npm run typecheck
+
+  windows-ps51:
+    # Real Windows PowerShell 5.1 (powershell.exe), NOT pwsh 7:
+    # this is where the checksum Content-pipeline and
+    # Copy-Item leaf/container bugs were originally reproduced.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Confirm Windows PowerShell 5.1 engine
+        shell: powershell
+        run: |
+          $v = $PSVersionTable.PSVersion
+          $ed = $PSVersionTable.PSEdition
+          Write-Host "engine: Windows PowerShell $v ($ed)"
+          if ($v.Major -ne 5) { throw "expected PS 5.x, got $v" }
+      - name: Parse every .ps1 with the 5.1 parser
+        shell: powershell
+        run: |
+          $errs = @()
+          Get-ChildItem -LiteralPath . -Filter *.ps1 -Recurse -File |
+            Where-Object { $_.FullName -notmatch '\\node_modules\\' } |
+            ForEach-Object {
+              $toks = $null; $errs2 = $null
+              $f = $_.FullName
+              $pt = [System.Management.Automation.Language.Parser]
+              [void]$pt::ParseFile($f, [ref]$toks, [ref]$errs2)
+              foreach ($e in $errs2) {
+                $errs += "$($_.Name): $($e.Message)"
+              }
+            }
+          if ($errs.Count -gt 0) {
+            $errs | ForEach-Object { Write-Host $_ }
+            throw "$($errs.Count) parser errors"
+          }
+          Write-Host "parser 5.1 OK"
+      - name: Smoke tests on powershell.exe (5.1)
+        shell: powershell
+        run: |
+          powershell.exe -NoProfile -NonInteractive `
+            -File installer/tests/Invoke-SmokeTests.ps1

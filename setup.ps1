@@ -45,6 +45,54 @@ function Boot-Fail([string]$why) {
   exit 1
 }
 
+# ===== BEGIN Get-ReleaseChecksum (mirror: installer/PiServerLib.ps1 <-> setup.ps1) =====
+# Canonical SHA256SUMS parser. setup.ps1 embeds a byte-identical copy because
+# the bootstrap must stay standalone; the smoke test asserts both blocks match.
+function Get-ReleaseChecksum {
+  param([string]$SumsFile, [string]$AssetName = "mi-pi-server-windows.zip")
+  if ([string]::IsNullOrWhiteSpace($SumsFile) -or (-not (Test-Path -LiteralPath $SumsFile))) {
+    return @{ Ok = $false; Hash = ""; Error = "sums_missing"; Detail = "SHA256SUMS file not found: $SumsFile" }
+  }
+  try {
+    $fi = Get-Item -LiteralPath $SumsFile -ErrorAction Stop
+    if ($fi.Length -le 0) {
+      return @{ Ok = $false; Hash = ""; Error = "sums_empty"; Detail = "SHA256SUMS file is empty (0 bytes): $SumsFile" }
+    }
+    # ReadAllText strips BOM (UTF-8/UTF-16) via .NET detection. Get-Content -Raw
+    # on PS 5.1 would keep BOM chars and decode without-BOM files as ANSI.
+    $text = [System.IO.File]::ReadAllText($fi.FullName)
+    $size = $fi.Length
+  } catch {
+    return @{ Ok = $false; Hash = ""; Error = "sums_unreadable"; Detail = "Cannot read SHA256SUMS file: $($_.Exception.Message)" }
+  }
+  $text = $text -replace "`r`n", "`n"
+  $assetRx = [regex]::Escape($AssetName)
+  $found = @()
+  $others = @()
+  $lines = 0
+  foreach ($line in ($text -split "`n")) {
+    $t = $line.Trim()
+    if ($t -eq "") { continue }
+    $lines++
+    # BSD coreutils form: '<64hex><spaces>[*]<file>' — strict, exact filename only.
+    $m = [regex]::Match($t, "^([0-9a-fA-F]{64})[ \t]+\*?$assetRx$")
+    if ($m.Success) { $found += $m.Groups[1].Value.ToLowerInvariant() }
+    else {
+      $om = [regex]::Match($t, "^([0-9a-fA-F]{64})[ \t]+\*?(\S+)$")
+      if ($om.Success) { $others += $om.Groups[2].Value }
+    }
+  }
+  $distinct = @($found | Select-Object -Unique)
+  if ($distinct.Count -eq 0) {
+    return @{ Ok = $false; Hash = ""; Error = "checksum_not_found"; Detail = "No valid line for '$AssetName' (file ${size}B, $lines non-empty lines, other entries: $($others -join ', '))" }
+  }
+  if ($distinct.Count -gt 1) {
+    return @{ Ok = $false; Hash = ""; Error = "checksum_conflict"; Detail = "Conflicting hashes for '$AssetName' ($($distinct.Count) distinct). Refusing." }
+  }
+  return @{ Ok = $true; Hash = $distinct[0]; Error = ""; Detail = "OK (${size}B, $lines lines)" }
+}
+# ===== END Get-ReleaseChecksum =====
+
 try {
   [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 } catch {
@@ -128,10 +176,24 @@ try {
   }
   $want = $ExpectedSha256
   if ([string]::IsNullOrWhiteSpace($want) -and (-not [string]::IsNullOrWhiteSpace($sumsUrl))) {
-    $sumsTxt = Invoke-WebRequest -Uri $sumsUrl -TimeoutSec 60 | Select-Object -ExpandProperty Content
-    foreach ($line in ($sumsTxt -split "`r?`n")) {
-      $m = [regex]::Match($line.Trim(), "^([0-9a-fA-F]{64})\s+mi-pi-server-windows\.zip$")
-      if ($m.Success) { $want = $m.Groups[1].Value.ToLowerInvariant() }
+    # Never parse IWR .Content in-memory: on PS 5.1 that path depends on the IE
+    # engine and silently yields nothing. Download to file, then strict-parse.
+    $sumsFile = Join-Path $tmpDir "SHA256SUMS.txt"
+    try {
+      Invoke-WebRequest -Uri $sumsUrl -OutFile $sumsFile -TimeoutSec 60
+    } catch {
+      throw "Download SHA256SUMS.txt fallito ($sumsUrl): $($_.Exception.Message)"
+    }
+    $par = Get-ReleaseChecksum -SumsFile $sumsFile
+    if ($par.Ok) {
+      $want = $par.Hash
+    } else {
+      $diag = @("release: $($rel.tag_name)",
+        "asset cercati: mi-pi-server-windows.zip, SHA256SUMS.txt",
+        "asset trovati: " + ((@($rel.assets) | ForEach-Object { $_.name }) -join ", "),
+        "URL checksum: $sumsUrl")
+      try { $diag += ("file scaricato: " + (Get-Item -LiteralPath $sumsFile).Length + " bytes") } catch { }
+      throw ("SHA256SUMS non utilizzabile [" + $par.Error + "]: " + $par.Detail + " | " + ($diag -join " | "))
     }
   }
   if ([string]::IsNullOrWhiteSpace($want)) {

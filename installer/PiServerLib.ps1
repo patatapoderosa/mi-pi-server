@@ -173,6 +173,123 @@ function Test-WindowsOS {
   return ($env:OS -eq "Windows_NT")
 }
 
+# ===== BEGIN Get-ReleaseChecksum (mirror: installer/PiServerLib.ps1 <-> setup.ps1) =====
+# Canonical SHA256SUMS parser. setup.ps1 embeds a byte-identical copy because
+# the bootstrap must stay standalone; the smoke test asserts both blocks match.
+function Get-ReleaseChecksum {
+  param([string]$SumsFile, [string]$AssetName = "mi-pi-server-windows.zip")
+  if ([string]::IsNullOrWhiteSpace($SumsFile) -or (-not (Test-Path -LiteralPath $SumsFile))) {
+    return @{ Ok = $false; Hash = ""; Error = "sums_missing"; Detail = "SHA256SUMS file not found: $SumsFile" }
+  }
+  try {
+    $fi = Get-Item -LiteralPath $SumsFile -ErrorAction Stop
+    if ($fi.Length -le 0) {
+      return @{ Ok = $false; Hash = ""; Error = "sums_empty"; Detail = "SHA256SUMS file is empty (0 bytes): $SumsFile" }
+    }
+    # ReadAllText strips BOM (UTF-8/UTF-16) via .NET detection. Get-Content -Raw
+    # on PS 5.1 would keep BOM chars and decode without-BOM files as ANSI.
+    $text = [System.IO.File]::ReadAllText($fi.FullName)
+    $size = $fi.Length
+  } catch {
+    return @{ Ok = $false; Hash = ""; Error = "sums_unreadable"; Detail = "Cannot read SHA256SUMS file: $($_.Exception.Message)" }
+  }
+  $text = $text -replace "`r`n", "`n"
+  $assetRx = [regex]::Escape($AssetName)
+  $found = @()
+  $others = @()
+  $lines = 0
+  foreach ($line in ($text -split "`n")) {
+    $t = $line.Trim()
+    if ($t -eq "") { continue }
+    $lines++
+    # BSD coreutils form: '<64hex><spaces>[*]<file>' — strict, exact filename only.
+    $m = [regex]::Match($t, "^([0-9a-fA-F]{64})[ \t]+\*?$assetRx$")
+    if ($m.Success) { $found += $m.Groups[1].Value.ToLowerInvariant() }
+    else {
+      $om = [regex]::Match($t, "^([0-9a-fA-F]{64})[ \t]+\*?(\S+)$")
+      if ($om.Success) { $others += $om.Groups[2].Value }
+    }
+  }
+  $distinct = @($found | Select-Object -Unique)
+  if ($distinct.Count -eq 0) {
+    return @{ Ok = $false; Hash = ""; Error = "checksum_not_found"; Detail = "No valid line for '$AssetName' (file ${size}B, $lines non-empty lines, other entries: $($others -join ', '))" }
+  }
+  if ($distinct.Count -gt 1) {
+    return @{ Ok = $false; Hash = ""; Error = "checksum_conflict"; Detail = "Conflicting hashes for '$AssetName' ($($distinct.Count) distinct). Refusing." }
+  }
+  return @{ Ok = $true; Hash = $distinct[0]; Error = ""; Detail = "OK (${size}B, $lines lines)" }
+}
+# ===== END Get-ReleaseChecksum =====
+
+<#
+.SYNOPSIS
+  Atomic staged deploy: payload -> stage -> validate -> swap.
+.DESCRIPTION
+  Copies server/, shared/, installer/ into a fresh stage dir (created first,
+  fixing the PS 5.1 'container onto leaf' failure), stamps VERSION, validates
+  the stage manifest, then swaps: backup in update mode, wipe otherwise.
+  Never throws: returns @{ Ok, Error, BackupPath }. On failure the stage is
+  removed and the live app is untouched (swap never ran).
+#>
+function Invoke-AppStaging {
+  param([string]$PayloadDir, [string]$AppPath, [string]$Mode = "fresh", [string]$VersionLabel = "")
+  $res = @{ Ok = $false; Error = ""; BackupPath = $null }
+  try {
+    if ([string]::IsNullOrWhiteSpace($PayloadDir) -or (-not (Test-Path -LiteralPath $PayloadDir))) {
+      $res.Error = "payload dir missing: $PayloadDir"; return $res
+    }
+    if ([string]::IsNullOrWhiteSpace($AppPath)) { $res.Error = "app path empty"; return $res }
+    $man = Test-ReleaseManifest -PayloadRoot $PayloadDir
+    if (-not $man.Ok) { $res.Error = "Manifest incompleto: " + ($man.Missing -join ", "); return $res }
+    $stage = $AppPath + ".new-" + (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssZ")
+    if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction Stop }
+    New-Item -ItemType Directory -Path $stage -Force -ErrorAction Stop | Out-Null
+    try {
+      foreach ($sub in @("server", "shared", "installer")) {
+        $src = Join-Path $PayloadDir $sub
+        if (-not (Test-Path -LiteralPath $src)) { continue }
+        # Destination MUST exist first: on PS 5.1 a wildcard Copy-Item onto a
+        # missing path fails ('container onto existing leaf item').
+        $dst = Join-Path $stage $sub
+        New-Item -ItemType Directory -Path $dst -Force -ErrorAction Stop | Out-Null
+        Copy-Item -Path (Join-Path $src "*") -Destination $dst -Recurse -Force -ErrorAction Stop
+      }
+      if ($VersionLabel -ne "") {
+        $VersionLabel | Out-File -LiteralPath (Join-Path $stage "VERSION") -Encoding ascii -NoNewline -ErrorAction Stop
+      }
+      $stMan = Test-ReleaseManifest -PayloadRoot $stage
+      if (-not $stMan.Ok) { throw ("Manifest dello stage incompleto: " + ($stMan.Missing -join ", ")) }
+    } catch {
+      Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+      throw
+    }
+    $backup = $null
+    if ((Test-Path -LiteralPath $AppPath) -and ($Mode -eq "update")) {
+      $backup = $AppPath + ".backup-" + (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssZ")
+      Move-Item -LiteralPath $AppPath -Destination $backup -Force -ErrorAction Stop
+    } elseif (Test-Path -LiteralPath $AppPath) {
+      Remove-Item -LiteralPath $AppPath -Recurse -Force -ErrorAction Stop
+    }
+    try {
+      Move-Item -LiteralPath $stage -Destination $AppPath -Force -ErrorAction Stop
+    } catch {
+      $swapErr = $_.Exception.Message
+      if ($null -ne $backup) {
+        try { Move-Item -LiteralPath $backup -Destination $AppPath -Force -ErrorAction Stop }
+        catch { throw "Swap fallito E restore del backup fallito (ripristino manuale da: $backup). Errore swap: $swapErr" }
+        throw "Swap fallito, backup ripristinato. Errore swap: $swapErr"
+      }
+      throw "Swap fallito: $swapErr"
+    }
+    $res.Ok = $true
+    $res.BackupPath = $backup
+    return $res
+  } catch {
+    $res.Error = $_.Exception.Message
+    return $res
+  }
+}
+
 <#
 .SYNOPSIS
   Resolve a GitHub release to a ZIP URL plus its expected SHA256.
@@ -202,14 +319,23 @@ function Get-ReleaseDownload {
     throw "Asset mi-pi-server-windows.zip assente nella release $($rel.tag_name)."
   }
   $sha = ""
+  $sumsError = ""
   if (-not [string]::IsNullOrWhiteSpace($sums)) {
-    $txt = Invoke-WebRequest -Uri $sums -TimeoutSec 30 | Select-Object -ExpandProperty Content
-    foreach ($line in ($txt -split "`r?`n")) {
-      $m = [regex]::Match($line.Trim(), "^([0-9a-fA-F]{64})\s+mi-pi-server-windows\.zip$")
-      if ($m.Success) { $sha = $m.Groups[1].Value.ToLowerInvariant() }
+    # Never parse IWR .Content in-memory (fragile on PS 5.1 IE engine):
+    # download to file, then run the strict Get-ReleaseChecksum parser.
+    $sumsFile = Join-Path ([System.IO.Path]::GetTempPath()) ("piserver-sums-" + [Guid]::NewGuid().ToString("N") + ".txt")
+    try {
+      Invoke-WebRequest -Uri $sums -OutFile $sumsFile -TimeoutSec 30
+      $par = Get-ReleaseChecksum -SumsFile $sumsFile
+      if ($par.Ok) { $sha = $par.Hash }
+      else { $sumsError = $par.Error + " (" + $par.Detail + ")" }
+    } catch {
+      $sumsError = "download failed: $($_.Exception.Message)"
+    } finally {
+      Remove-Item -LiteralPath $sumsFile -Force -ErrorAction SilentlyContinue
     }
   }
-  return @{ Tag = [string]$rel.tag_name; ZipUrl = [string]$zip; Sha256 = $sha }
+  return @{ Tag = [string]$rel.tag_name; ZipUrl = [string]$zip; Sha256 = $sha; SumsError = $sumsError }
 }
 
 <#

@@ -9,6 +9,9 @@
   validation (good/bad/missing), manifest validation (complete/incomplete),
   idempotent config preservation (remote-server.json), download failure,
   health-check + remote-daemon probe fail-closed,
+  SHA256SUMS strict parsing (LF/CRLF/BOM/spacing/asterisk/multi-file plus
+  negatives and conflicting-duplicate fail-closed) with setup.ps1 mirror-sync,
+  atomic staged deploy (clean/nested/fresh/update/backup/failure-intact),
   and the no-secrets-in-logs guarantee.
 
   Windows-only parts (Task Scheduler registration, icacls, powercfg) are
@@ -218,6 +221,115 @@ try {
   } else {
     Skip-Test "task settings" "non-Windows (Get-ScheduledTask assente)"
   }
+
+  Write-Host "== SHA256SUMS parser (Get-ReleaseChecksum) =="
+  $RepoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+  $HA = ("a" * 64)
+  $HB = ("b" * 64)
+  function Write-SumsBytes([string]$p, [string]$t, [string]$enc) {
+    if ($enc -eq "bom") { [System.IO.File]::WriteAllText($p, $t, (New-Object System.Text.UTF8Encoding($true))) }
+    elseif ($enc -eq "utf16") { [System.IO.File]::WriteAllText($p, $t, [System.Text.Encoding]::Unicode) }
+    else { [System.IO.File]::WriteAllText($p, $t) }
+  }
+  $sumsDir = Join-Path $TmpRoot "sums"
+  New-Item -ItemType Directory -Path $sumsDir -Force | Out-Null
+  $sf = Join-Path $sumsDir "SHA256SUMS.txt"
+  Write-SumsBytes $sf ($HA + "  mi-pi-server-windows.zip" + "`n") "lf"
+  $r = Get-ReleaseChecksum -SumsFile $sf
+  Assert-True ($r.Ok -and ($r.Hash -eq $HA)) "formato LF due-spazi"
+  Write-SumsBytes $sf ($HA + "  mi-pi-server-windows.zip" + "`r`n") "lf"
+  Assert-True ((Get-ReleaseChecksum -SumsFile $sf).Ok) "formato CRLF"
+  Write-SumsBytes $sf ($HA + "  mi-pi-server-windows.zip" + "`n") "bom"
+  Assert-True ((Get-ReleaseChecksum -SumsFile $sf).Ok) "BOM UTF-8"
+  Write-SumsBytes $sf ($HA + "  mi-pi-server-windows.zip" + "`n") "utf16"
+  Assert-True ((Get-ReleaseChecksum -SumsFile $sf).Ok) "BOM UTF-16"
+  Write-SumsBytes $sf ($HA + " mi-pi-server-windows.zip" + "`n") "lf"
+  Assert-True ((Get-ReleaseChecksum -SumsFile $sf).Ok) "uno spazio"
+  Write-SumsBytes $sf ($HA + " *mi-pi-server-windows.zip" + "`n") "lf"
+  Assert-True ((Get-ReleaseChecksum -SumsFile $sf).Ok) "asterisco binario"
+  Write-SumsBytes $sf (("c" * 64) + "  other.zip" + "`n" + $HB + "  mi-pi-server-windows.zip" + "`n") "lf"
+  $rm = Get-ReleaseChecksum -SumsFile $sf
+  Assert-True ($rm.Ok -and ($rm.Hash -eq $HB)) "file multipli: sceglie HASH2"
+  Write-SumsBytes $sf ("abc  mi-pi-server-windows.zip" + "`n") "lf"
+  Assert-True (-not (Get-ReleaseChecksum -SumsFile $sf).Ok) "hash corto rifiutato"
+  Write-SumsBytes $sf ($HA + "  altro.zip" + "`n") "lf"
+  Assert-True (-not (Get-ReleaseChecksum -SumsFile $sf).Ok) "filename diverso rifiutato"
+  Write-SumsBytes $sf (("g" * 64) + "  mi-pi-server-windows.zip" + "`n") "lf"
+  Assert-True (-not (Get-ReleaseChecksum -SumsFile $sf).Ok) "hash non-hex rifiutato"
+  Write-SumsBytes $sf ($HA + "  mi-pi-server-windows.zip" + "`n" + $HB + "  mi-pi-server-windows.zip" + "`n") "lf"
+  $rc = Get-ReleaseChecksum -SumsFile $sf
+  Assert-True ((-not $rc.Ok) -and ($rc.Error -eq "checksum_conflict")) "duplicati discordanti = FAIL CLOSED"
+  Write-SumsBytes $sf ($HA + "  mi-pi-server-windows.zip" + "`n" + $HA + "  mi-pi-server-windows.zip" + "`n") "lf"
+  Assert-True ((Get-ReleaseChecksum -SumsFile $sf).Ok) "duplicati identici accettati"
+  $rn = Get-ReleaseChecksum -SumsFile (Join-Path $sumsDir "inesistente.txt")
+  Assert-True ((-not $rn.Ok) -and ($rn.Error -eq "sums_missing")) "file mancante"
+  Write-SumsBytes $sf "" "lf"
+  $re = Get-ReleaseChecksum -SumsFile $sf
+  Assert-True ((-not $re.Ok) -and ($re.Error -eq "sums_empty")) "file vuoto"
+  Write-Host "== checksum parser: mirror setup.ps1 <-> PiServerLib.ps1 =="
+  function Get-MirrorBlock([string]$file) {
+    $t = Get-Content -LiteralPath $file -Raw
+    $m = [regex]::Match($t, "(?s)# ===== BEGIN Get-ReleaseChecksum.*?# ===== END Get-ReleaseChecksum =====")
+    if ($m.Success) { return $m.Value } else { return $null }
+  }
+  $libBlock = Get-MirrorBlock (Join-Path (Split-Path -Parent $PSScriptRoot) "PiServerLib.ps1")
+  $bootBlock = Get-MirrorBlock (Join-Path $RepoRoot "setup.ps1")
+  Assert-True (($null -ne $libBlock) -and ($null -ne $bootBlock)) "blocchi mirror presenti"
+  Assert-True ($libBlock -eq $bootBlock) "parser identici (niente derive)"
+
+  Write-Host "== staged deploy (Invoke-AppStaging) =="
+  function New-MiniPayload([string]$dir) {
+    foreach ($rel in @("server\pi-daemon.mjs", "server\pi-remote-config\index.ts",
+        "server\pi-remote-config\package.json", "shared\protocol.ts",
+        "shared\modules.ts", "shared\store.ts",
+        "installer\run-task.ps1", "installer\run-remote.ps1",
+        "installer\windows-installer.ps1",
+        "server\pi-remote-server\index.ts", "server\pi-remote-server\server.ts",
+        "server\pi-remote-server\migrate.ts", "server\pi-remote-server\tailscale.ts",
+        "server\x\y\z.ts")) {
+      $fp = Join-Path $dir $rel
+      $dd = Split-Path -Parent $fp
+      if (-not (Test-Path -LiteralPath $dd)) { New-Item -ItemType Directory -Path $dd -Force | Out-Null }
+      ("payload:" + $rel) | Out-File -LiteralPath $fp -Encoding ascii -NoNewline
+    }
+  }
+  $stgRoot = Join-Path $TmpRoot "staging"
+  New-Item -ItemType Directory -Path $stgRoot -Force | Out-Null
+  $pay1 = Join-Path $stgRoot "pay1"
+  New-MiniPayload $pay1
+  $app1 = Join-Path $stgRoot "app"
+  $s1 = Invoke-AppStaging -PayloadDir $pay1 -AppPath $app1 -Mode "fresh" -VersionLabel "v9.9.9-test"
+  Assert-True ($s1.Ok -and ($null -eq $s1.BackupPath)) "installazione pulita OK, nessun backup"
+  Assert-True ((Get-Content -LiteralPath (Join-Path $app1 "server\x\y\z.ts") -Raw) -eq "payload:server\x\y\z.ts") "file annidati copiati"
+  Assert-True ((Get-Content -LiteralPath (Join-Path $app1 "VERSION") -Raw) -eq "v9.9.9-test") "VERSION stampata"
+  Assert-True ((Get-Content -LiteralPath (Join-Path $app1 "shared\protocol.ts") -Raw) -eq "payload:shared\protocol.ts") "shared copiata"
+  "VECCHIA" | Out-File -LiteralPath (Join-Path $app1 "server\pi-daemon.mjs") -Encoding ascii -NoNewline
+  $s2 = Invoke-AppStaging -PayloadDir $pay1 -AppPath $app1 -Mode "fresh" -VersionLabel "v9.9.9-test"
+  Assert-True ($s2.Ok -and ($null -eq $s2.BackupPath)) "reinstall fresh OK"
+  Assert-True ((Get-Content -LiteralPath (Join-Path $app1 "server\pi-daemon.mjs") -Raw) -like "payload:*") "app esistente sostituita in fresh"
+  Assert-True ((@(Get-ChildItem -LiteralPath $stgRoot -Filter "app.backup-*") ).Count -eq 0) "fresh non crea backup"
+  "VECCHIA2" | Out-File -LiteralPath (Join-Path $app1 "server\pi-daemon.mjs") -Encoding ascii -NoNewline
+  $s3 = Invoke-AppStaging -PayloadDir $pay1 -AppPath $app1 -Mode "update" -VersionLabel "v9.9.9-test"
+  Assert-True ($s3.Ok -and ($null -ne $s3.BackupPath)) "update OK con backup"
+  Assert-True ((Get-Content -LiteralPath (Join-Path $s3.BackupPath "server\pi-daemon.mjs") -Raw) -eq "VECCHIA2") "backup contiene vecchia app"
+  Assert-True ((Get-Content -LiteralPath (Join-Path $app1 "server\pi-daemon.mjs") -Raw) -like "payload:*") "live aggiornata"
+  $payBad = Join-Path $stgRoot "payBad"
+  New-MiniPayload $payBad
+  Remove-Item -LiteralPath (Join-Path $payBad "shared\store.ts") -Force
+  "SENTINELLA" | Out-File -LiteralPath (Join-Path $app1 "server\pi-daemon.mjs") -Encoding ascii -NoNewline
+  $s4 = Invoke-AppStaging -PayloadDir $payBad -AppPath $app1 -Mode "update" -VersionLabel "v9.9.9-test"
+  Assert-True (-not $s4.Ok) "payload incompleto rifiutato"
+  Assert-True ((Get-Content -LiteralPath (Join-Path $app1 "server\pi-daemon.mjs") -Raw) -eq "SENTINELLA") "app live intatta dopo fallimento"
+  Assert-True ((@(Get-ChildItem -LiteralPath $stgRoot -Filter "app.new-*")).Count -eq 0) "stage fallito rimosso"
+  $s5 = Invoke-AppStaging -PayloadDir (Join-Path $stgRoot "inesistente") -AppPath (Join-Path $stgRoot "app2") -Mode "fresh"
+  Assert-True ((-not $s5.Ok) -and (-not (Test-Path -LiteralPath (Join-Path $stgRoot "app2")))) "payload mancante: nulla creato"
+  $deepApp = Join-Path (Join-Path $stgRoot "nodir") "app"
+  $s6 = Invoke-AppStaging -PayloadDir $pay1 -AppPath $deepApp -Mode "fresh"
+  Assert-True ($s6.Ok -and (Test-Path -LiteralPath (Join-Path $deepApp "server\pi-daemon.mjs"))) "parent mancanti creati (mkdir -p)"
+  Assert-True ((Get-Content -LiteralPath (Join-Path $pay1 "server\pi-daemon.mjs") -Raw) -like "payload:*") "payload non toccato"
+  $wiText = Get-Content -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) "windows-installer.ps1") -Raw
+  Assert-True ($wiText -match "Invoke-AppStaging -PayloadDir") "installer usa Invoke-AppStaging"
+  Assert-True ($wiText -notmatch 'Join-Path \$stageNew \$sub') "nessuna copia inline sul leaf (bug 5.1)"
 } finally {
   Remove-Item -LiteralPath $TmpRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
