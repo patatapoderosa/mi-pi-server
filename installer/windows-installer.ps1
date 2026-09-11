@@ -53,6 +53,9 @@ param(
   [string]$SourceZip = "",
   [string]$ExpectedSha256 = "",
   [switch]$Update,
+  [switch]$Resume,
+  [switch]$Force,
+  [int]$FromStep = 0,
   [string]$PayloadDir = "",
   [string]$InstallRoot = "C:\PiServer",
   [string]$TailscaleAuthKey = ""
@@ -102,6 +105,9 @@ if (-not (Test-IsAdmin)) {
   if ($SourceZip -ne "") { $elevArgs += @("-SourceZip", "`"$SourceZip`"") }
   if ($ExpectedSha256 -ne "") { $elevArgs += @("-ExpectedSha256", "`"$ExpectedSha256`"") }
   if ($PayloadDir -ne "") { $elevArgs += @("-PayloadDir", "`"$PayloadDir`"") }
+  if ($Resume) { $elevArgs += "-Resume" }
+  if ($Force) { $elevArgs += "-Force" }
+  if ($FromStep -gt 0) { $elevArgs += @("-FromStep", "$FromStep") }
   # NOTE: TailscaleAuthKey is deliberately NOT forwarded on auto-elevation:
   # command lines are visible to other users (wmic/tasklist). Pass it only
   # to an already-elevated shell, or log in interactively.
@@ -119,20 +125,145 @@ try {
   # Transcript is a bonus; Write-InstallLog still writes the file.
 }
 
+# ---- install state (resume): checkpoint + real-state verification ----
+$script:StatePath = Join-Path $Paths.Data "install-state.json"
+$script:StepSkip = @{}
+function Save-StepState() {
+  $null = Write-InstallState -Path $script:StatePath -State $script:InstallState
+}
+function Complete-InstallStep([string]$Name) {
+  if ($script:InstallState.completedSteps -notcontains $Name) { $script:InstallState.completedSteps += $Name }
+  $script:InstallState.currentStep = ""
+  $script:InstallState.lastSuccessfulStep = $Name
+  $script:InstallState.lastErrorKind = ""
+  Save-StepState
+}
+function Skip-InstallStep([string]$Name) {
+  if ($script:InstallState.skippedSteps -notcontains $Name) { $script:InstallState.skippedSteps += $Name }
+  $script:InstallState.currentStep = ""
+  Save-StepState
+}
+function Resolve-StepFailure {
+  param([string]$Name, [string]$Label, [string]$Title, $Err, [int]$Attempt, [switch]$AllowSkip)
+  $msg = ""
+  try { $msg = $Err.Exception.Message } catch { $msg = [string]$Err }
+  $se = Split-StepError -Message $msg
+  $script:InstallState.lastErrorKind = $se.Kind
+  $script:InstallState.currentStep = $Name
+  Save-StepState
+  L "step $Label ($Name) errore [$($se.Kind)] tentativo $Attempt : $($se.Text)" "FAIL"
+  $act = Resolve-StepAction -Kind $se.Kind -Attempt $Attempt -MaxAttempts 3
+  if ($act -eq "retry") {
+    $d = Get-RetryDelaySec -Attempt $Attempt
+    L "retry automatico $Name tra ${d}s (tentativo $($Attempt + 1)/3)" "WARN"
+    Write-Host "Errore temporaneo, riprovo tra ${d}s... (tentativo $($Attempt + 1)/3)" -ForegroundColor Yellow
+    Start-Sleep -Seconds $d
+    return "retry"
+  }
+  if ($act -eq "fail") {
+    L "errore fatale in $Label ($Name): $($se.Text)" "FAIL"
+    Write-Host ""
+    Write-Host "ERRORE FATALE nello step $Label - $Title" -ForegroundColor Red
+    Write-Host $se.Text -ForegroundColor Yellow
+    Write-Host "Checkpoint salvato: $script:StatePath"
+    Write-Host "Rilancia lo stesso comando per riprendere (verifica automatica)."
+    exit 1
+  }
+  $choice = Show-StepMenu -StepLabel $Label -Title $Title -ErrorMessage $se.Text -Details $msg -AllowSkip:$AllowSkip
+  if ($choice -eq "skip") { Skip-InstallStep -Name $Name; L "step $Label saltato su scelta operatore" "WARN"; return "skip" }
+  if ($choice -eq "exit") {
+    Write-Host ""
+    Write-Host "Uscita con checkpoint. Per riprendere, rilancia lo stesso comando." -ForegroundColor Cyan
+    Write-Host "Stato: $script:StatePath"
+    exit 2
+  }
+  return "retry"
+}
+$script:StepCatalog = @(
+  @{ N = 1; Name = "windows"; Label = "1/11"; Title = "Controllo Windows" },
+  @{ N = 2; Name = "node"; Label = "2/11"; Title = "Node.js 22" },
+  @{ N = 3; Name = "pi"; Label = "3/11"; Title = "Pi Coding Agent" },
+  @{ N = 4; Name = "pi-telegram"; Label = "4/11"; Title = "pi-telegram" },
+  @{ N = 5; Name = "tailscale"; Label = "5/11"; Title = "Tailscale (private network)" },
+  @{ N = 6; Name = "deploy"; Label = "6/11"; Title = "Remote extension (deploy app)" },
+  @{ N = 7; Name = "config"; Label = "7/11"; Title = "Config (remote-server.json, no Telegram IDs anymore)" },
+  @{ N = 8; Name = "secrets"; Label = "8/11"; Title = "Secrets e login Pi" },
+  @{ N = 9; Name = "tasks"; Label = "9/11"; Title = "Windows startup (2 tasks) + firewall" },
+  @{ N = 10; Name = "sleep"; Label = "10/11"; Title = "Sleep settings" },
+  @{ N = 11; Name = "health"; Label = "11/11"; Title = "Health check" }
+)
+$stFile = Read-InstallState -Path $script:StatePath
+$script:InstallState = $stFile.State
+if ($stFile.Notice -ne "") { Write-Host $stFile.Notice -ForegroundColor Yellow; L $stFile.Notice "WARN" }
+if ($Force) {
+  $script:InstallState = @{ schemaVersion = 1; targetRelease = ""; completedSteps = @(); skippedSteps = @(); currentStep = ""; lastSuccessfulStep = ""; lastErrorKind = ""; updatedAt = "" }
+  L "-Force: checkpoint ignorato, verifica/rieseguo tutto" "WARN"
+}
+if ($FromStep -lt 0 -or $FromStep -gt 11) { Write-Host "-FromStep ignorato (range 1-11)." -ForegroundColor Yellow; $FromStep = 0 }
+foreach ($s in $script:StepCatalog) {
+  $run = $true
+  if ($Force) { $run = $true }
+  elseif ($FromStep -gt 0 -and $s.N -ge $FromStep) { $run = $true }
+  elseif ($Mode -eq "update" -and $s.Name -eq "deploy") { $run = $true }
+  elseif ($script:InstallState.completedSteps -contains $s.Name) {
+    $ok = $false
+    try { $ok = Test-StepRealState -Step $s.Name -Paths $Paths } catch { $ok = $false }
+    if ($ok) { $run = $false }
+  }
+  $script:StepSkip[$s.Name] = (-not $run)
+}
+if ($stFile.Corrupt -or $Force -or ($script:InstallState.lastSuccessfulStep -ne "") -or ($script:InstallState.completedSteps.Count -gt 0)) {
+  Write-Host ""
+  Write-Host "Installazione precedente rilevata." -ForegroundColor Cyan
+  foreach ($s in $script:StepCatalog) {
+    $mark = "da eseguire"
+    if ($script:StepSkip[$s.Name]) { $mark = "gia OK" }
+    Write-Host (("[" + $s.Label + "] " + $s.Title + " .......... " + $mark))
+  }
+  if ($script:InstallState.currentStep -ne "") {
+    Write-Host ("Ripresa da: " + $script:InstallState.currentStep)
+  }
+}
+$script:InstallState.targetRelease = $Version
+Save-StepState
+
 try {
   # ================= [1/11] Windows =================
   Step "1/11" "Controllo Windows"
-  if (-not (Test-WindowsOS)) { Fail "Questo installer gira solo su Windows." }
+  if ($script:StepSkip.windows) { L "step 1/11 gia OK (verificato), skip" "OK" }
+  else {
+    $script:InstallState.currentStep = "windows"; Save-StepState
+    $attempt = 0
+    while ($true) {
+      $attempt++
+      try {
+  if (-not (Test-WindowsOS)) { throw (New-StepError "System" "Questo installer gira solo su Windows.") }
   $os = Get-CimInstance Win32_OperatingSystem
   L "OS: $($os.Caption) build $($os.BuildNumber)" "OK"
   try {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
   } catch {
-    Fail "Impossibile abilitare TLS 1.2: $($_.Exception.Message)"
+    throw (New-StepError "System" "Impossibile abilitare TLS 1.2: $($_.Exception.Message)")
+  }
+
+        Complete-InstallStep -Name "windows"
+        break
+      } catch {
+        $dec = Resolve-StepFailure -Name "windows" -Label "1/11" -Title "Controllo Windows" -Err $_ -Attempt $attempt -AllowSkip
+        if ($dec -eq "skip") { break }
+      }
+    }
   }
 
   # ================= [2/11] Node =================
   Step "2/11" "Node.js 22"
+  if ($script:StepSkip.node) { L "step 2/11 gia OK (verificato), skip" "OK" }
+  else {
+    $script:InstallState.currentStep = "node"; Save-StepState
+    $attempt = 0
+    while ($true) {
+      $attempt++
+      try {
   $nodeOk = $false
   try {
     $v = & node -p "process.versions.node" 2>$null
@@ -154,7 +285,7 @@ try {
       L "winget assente: fallback MSI da nodejs.org" "WARN"
       $index = Invoke-RestMethod -Uri "https://nodejs.org/dist/index.json" -TimeoutSec 30
       $rel = $index | Where-Object { $_.version -match "^v22\." } | Select-Object -First 1
-      if ($null -eq $rel) { Fail "Nessuna release Node 22 trovata su nodejs.org." }
+      if ($null -eq $rel) { throw (New-StepError "Transient" "Nessuna release Node 22 trovata su nodejs.org.") }
       $msiUrl = "https://nodejs.org/dist/$($rel.version)/node-$($rel.version)-x64.msi"
       $msi = Join-Path $env:TEMP ("node-{0}.msi" -f $rel.version)
       Invoke-WebRequest -Uri $msiUrl -OutFile $msi -TimeoutSec 300
@@ -164,15 +295,31 @@ try {
     }
     $v = & node -p "process.versions.node" 2>$null
     if (-not (Test-AtLeastNode22 -VersionString $v)) {
-      Fail "Node.js >= 22 non disponibile dopo l'installazione (trovato: '$v')."
+      throw (New-StepError "System" "Node.js >= 22 non disponibile dopo l'installazione (trovato: '$v').")
     }
     L "Node.js $v installato" "OK"
   }
   $NodeExe = Resolve-ToolPath "node"
-  if ($null -eq $NodeExe) { Fail "node.exe non risolvibile dopo l'installazione." }
+  if ($null -eq $NodeExe) { throw (New-StepError "System" "node.exe non risolvibile dopo l'installazione.") }
+
+        Complete-InstallStep -Name "node"
+        break
+      } catch {
+        $dec = Resolve-StepFailure -Name "node" -Label "2/11" -Title "Node.js 22" -Err $_ -Attempt $attempt -AllowSkip
+        if ($dec -eq "skip") { break }
+      }
+    }
+  }
 
   # ================= [3/11] Pi =================
   Step "3/11" "Pi Coding Agent"
+  if ($script:StepSkip.pi) { L "step 3/11 gia OK (verificato), skip" "OK" }
+  else {
+    $script:InstallState.currentStep = "pi"; Save-StepState
+    $attempt = 0
+    while ($true) {
+      $attempt++
+      try {
   $piCmd = Resolve-ToolPath "pi"
   if ($null -ne $piCmd) {
     try {
@@ -184,7 +331,7 @@ try {
   if ($null -eq $piCmd) {
     L "install npm -g @earendil-works/pi-coding-agent"
     $npm = Resolve-ToolPath "npm"
-    if ($null -eq $npm) { Fail "npm non trovato (installazione Node incompleta?)." }
+    if ($null -eq $npm) { throw (New-StepError "System" "npm non trovato (installazione Node incompleta?).") }
     & $npm install -g "@earendil-works/pi-coding-agent" --no-audit --no-fund
     $piCmd = Resolve-ToolPath "pi"
     if ($null -eq $piCmd) {
@@ -196,13 +343,29 @@ try {
         if (Test-Path -LiteralPath $cand) { $piCmd = $cand; break }
       }
     }
-    if ($null -eq $piCmd) { Fail "Pi installato ma pi.cmd non trovato. Controlla il prefisso npm globale." }
+    if ($null -eq $piCmd) { throw (New-StepError "System" "Pi installato ma pi.cmd non trovato. Controlla il prefisso npm globale.") }
     L "Pi installato: $piCmd" "OK"
   }
   $NpmGlobalBin = Split-Path -Parent $piCmd
 
+        Complete-InstallStep -Name "pi"
+        break
+      } catch {
+        $dec = Resolve-StepFailure -Name "pi" -Label "3/11" -Title "Pi Coding Agent" -Err $_ -Attempt $attempt -AllowSkip
+        if ($dec -eq "skip") { break }
+      }
+    }
+  }
+
   # ================= [4/11] pi-telegram =================
   Step "4/11" "pi-telegram"
+  if ($script:StepSkip["pi-telegram"]) { L "step 4/11 gia OK (verificato), skip" "OK" }
+  else {
+    $script:InstallState.currentStep = "pi-telegram"; Save-StepState
+    $attempt = 0
+    while ($true) {
+      $attempt++
+      try {
   $listed = ""
   try { $listed = (& $piCmd list 2>$null | Out-String) } catch { }
   if ($listed -match "pi-telegram") {
@@ -218,13 +381,29 @@ try {
     $listed = ""
     try { $listed = (& $piCmd list 2>$null | Out-String) } catch { }
     if ($listed -notmatch "pi-telegram") {
-      Fail "pi-telegram non risulta installato (pi list). Rete disponibile? Riesegui con -Update dopo 'pi install npm:@llblab/pi-telegram' manuale."
+      throw (New-StepError "System" "pi-telegram non risulta installato (pi list). Rete disponibile? Riesegui con -Update dopo 'pi install npm:@llblab/pi-telegram' manuale.")
     }
     L "pi-telegram installato" "OK"
   }
 
+        Complete-InstallStep -Name "pi-telegram"
+        break
+      } catch {
+        $dec = Resolve-StepFailure -Name "pi-telegram" -Label "4/11" -Title "pi-telegram" -Err $_ -Attempt $attempt -AllowSkip
+        if ($dec -eq "skip") { break }
+      }
+    }
+  }
+
   # ================= [5/11] Tailscale =================
   Step "5/11" "Tailscale (private network)"
+  if ($script:StepSkip.tailscale) { L "step 5/11 gia OK (verificato), skip" "OK" }
+  else {
+    $script:InstallState.currentStep = "tailscale"; Save-StepState
+    $attempt = 0
+    while ($true) {
+      $attempt++
+      try {
   $tsExe = Resolve-ToolPath "tailscale"
   if ($null -eq $tsExe) {
     $tsExe = Join-Path ${env:ProgramFiles} "Tailscale\tailscale.exe"
@@ -247,7 +426,7 @@ try {
     Start-Sleep -Seconds 5
     $tsExe = Join-Path ${env:ProgramFiles} "Tailscale\tailscale.exe"
     if (-not (Test-Path -LiteralPath $tsExe)) { $tsExe = Resolve-ToolPath "tailscale" }
-    if ($null -eq $tsExe -or (-not (Test-Path -LiteralPath $tsExe))) { Fail "Tailscale installato ma tailscale.exe non trovato." }
+    if ($null -eq $tsExe -or (-not (Test-Path -LiteralPath $tsExe))) { throw (New-StepError "System" "Tailscale installato ma tailscale.exe non trovato.") }
     L "Tailscale installato" "OK"
   } else {
     L "Tailscale gia presente" "OK"
@@ -280,17 +459,33 @@ try {
       & $tsExe status 2>&1 | Out-Null
       if ($LASTEXITCODE -eq 0) { $tsUp = $true }
     } catch { }
-    if (-not $tsUp) { Fail "Tailscale non connesso (tailscale status fallisce). Rilancia con -Update dopo il login." }
+    if (-not $tsUp) { throw (New-StepError "Transient" "Tailscale non connesso (tailscale status fallisce). Completa il login e riprova.") }
   }
   $tsIp = ""
   try { $tsIp = ((& $tsExe ip -4 2>$null | Out-String).Trim().Split("`n")[0]).Trim() } catch { }
   if ($tsIp -notmatch "^100\.(6[4-9]|[78]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}$") {
-    Fail "IP Tailscale non valido o assente. Verifica tailscale status."
+    throw (New-StepError "Transient" "IP Tailscale non valido o assente. Verifica tailscale status.")
   }
   L "tailnet OK (this node: $tsIp)" "OK"
 
+        Complete-InstallStep -Name "tailscale"
+        break
+      } catch {
+        $dec = Resolve-StepFailure -Name "tailscale" -Label "5/11" -Title "Tailscale (private network)" -Err $_ -Attempt $attempt -AllowSkip
+        if ($dec -eq "skip") { break }
+      }
+    }
+  }
+
   # ================= [6/11] App deploy =================
   Step "6/11" "Remote extension (deploy app)"
+  if ($script:StepSkip.deploy) { L "step 6/11 gia OK (verificato), skip" "OK" }
+  else {
+    $script:InstallState.currentStep = "deploy"; Save-StepState
+    $attempt = 0
+    while ($true) {
+      $attempt++
+      try {
   $payload = $PayloadDir
   $tmpPayload = ""
   if ([string]::IsNullOrWhiteSpace($payload)) {
@@ -300,11 +495,11 @@ try {
     $zipPath = Join-Path $tmpRoot "payload.zip"
     if ($SourceZip -ne "") {
       L "payload locale: $SourceZip"
-      if (-not (Test-Path -LiteralPath $SourceZip)) { Fail "SourceZip non trovato: $SourceZip" }
+      if (-not (Test-Path -LiteralPath $SourceZip)) { throw (New-StepError "System" "SourceZip non trovato: $SourceZip") }
       Copy-Item -LiteralPath $SourceZip -Destination $zipPath -Force
       if ($ExpectedSha256 -ne "") {
         if (-not (Test-FileChecksum -Path $zipPath -ExpectedSha256 $ExpectedSha256)) {
-          Fail "Checksum dello ZIP locale non coincide (-ExpectedSha256). Abortito."
+          throw (New-StepError "Fatal" "Checksum dello ZIP locale non coincide (-ExpectedSha256). Abortito.")
         }
         L "checksum ZIP locale OK" "OK"
       } else {
@@ -312,15 +507,16 @@ try {
       }
     } else {
       $dl = Get-ReleaseDownload -Repo $Repo -Version $Version
+      $script:InstallState.targetRelease = $dl.Tag; Save-StepState
       L "download $($dl.ZipUrl)"
       Invoke-WebRequest -Uri $dl.ZipUrl -OutFile $zipPath -TimeoutSec 300
       $want = $ExpectedSha256
       if ([string]::IsNullOrWhiteSpace($want)) { $want = $dl.Sha256 }
       if ([string]::IsNullOrWhiteSpace($want)) {
-        Fail ("Nessun checksum disponibile per questa release (né -ExpectedSha256 né SHA256SUMS.txt: " + $dl.SumsError + "). Fail closed: crea una release con SHA256SUMS.txt o passa -ExpectedSha256.")
+        throw (New-StepError "Fatal" ("Nessun checksum disponibile per questa release (né -ExpectedSha256 né SHA256SUMS.txt: " + $dl.SumsError + "). Fail closed: crea una release con SHA256SUMS.txt o passa -ExpectedSha256."))
       }
       if (-not (Test-FileChecksum -Path $zipPath -ExpectedSha256 $want)) {
-        Fail "Checksum release non coincide. File scartato (fail closed)."
+        throw (New-StepError "Fatal" "Checksum release non coincide. File scartato (fail closed).")
       }
       L "checksum release OK" "OK"
     }
@@ -333,7 +529,7 @@ try {
   $payload = Resolve-PayloadRoot -Dir $payload
   $man = Test-ReleaseManifest -PayloadRoot $payload
   if (-not $man.Ok) {
-    Fail ("Manifest incompleto, file mancanti: " + ($man.Missing -join ", "))
+    throw (New-StepError "Fatal" ("Manifest incompleto, file mancanti: " + ($man.Missing -join ", ")))
   }
   L "manifest payload OK" "OK"
 
@@ -349,7 +545,7 @@ try {
   $ver = $Version
   if ($ver -eq "latest") { $ver = "latest@$(Get-Date -Format 'yyyyMMdd')" }
   $st = Invoke-AppStaging -PayloadDir $payload -AppPath $Paths.App -Mode $Mode -VersionLabel $ver
-  if (-not $st.Ok) { Fail ("Deploy staging fallito (app esistente intatta): " + $st.Error) }
+  if (-not $st.Ok) { throw (New-StepError "Fatal" ("Deploy staging fallito (app esistente intatta): " + $st.Error)) }
   $appBackup = $st.BackupPath
   if ($null -ne $appBackup) { L "backup app -> $appBackup" }
   L "app deployata (VERSION=$ver)" "OK"
@@ -391,7 +587,7 @@ try {
       if ($LASTEXITCODE -eq 0) { $nodeStripArgs = $candidate; $stripped = $true; break }
     } catch { }
   }
-  if (-not $stripped) { Fail "Node cannot type-check the remote daemon entry (node --check failed). Upgrade Node 22." }
+  if (-not $stripped) { throw (New-StepError "System" "Node cannot type-check the remote daemon entry (node --check failed). Upgrade Node 22.") }
   L "node type-stripping: $(if ($nodeStripArgs.Count -eq 0) { 'native (no flag)' } else { $nodeStripArgs -join ' ' })" "OK"
 
   # runtime-env.json with absolute paths (SYSTEM-safe).
@@ -410,18 +606,33 @@ try {
     Remove-Item -LiteralPath $tmpPayload -Recurse -Force -ErrorAction SilentlyContinue
   }
 
+        Complete-InstallStep -Name "deploy"
+        break
+      } catch {
+        $dec = Resolve-StepFailure -Name "deploy" -Label "6/11" -Title "Remote extension (deploy app)" -Err $_ -Attempt $attempt
+        if ($dec -eq "skip") { break }
+      }
+    }
+  }
+
   # ================= [7/11] Config =================
   Step "7/11" "Config (remote-server.json, no Telegram IDs anymore)"
+  if ($script:StepSkip.config) { L "step 7/11 gia OK (verificato), skip" "OK" }
+  else {
+    $script:InstallState.currentStep = "config"; Save-StepState
+    $attempt = 0
+    while ($true) {
+      $attempt++
+      try {
   $serverCfgPath = Join-Path $Paths.AgentDir "remote-server.json"
   $serverCfgExists = Test-Path -LiteralPath $serverCfgPath
   $portRaw = $env:PI_REMOTE_PORT
   if (-not $serverCfgExists) {
-    if ([string]::IsNullOrWhiteSpace($portRaw)) {
-      $portRaw = Read-Host "Remote API port [43128]"
-      if ([string]::IsNullOrWhiteSpace($portRaw)) { $portRaw = "43128" }
-    }
-    if ($portRaw -notmatch "^\d+$" -or [int]$portRaw -lt 1 -or [int]$portRaw -gt 65535) {
-      Fail "Port must be 1-65535."
+    $portEnv = $env:PI_REMOTE_PORT
+    if ((Test-ValidPort $portEnv)) { $portRaw = ([string]$portEnv).Trim() }
+    else {
+      if (-not [string]::IsNullOrWhiteSpace($portEnv)) { Write-Host "PI_REMOTE_PORT non valida, chiedo interattivamente." -ForegroundColor Yellow }
+      $portRaw = Read-ValidatedPort
     }
   }
   $serverDefaults = @{
@@ -443,8 +654,24 @@ try {
   if ($RemotePort -notmatch "^\d+$") { $RemotePort = "43128" }
   L "remote API port: $RemotePort" "OK"
 
+        Complete-InstallStep -Name "config"
+        break
+      } catch {
+        $dec = Resolve-StepFailure -Name "config" -Label "7/11" -Title "Config (remote-server.json)" -Err $_ -Attempt $attempt -AllowSkip
+        if ($dec -eq "skip") { break }
+      }
+    }
+  }
+
   # ================= [8/11] Secrets =================
   Step "8/11" "Secrets e login Pi"
+  if ($script:StepSkip.secrets) { L "step 8/11 gia OK (verificato), skip" "OK" }
+  else {
+    $script:InstallState.currentStep = "secrets"; Save-StepState
+    $attempt = 0
+    while ($true) {
+      $attempt++
+      try {
   L "--- step 8/11 (secrets+login)"
   if (-not (Test-Path -LiteralPath $Paths.SecretsDir)) {
     New-Item -ItemType Directory -Path $Paths.SecretsDir -Force | Out-Null
@@ -452,30 +679,94 @@ try {
   & icacls $Paths.SecretsDir /inheritance:r /grant:r "SYSTEM:(OI)(CI)F" /grant:r "Administrators:(OI)(CI)F" | Out-Null
   $tokFile = Join-Path $Paths.SecretsDir "server-bot-token"
   $hmacFile = Join-Path $Paths.SecretsDir "remote-hmac"
-  $botToken = $env:PI_SERVER_BOT_TOKEN
-  if (-not (Test-Path -LiteralPath $tokFile)) {
-    if ([string]::IsNullOrWhiteSpace($botToken)) {
-      $botToken = Read-HiddenInput -Prompt "ServerBot token (nascosto)"
+  # Token flow: validate FIRST, write ONLY when verified. Existing valid token
+  # is preserved; an unverifiable existing file is never deleted (only replaced
+  # after a new token verifies). The token value is never logged.
+  $botToken = $null
+  $botInfo = $null
+  $envTok = $env:PI_SERVER_BOT_TOKEN
+  if (-not [string]::IsNullOrWhiteSpace($envTok)) {
+    if (-not (Test-ValidTokenFormat $envTok)) { Write-Host "PI_SERVER_BOT_TOKEN malformato, lo ignoro e chiedo." -ForegroundColor Yellow }
+    else {
+      L "verifico token da env con Telegram..."
+      $chkEnv = Test-TelegramBotToken -Token $envTok.Trim() -TimeoutSec 20
+      if ($chkEnv.Ok) { $botToken = $envTok.Trim(); $botInfo = $chkEnv }
+      elseif ($chkEnv.Kind -eq "invalid-token") { Write-Host ("Token da env rifiutato: " + $chkEnv.Message) -ForegroundColor Yellow }
+      else {
+        $pickEnv = Show-StepMenu -StepLabel "8/11" -Title "Secrets e login Pi" -ErrorMessage ("Token da env non verificabile: " + $chkEnv.Message) -Details $chkEnv.Kind
+        if ($pickEnv -eq "exit") { Write-Host ""; Write-Host "Uscita con checkpoint. Per riprendere, rilancia lo stesso comando." -ForegroundColor Cyan; exit 2 }
+      }
     }
-    if ([string]::IsNullOrWhiteSpace($botToken)) { Fail "ServerBot token obbligatorio." }
-    $botToken | Out-File -LiteralPath $tokFile -Encoding ascii -NoNewline
+  }
+  if (($null -eq $botToken) -and (Test-Path -LiteralPath $tokFile)) {
+    $oldTok = ""
+    try { $oldTok = (Get-Content -LiteralPath $tokFile -Raw -ErrorAction Stop).Trim() } catch { $oldTok = "" }
+    if ($oldTok -ne "") {
+      L "verifico token esistente con Telegram..."
+      $chkOld = Test-TelegramBotToken -Token $oldTok -TimeoutSec 20
+      if ($chkOld.Ok) {
+        $botToken = $oldTok; $botInfo = $chkOld
+        L ("server-bot-token esistente verificato (id=" + $chkOld.BotId + ")") "OK"
+      }
+      elseif ($chkOld.Kind -eq "invalid-token") { Write-Host "Token esistente non piu valido: ne chiedo uno nuovo (il file resta finche il nuovo non e verificato)." -ForegroundColor Yellow }
+      else {
+        $pickOld = Show-StepMenu -StepLabel "8/11" -Title "Secrets e login Pi" -ErrorMessage ("Token esistente non verificabile: " + $chkOld.Message) -Details $chkOld.Kind
+        if ($pickOld -eq "exit") { Write-Host ""; Write-Host "Uscita con checkpoint. Per riprendere, rilancia lo stesso comando." -ForegroundColor Cyan; exit 2 }
+      }
+    }
+  }
+  while ($null -eq $botToken) {
+    $cand = Read-ValidatedHidden -Prompt "ServerBot token (nascosto)" -Validate { param($x) Test-ValidTokenFormat $x } -InvalidMessage "Formato token non valido (atteso 123456:ABC... da BotFather). Riprova."
+    $cand = $cand.Trim()
+    $attemptT = 0
+    while ($null -eq $botToken) {
+      $attemptT++
+      Write-Host "Verifico con Telegram..."
+      $chk = Test-TelegramBotToken -Token $cand -TimeoutSec 20
+      if ($chk.Ok) {
+        Write-Host ""
+        Write-Host "Bot trovato:" -ForegroundColor Green
+        Write-Host ("  ID: " + $chk.BotId)
+        if (-not [string]::IsNullOrWhiteSpace($chk.BotUsername)) { Write-Host ("  Username: @" + $chk.BotUsername) }
+        if (Read-ValidatedYesNo -Prompt "Usare questo bot? [Y/n]" -Default "Y") { $botToken = $cand; $botInfo = $chk }
+        break
+      }
+      if ($chk.Kind -eq "invalid-token") {
+        Write-Host ("Token Telegram non valido. " + $chk.Message) -ForegroundColor Yellow
+        Write-Host "Controlla BotFather e riprova."
+        break
+      }
+      Write-Host ("Token non ancora verificabile: " + $chk.Message) -ForegroundColor Yellow
+      if ($attemptT -lt 3) {
+        $dT = Get-RetryDelaySec -Attempt $attemptT
+        Write-Host "Riprovo tra ${dT}s..." -ForegroundColor Yellow
+        Start-Sleep -Seconds $dT
+      } else {
+        $pickT = Show-StepMenu -StepLabel "8/11" -Title "Secrets e login Pi" -ErrorMessage ("Token non verificabile: " + $chk.Message) -Details $chk.Kind
+        if ($pickT -eq "exit") { Write-Host ""; Write-Host "Uscita con checkpoint. Per riprendere, rilancia lo stesso comando." -ForegroundColor Cyan; exit 2 }
+      }
+    }
+  }
+  $writeTok = $true
+  if (Test-Path -LiteralPath $tokFile) {
+    try { if (((Get-Content -LiteralPath $tokFile -Raw -ErrorAction Stop).Trim()) -eq $botToken) { $writeTok = $false; L "server-bot-token esistente preservato (gia verificato)" "OK" } } catch { }
+  }
+  if ($writeTok) {
+    if (-not (Write-AtomicTextFile -Path $tokFile -Content $botToken -Encoding "ascii")) { throw (New-StepError "Fatal" "Impossibile scrivere server-bot-token (secret state inconsistente).") }
     & icacls $tokFile /inheritance:r /grant:r "SYSTEM:F" /grant:r "Administrators:F" | Out-Null
     L "server-bot-token scritto (ACL: SYSTEM+Administrators)" "OK"
-  } else {
-    L "server-bot-token esistente preservato" "OK"
   }
   $hmacShowOnce = ""
   if (-not (Test-Path -LiteralPath $hmacFile)) {
-    $hmac = $env:PI_REMOTE_HMAC
-    if ([string]::IsNullOrWhiteSpace($hmac)) {
-      $hmac = Read-HiddenInput -Prompt "HMAC secret [INVIO = genera automaticamente] (nascosto)"
+    $envHmac = $env:PI_REMOTE_HMAC
+    $hmac = $null
+    if ((Test-ValidHmac $envHmac)) { $hmac = @{ Secret = ([string]$envHmac); Generated = $false } }
+    else {
+      if (-not [string]::IsNullOrWhiteSpace($envHmac)) { Write-Host "PI_REMOTE_HMAC non valido (min 16 stampabili, no spazi), chiedo." -ForegroundColor Yellow }
+      $hmac = Read-ValidatedHmac
     }
-    if ([string]::IsNullOrWhiteSpace($hmac)) {
-      $hmac = New-RandomHex -Bytes 32
-      $hmacShowOnce = $hmac
-      L "HMAC generato (RNG crittografico)" "OK"
-    }
-    $hmac | Out-File -LiteralPath $hmacFile -Encoding ascii -NoNewline
+    if ($hmac.Generated) { $hmacShowOnce = $hmac.Secret; L "HMAC generato (RNG crittografico)" "OK" }
+    if (-not (Write-AtomicTextFile -Path $hmacFile -Content $hmac.Secret -Encoding "ascii")) { throw (New-StepError "Fatal" "Impossibile scrivere remote-hmac (secret state inconsistente).") }
     & icacls $hmacFile /inheritance:r /grant:r "SYSTEM:F" /grant:r "Administrators:F" | Out-Null
     L "remote-hmac scritto (ACL: SYSTEM+Administrators)" "OK"
   } else {
@@ -485,35 +776,24 @@ try {
   # pi-telegram itself reads telegram.json: keep both in sync, token redacted in logs).
   $tgJson = Join-Path $Paths.AgentDir "telegram.json"
   $ownerId = $env:PI_OWNER_ID
-  if ([string]::IsNullOrWhiteSpace($ownerId)) {
+  if (-not (Test-ValidOwnerId $ownerId)) {
+    if (-not [string]::IsNullOrWhiteSpace($ownerId)) { Write-Host "PI_OWNER_ID non valido, chiedo." -ForegroundColor Yellow }
+    $defOwner = $null
     try {
       $old = Get-Content -LiteralPath $tgJson -Raw -ErrorAction Stop | ConvertFrom-Json
       if ($null -ne $old.profiles -and $null -ne $old.profiles.default) {
-        $ownerId = [string]$old.profiles.default.allowedUserId
+        $cand = [string]$old.profiles.default.allowedUserId
+        if (Test-ValidOwnerId $cand) { $defOwner = $cand }
       }
     } catch { }
-    if ([string]::IsNullOrWhiteSpace($ownerId) -or ($ownerId -eq "0")) {
-      $ownerId = Read-Host "Owner Telegram user id (numerico, da @userinfobot)"
-    }
+    if ($null -ne $defOwner) { $ownerId = Read-ValidatedOwnerId -Prompt ("Owner Telegram user id (numerico, da @userinfobot) [" + $defOwner + "]") -Default $defOwner }
+    else { $ownerId = Read-ValidatedOwnerId }
   }
-  if ($ownerId -notmatch "^\d+$") { Fail "Owner id deve essere numerico." }
-  $tokNow = ""
-  if (Test-Path -LiteralPath $tokFile) {
-    $tokNow = (Get-Content -LiteralPath $tokFile -Raw).Trim()
-  }
-  if ($tokNow -eq "") { Fail "Token ServerBot illeggibile dopo la scrittura." }
-  @{ profiles = @{ default = @{ botToken = $tokNow; allowedUserId = [long]$ownerId } } } |
-    ConvertTo-Json -Depth 5 | Out-File -LiteralPath $tgJson -Encoding utf8
-  L "telegram.json sincronizzato (token non stampato nei log)" "OK"
-
-  # Token validity (getMe) without ever logging the token.
-  try {
-    $me = Invoke-RestMethod -Uri ("https://api.telegram.org/bot" + $tokNow + "/getMe") -TimeoutSec 20
-    if ($null -eq $me.ok -or -not $me.ok) { throw "getMe ok=false" }
-    L ("ServerBot getMe OK (id=" + $me.result.id + ")") "OK"
-  } catch {
-    Fail "ServerBot token non valido o rete assente: $($_.Exception.Message)"
-  }
+  # Token gia verificato in acquisizione: sincronizzo telegram.json atomicamente.
+  # (Nessuna seconda getMe: la validita e stata provata prima della scrittura.)
+  $tgBody = @{ profiles = @{ default = @{ botToken = $botToken; allowedUserId = [long]$ownerId } } } | ConvertTo-Json -Depth 5
+  if (-not (Write-AtomicTextFile -Path $tgJson -Content $tgBody -Encoding "utf8")) { throw (New-StepError "Fatal" "Impossibile scrivere telegram.json (secret state inconsistente).") }
+  L ("telegram.json sincronizzato (token non stampato nei log, bot id=" + $botInfo.BotId + ")") "OK"
 
   # ---- Pi login (same step 8/11: no credentials = no server) ----
   Write-Host ""
@@ -547,13 +827,29 @@ try {
       if ($LASTEXITCODE -eq 0) { $authOk = $true }
     } catch { }
     if (-not $authOk) {
-      Fail "Pi ancora senza credenziali (pi auth check fallisce). Completa /login e rilancia con -Update."
+      throw (New-StepError "System" "Pi ancora senza credenziali (pi auth check fallisce). Completa /login e scegli Riprova.")
     }
   }
   L "Pi autenticato (pi auth check OK)" "OK"
 
+        Complete-InstallStep -Name "secrets"
+        break
+      } catch {
+        $dec = Resolve-StepFailure -Name "secrets" -Label "8/11" -Title "Secrets e login Pi" -Err $_ -Attempt $attempt
+        if ($dec -eq "skip") { break }
+      }
+    }
+  }
+
   # ================= [9/11] Task =================
   Step "9/11" "Windows startup (2 tasks) + firewall"
+  if ($script:StepSkip.tasks) { L "step 9/11 gia OK (verificato), skip" "OK" }
+  else {
+    $script:InstallState.currentStep = "tasks"; Save-StepState
+    $attempt = 0
+    while ($true) {
+      $attempt++
+      try {
   $action = New-ScheduledTaskAction -Execute "powershell.exe" `
     -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$($Paths.RunTask)`"" `
     -WorkingDirectory (Split-Path -Parent $Paths.Daemon)
@@ -609,21 +905,53 @@ try {
     Start-ScheduledTask -TaskName $remoteTask
     L "tasks avviati" "OK"
   } catch {
-    Fail "Registrati ma avvio fallito: $($_.Exception.Message)"
+    throw (New-StepError "System" "Registrati ma avvio fallito: $($_.Exception.Message)")
+  }
+
+        Complete-InstallStep -Name "tasks"
+        break
+      } catch {
+        $dec = Resolve-StepFailure -Name "tasks" -Label "9/11" -Title "Windows startup (2 tasks) + firewall" -Err $_ -Attempt $attempt -AllowSkip
+        if ($dec -eq "skip") { break }
+      }
+    }
   }
 
   # ================= [10/11] Sleep =================
   Step "10/11" "Sleep settings"
+  if ($script:StepSkip.sleep) { L "step 10/11 gia OK (verificato), skip" "OK" }
+  else {
+    $script:InstallState.currentStep = "sleep"; Save-StepState
+    $attempt = 0
+    while ($true) {
+      $attempt++
+      try {
   try {
     & powercfg /change standby-timeout-ac 0
     & powercfg /hibernate off
     L "sleep AC disabilitato + hibernate off" "OK"
   } catch {
-    Fail "powercfg fallito: $($_.Exception.Message)"
+    throw (New-StepError "System" "powercfg fallito: $($_.Exception.Message)")
+  }
+
+        Complete-InstallStep -Name "sleep"
+        break
+      } catch {
+        $dec = Resolve-StepFailure -Name "sleep" -Label "10/11" -Title "Sleep settings" -Err $_ -Attempt $attempt -AllowSkip
+        if ($dec -eq "skip") { break }
+      }
+    }
   }
 
   # ================= [11/11] Health =================
   Step "11/11" "Health check"
+  if ($script:StepSkip.health) { L "step 11/11 gia OK (verificato), skip" "OK" }
+  else {
+    $script:InstallState.currentStep = "health"; Save-StepState
+    $attempt = 0
+    while ($true) {
+      $attempt++
+      try {
   Start-Sleep -Seconds 10
   $hc = Invoke-HealthCheck -Paths $Paths -PiBin $piCmd
   if (-not $hc.Ok) {
@@ -641,11 +969,20 @@ try {
       Copy-Item -Path (Join-Path $Paths.App "shared") -Destination $Paths.SharedDir -Recurse -Force
       try { Start-ScheduledTask -TaskName $TaskName } catch { }
       try { Start-ScheduledTask -TaskName $Paths.RemoteTaskName } catch { }
-      Fail ("Update fallito, rollback eseguito. Errori: " + ($hc.Failures -join "; "))
+      throw (New-StepError "System" ("Update fallito, rollback eseguito. Errori: " + ($hc.Failures -join "; ")))
     }
-    Fail ("Health check fallito: " + ($hc.Failures -join "; "))
+    throw (New-StepError "System" ("Health check fallito: " + ($hc.Failures -join "; ")))
   }
   L "health check OK" "OK"
+
+        Complete-InstallStep -Name "health"
+        break
+      } catch {
+        $dec = Resolve-StepFailure -Name "health" -Label "11/11" -Title "Health check" -Err $_ -Attempt $attempt
+        if ($dec -eq "skip") { break }
+      }
+    }
+  }
 
   # ================= HMAC once =================
   if ($hmacShowOnce -ne "") {

@@ -330,6 +330,171 @@ try {
   $wiText = Get-Content -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) "windows-installer.ps1") -Raw
   Assert-True ($wiText -match "Invoke-AppStaging -PayloadDir") "installer usa Invoke-AppStaging"
   Assert-True ($wiText -notmatch 'Join-Path \$stageNew \$sub') "nessuna copia inline sul leaf (bug 5.1)"
+
+  Write-Host "== telegram failure taxonomy =="
+  $k401 = Classify-TelegramFailure -StatusCode 401
+  Assert-True (($k401.Kind -eq "invalid-token") -and (-not $k401.Transient)) "401 = token invalido, non transient"
+  $k403 = Classify-TelegramFailure -StatusCode 403
+  Assert-True ($k403.Kind -eq "invalid-token") "403 = token invalido"
+  Assert-True ((Classify-TelegramFailure -StatusCode 404).Kind -eq "malformed") "404 = malformed"
+  $k500 = Classify-TelegramFailure -StatusCode 500
+  Assert-True (($k500.Kind -eq "server-busy") -and $k500.Transient) "500 = transient"
+  Assert-True ((Classify-TelegramFailure -StatusCode 0 -WebStatus "Timeout").Kind -eq "timeout") "timeout WebStatus"
+  Assert-True ((Classify-TelegramFailure -StatusCode 0 -WebStatus "NameResolutionFailure").Kind -eq "dns") "dns WebStatus"
+  Assert-True ((Classify-TelegramFailure -StatusCode 0 -WebStatus "SecureChannelFailure").Kind -eq "tls") "tls WebStatus"
+  Assert-True ((Classify-TelegramFailure -StatusCode 0 -WebStatus "ConnectFailure").Kind -eq "connection") "connection WebStatus"
+  Assert-True ((Classify-TelegramFailure -Message "The remote server returned an error: (401) Unauthorized.").Kind -eq "invalid-token") "401 nel testo (PS 5.1 senza Response)"
+  Assert-True ((Classify-TelegramFailure -Message "qualcosa di strano").Kind -eq "unknown") "sconosciuto = unknown"
+  $weTimeout = New-Object System.Net.WebException("The operation has timed out", [System.Net.WebExceptionStatus]::Timeout)
+  $fTimeout = Get-TelegramFailureFacts -Exception $weTimeout
+  Assert-True (($fTimeout.WebStatus -eq "Timeout") -and ((Classify-TelegramFailure -StatusCode $fTimeout.StatusCode -WebStatus $fTimeout.WebStatus -Message $fTimeout.Message).Kind -eq "timeout")) "facts+classify timeout end-to-end"
+  $weDns = New-Object System.Net.WebException("The remote name could not be resolved", [System.Net.WebExceptionStatus]::NameResolutionFailure)
+  $fDns = Get-TelegramFailureFacts -Exception $weDns
+  Assert-True ((Classify-TelegramFailure -StatusCode $fDns.StatusCode -WebStatus $fDns.WebStatus -Message $fDns.Message).Kind -eq "dns") "facts+classify dns end-to-end"
+  $fNull = Get-TelegramFailureFacts -Exception $null
+  Assert-True (($fNull.StatusCode -eq 0) -and ($fNull.WebStatus -eq "")) "facts su null non lancia"
+  $okResp = [pscustomobject]@{ ok = $true; result = [pscustomobject]@{ id = 123456789; username = "my_bot" } }
+  $pr = Test-TelegramGetMeResponse -Response $okResp
+  Assert-True ($pr.Ok -and ($pr.BotId -eq "123456789") -and ($pr.BotUsername -eq "my_bot")) "getMe ok parsata"
+  Assert-True (-not (Test-TelegramGetMeResponse -Response ([pscustomobject]@{ ok = $false })).Ok) "getMe ok=false rifiutata"
+  Assert-True (-not (Test-TelegramGetMeResponse -Response $null).Ok) "getMe null rifiutata"
+  Assert-True (-not (Test-TelegramGetMeResponse -Response ([pscustomobject]@{ ok = $true; result = [pscustomobject]@{} })).Ok) "getMe senza id rifiutata"
+  $invOk = { param($u, $t) return [pscustomobject]@{ ok = $true; result = [pscustomobject]@{ id = 42; username = "b" } } }
+  $tr = Test-TelegramBotToken -Token "123456:ABCDEFghij1234567890abcdefghij" -Invoker $invOk
+  Assert-True ($tr.Ok -and ($tr.BotId -eq "42")) "token valido via invoker"
+  $inv401 = { param($u, $t) throw (New-Object System.Net.WebException("The remote server returned an error: (401) Unauthorized.", [System.Net.WebExceptionStatus]::ProtocolError)) }
+  $tr401 = Test-TelegramBotToken -Token "123456:ERRATO" -Invoker $inv401
+  Assert-True ((-not $tr401.Ok) -and ($tr401.Kind -eq "invalid-token") -and (-not $tr401.Transient)) "token 401 = riprompt, non retry"
+  Assert-True ($tr401.Message -notmatch "123456:ERRATO") "token mai nel messaggio"
+  $invTo = { param($u, $t) throw (New-Object System.Net.WebException("The operation has timed out", [System.Net.WebExceptionStatus]::Timeout)) }
+  $trTo = Test-TelegramBotToken -Token "123456:TIMEOUTTEST" -Invoker $invTo
+  Assert-True ((-not $trTo.Ok) -and $trTo.Transient) "timeout = transient"
+  Assert-True ($trTo.Message -notmatch "TIMEOUTTEST") "token mai nel messaggio (timeout)"
+  $trEmpty = Test-TelegramBotToken -Token ""
+  Assert-True ((-not $trEmpty.Ok) -and ($trEmpty.Kind -eq "empty")) "token vuoto"
+
+  Write-Host "== input validators + prompt loops =="
+  Assert-True (-not (Test-ValidPort "abc")) "porta abc rifiutata"
+  Assert-True (-not (Test-ValidPort "0")) "porta 0 rifiutata"
+  Assert-True (-not (Test-ValidPort "65536")) "porta 65536 rifiutata"
+  Assert-True (-not (Test-ValidPort "")) "porta vuota rifiutata"
+  Assert-True (Test-ValidPort "43128") "porta 43128 accettata"
+  Assert-True (Test-ValidPort "1") "porta 1 accettata"
+  Assert-True (Test-ValidPort "65535") "porta 65535 accettata"
+  Assert-True (-not (Test-ValidOwnerId "abc")) "owner abc rifiutato"
+  Assert-True (-not (Test-ValidOwnerId "0")) "owner 0 rifiutato"
+  Assert-True (Test-ValidOwnerId "123456789") "owner numerico accettato"
+  Assert-True (Test-ValidTokenFormat "123456:ABCDEFghij1234567890abcdefghij") "formato token ok"
+  Assert-True (-not (Test-ValidTokenFormat "nontoken")) "formato token rifiutato"
+  Assert-True (-not (Test-ValidHmac "corto")) "hmac corto rifiutato"
+  Assert-True (-not (Test-ValidHmac "ha spazi dentro qui okkk")) "hmac con spazi rifiutato"
+  Assert-True (Test-ValidHmac "0123456789abcdef0123456789abcdef") "hmac valido accettato"
+  $script:fakeAnswers = @()
+  $fakeRead = { param($p) $a = $null; if ($script:fakeAnswers.Count -gt 0) { $a = $script:fakeAnswers[0]; $script:fakeAnswers = @($script:fakeAnswers | Select-Object -Skip 1) }; return $a }
+  $script:fakeAnswers = @("abc", "90000", "43128")
+  Assert-Equal (Read-ValidatedPort -ReadFunc $fakeRead) "43128" "porta: due errori poi valore"
+  $script:fakeAnswers = @("")
+  Assert-Equal (Read-ValidatedPort -ReadFunc $fakeRead) "43128" "porta vuota = default"
+  $script:fakeAnswers = @("abc", "123")
+  Assert-Equal (Read-ValidatedOwnerId -ReadFunc $fakeRead) "123" "owner: errore poi valore"
+  $script:fakeAnswers = @("forse", "s")
+  Assert-True (Read-ValidatedYesNo -Prompt "Confermi?" -ReadFunc $fakeRead) "yesno: garbage poi s = true"
+  $script:fakeAnswers = @("n")
+  Assert-True (-not (Read-ValidatedYesNo -Prompt "Confermi?" -ReadFunc $fakeRead)) "yesno: n = false"
+  $script:fakeAnswers = @("")
+  Assert-True (Read-ValidatedYesNo -Prompt "Confermi?" -ReadFunc $fakeRead) "yesno: vuoto = default Y"
+  $script:fakeAnswers = @("")
+  $genHmac = Read-ValidatedHmac -ReadFunc $fakeRead
+  Assert-True (($genHmac.Secret.Length -eq 64) -and ($genHmac.Secret -notmatch "\s") -and $genHmac.Generated) "hmac vuoto = generato 64hex"
+  $script:fakeAnswers = @("corto", "0123456789abcdef0123456789abcdef")
+  $typedHmac = Read-ValidatedHmac -ReadFunc $fakeRead
+  Assert-True (($typedHmac.Secret -eq "0123456789abcdef0123456789abcdef") -and (-not $typedHmac.Generated)) "hmac: errore poi valore digitato"
+  $script:fakeAnswers = @("")
+  Assert-Equal (Read-ValidatedOwnerId -Prompt "Owner" -Default "777" -ReadFunc $fakeRead) "777" "owner vuoto = default esistente"
+  $atomPath = Join-Path $TmpRoot "atomico.txt"
+  Assert-True (Write-AtomicTextFile -Path $atomPath -Content "uno") "atomic write ok"
+  Assert-Equal (Get-Content -LiteralPath $atomPath -Raw) "uno" "atomic contenuto"
+  Assert-True (Write-AtomicTextFile -Path $atomPath -Content "due") "atomic overwrite ok"
+  Assert-Equal (Get-Content -LiteralPath $atomPath -Raw) "due" "atomic overwrite contenuto"
+  Assert-True ((@(Get-ChildItem -LiteralPath $TmpRoot -Filter "atomico.txt.tmp-*")).Count -eq 0) "atomic: nessun tmp residuo"
+  Assert-True (-not (Write-AtomicTextFile -Path "" -Content "x")) "atomic path vuoto = false"
+  $script:fakeAnswers = @("nontoken", "123456:ABCDEFghij1234567890abcdefghij")
+  $tokLoop = Read-ValidatedHidden -Prompt "Token" -Validate { param($x) Test-ValidTokenFormat $x } -InvalidMessage "bad" -ReadFunc $fakeRead
+  Assert-Equal $tokLoop "123456:ABCDEFghij1234567890abcdefghij" "token: formato errato poi valido"
+
+  Write-Host "== retry engine + step taxonomy =="
+  Assert-Equal (Get-RetryDelaySec -Attempt 1) 2 "delay 1 = 2s"
+  Assert-Equal (Get-RetryDelaySec -Attempt 2) 4 "delay 2 = 4s"
+  Assert-Equal (Get-RetryDelaySec -Attempt 3) 8 "delay 3 = 8s"
+  Assert-Equal (Get-RetryDelaySec -Attempt 10) 30 "delay cap 30s"
+  $script:flakyN = 0
+  $rw1 = Invoke-WithRetry -Action { $script:flakyN++; if ($script:flakyN -lt 2) { throw "timeout simulato" }; return "fatto" } -IsTransient { param($e) ($e.Exception.Message -match "timeout") } -BaseDelaySec 0
+  Assert-True ($rw1.Ok -and ($rw1.Value -eq "fatto") -and ($rw1.Attempts -eq 2)) "retry: transient poi successo"
+  $rw2 = Invoke-WithRetry -Action { throw "checksum mismatch simulato" } -IsTransient { param($e) $false } -BaseDelaySec 0
+  Assert-True ((-not $rw2.Ok) -and ($rw2.Attempts -eq 1)) "non-transient: nessun retry"
+  $script:alwaysN = 0
+  $rw3 = Invoke-WithRetry -Action { $script:alwaysN++; throw "connessione persa" } -IsTransient { param($e) $true } -MaxAttempts 3 -BaseDelaySec 0
+  Assert-True ((-not $rw3.Ok) -and ($rw3.Attempts -eq 3)) "sempre-transient: 3 tentativi poi stop"
+  $se1 = Split-StepError (New-StepError "Transient" "x timeout y")
+  Assert-True ($se1.Kind -eq "Transient") "tag Transient letto"
+  $se2 = Split-StepError (New-StepError "Fatal" "checksum bad")
+  Assert-True ($se2.Kind -eq "Fatal") "tag Fatal letto"
+  $se3 = Split-StepError "The operation has timed out"
+  Assert-True ($se3.Kind -eq "Transient") "eccezione raw timeout = Transient"
+  $se4 = Split-StepError "qualcosa di generico" 
+  Assert-True ($se4.Kind -eq "System") "default = System"
+  Assert-Equal (Resolve-StepAction -Kind "Fatal" -Attempt 1) "fail" "fatal = fail"
+  Assert-Equal (Resolve-StepAction -Kind "Transient" -Attempt 1) "retry" "transient tentativo 1 = retry"
+  Assert-Equal (Resolve-StepAction -Kind "Transient" -Attempt 3) "menu" "transient tentativo 3 = menu"
+  Assert-Equal (Resolve-StepAction -Kind "System" -Attempt 1) "menu" "system = menu"
+  $mRetry = Show-StepMenu -StepLabel "8/11" -Title "T" -ErrorMessage "e" -ReadFunc { param($o) return "r" }
+  Assert-Equal $mRetry "retry" "menu R"
+  $mSkip = Show-StepMenu -StepLabel "8/11" -Title "T" -ErrorMessage "e" -AllowSkip -ReadFunc { param($o) return "s" }
+  Assert-Equal $mSkip "skip" "menu S (consentito)"
+  $script:mns = 0
+  $mNoSkip = Show-StepMenu -StepLabel "8/11" -Title "T" -ErrorMessage "e" -ReadFunc { param($o) if ($script:mns -ne 1) { $script:mns = 1; return "s" } else { return "e" } }
+  Assert-Equal $mNoSkip "exit" "menu S negato su step critico"
+  $script:mns = 0
+  $mDet = Show-StepMenu -StepLabel "8/11" -Title "T" -ErrorMessage "e" -Details "dettagli-ok" -ReadFunc { param($o) if ($script:mns -ne 1) { $script:mns = 1; return "d" } else { return "e" } }
+  Assert-Equal $mDet "exit" "menu D poi E"
+  $script:mns = 0
+  $mDef = Show-StepMenu -StepLabel "8/11" -Title "T" -ErrorMessage "e" -ReadFunc { param($o) return "" }
+  Assert-Equal $mDef "retry" "menu vuoto = default R"
+
+  Write-Host "== checkpoint atomico =="
+  $cpPath = Join-Path $TmpRoot "install-state.json"
+  $rMissing = Read-InstallState -Path (Join-Path $TmpRoot "nonesiste.json")
+  Assert-True (($rMissing.State.completedSteps.Count -eq 0) -and (-not $rMissing.Corrupt)) "checkpoint mancante = blank"
+  $st0 = @{ schemaVersion = 1; targetRelease = "v9.9.9"; completedSteps = @("windows", "node"); skippedSteps = @(); currentStep = "pi"; lastSuccessfulStep = "node"; lastErrorKind = ""; updatedAt = "" }
+  Assert-True (Write-InstallState -Path $cpPath -State $st0) "scrittura checkpoint"
+  $rBack = Read-InstallState -Path $cpPath
+  Assert-True (($rBack.State.targetRelease -eq "v9.9.9") -and ($rBack.State.completedSteps -contains "node") -and ($rBack.State.currentStep -eq "pi")) "round-trip checkpoint"
+  Assert-True ((@(Get-ChildItem -LiteralPath $TmpRoot -Filter "install-state.json.tmp-*")).Count -eq 0) "nessun tmp residuo"
+  "NON-JSON{{{" | Out-File -LiteralPath $cpPath -Encoding ascii -Force
+  $rCorr = Read-InstallState -Path $cpPath
+  Assert-True ($rCorr.Corrupt -and ($rCorr.State.completedSteps.Count -eq 0)) "corrotto = backup + blank"
+  Assert-True ((@(Get-ChildItem -LiteralPath $TmpRoot -Filter "install-state.json.corrupt-*")).Count -ge 1) "backup corrotto creato"
+  '{ "schemaVersion": 99, "completedSteps": ["windows"] }' | Out-File -LiteralPath $cpPath -Encoding ascii -Force
+  $rOld = Read-InstallState -Path $cpPath
+  Assert-True (($rOld.State.completedSteps.Count -eq 0) -and ($rOld.Notice -ne "")) "schema vecchio = blank + notice"
+  $stSecret = @{ schemaVersion = 1; targetRelease = "v"; completedSteps = @(); skippedSteps = @(); currentStep = ""; lastSuccessfulStep = ""; lastErrorKind = ""; updatedAt = ""; botToken = "123456:SEGRETOTEST999"; remoteHmac = "hmac-segreto-test" }
+  [void](Write-InstallState -Path $cpPath -State $stSecret)
+  $cpRaw = Get-Content -LiteralPath $cpPath -Raw
+  Assert-True (($cpRaw -notmatch "SEGRETOTEST999") -and ($cpRaw -notmatch "hmac-segreto-test")) "secret mai nel checkpoint"
+
+  Write-Host "== redazione log + verifiche real-state =="
+  $logf2 = Join-Path $TmpRoot "t2.log"
+  Write-InstallLog -Message "prova bot123456:ABCDEFghij1234567890abcdefghij fine" -LogFile $logf2 -Level OK
+  $lc2 = Get-Content -LiteralPath $logf2 -Raw
+  Assert-True (($lc2 -match "bot<redacted>") -and ($lc2 -notmatch "ABCDEFghij1234567890abcdefghij")) "token redactato nei log"
+  $bogus2 = Get-PiServerPaths -Root (Join-Path $TmpRoot "vuoto2")
+  Assert-True (-not (Test-StepRealState -Step "deploy" -Paths $bogus2)) "verify deploy vuoto = false"
+  Assert-True (-not (Test-StepRealState -Step "secrets" -Paths $bogus2)) "verify secrets vuoto = false"
+  Assert-True (-not (Test-StepRealState -Step "sconosciuto" -Paths $bogus2)) "verify step ignoto = false"
+  Assert-True (-not (Test-StepRealState -Step "sleep" -Paths $bogus2)) "sleep sempre rieseguito"
+  $threw3 = $false
+  try { $null = Test-StepRealState -Step "deploy" -Paths $null } catch { $threw3 = $true }
+  Assert-True (-not $threw3) "verifier non lancia mai"
 } finally {
   Remove-Item -LiteralPath $TmpRoot -Recurse -Force -ErrorAction SilentlyContinue
 }

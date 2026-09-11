@@ -31,6 +31,9 @@ param(
   [string]$Version = "latest",
   [string]$ExpectedSha256 = "",
   [switch]$Update,
+  [switch]$Resume,
+  [switch]$Force,
+  [int]$FromStep = 0,
   [string]$InstallRoot = "C:\PiServer",
   [string]$TailscaleAuthKey = ""
 )
@@ -137,6 +140,9 @@ if (-not $IsAdminNow) {
   $eArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$selfFile`"",
     "-Repo", "`"$Repo`"", "-Version", "`"$Version`"", "-InstallRoot", "`"$InstallRoot`"")
   if ($Update) { $eArgs += "-Update" }
+  if ($Resume) { $eArgs += "-Resume" }
+  if ($Force) { $eArgs += "-Force" }
+  if ($FromStep -gt 0) { $eArgs += @("-FromStep", "$FromStep") }
   if ($ExpectedSha256 -ne "") { $eArgs += @("-ExpectedSha256", "`"$ExpectedSha256`"") }
   try {
     $p = Start-Process -FilePath "powershell.exe" -ArgumentList $eArgs -Verb RunAs -Wait -PassThru
@@ -174,6 +180,22 @@ try {
   if ([string]::IsNullOrWhiteSpace($zipUrl)) {
     throw "Asset mi-pi-server-windows.zip assente nella release $($rel.tag_name)."
   }
+  # Resume senza riscaricare: se il checkpoint dice deploy/config/secrets/tasks
+  # fatti per QUESTA release e app/VERSION esistono, salto download+verify+extract.
+  # L'installer riverifica comunque ogni step sulla macchina reale.
+  $bootSkipDownload = $false
+  try {
+    $peekRaw = Get-Content -LiteralPath (Join-Path $InstallRoot "data\install-state.json") -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    $peekDone = @($peekRaw.completedSteps)
+    $peekOk = $true
+    foreach ($pn in @("deploy", "config", "secrets", "tasks")) { if ($peekDone -notcontains $pn) { $peekOk = $false } }
+    if ($peekOk -and ([string]$peekRaw.targetRelease -eq [string]$rel.tag_name) -and (Test-Path -LiteralPath (Join-Path $InstallRoot "app\server\pi-daemon.mjs")) -and (Test-Path -LiteralPath (Join-Path $InstallRoot "app\VERSION")) -and (Test-Path -LiteralPath (Join-Path $InstallRoot "app\installer\windows-installer.ps1"))) {
+      $bootSkipDownload = $true
+      Write-Host "Deploy gia verificato per $($rel.tag_name): salto il download, riprendo dall'installer." -ForegroundColor Cyan
+    }
+  } catch { $bootSkipDownload = $false }
+  $payload = ""
+  if (-not $bootSkipDownload) {
   $want = $ExpectedSha256
   if ([string]::IsNullOrWhiteSpace($want) -and (-not [string]::IsNullOrWhiteSpace($sumsUrl))) {
     # Never parse IWR .Content in-memory: on PS 5.1 that path depends on the IE
@@ -225,17 +247,26 @@ try {
   }
   Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue
 
+  } else {
+    $installer = Join-Path $InstallRoot "app\installer\windows-installer.ps1"
+  }
   $iArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$installer`"",
     "-Repo", "`"$Repo`"", "-Version", "`"$Version`"",
-    "-PayloadDir", "`"$payload`"", "-InstallRoot", "`"$InstallRoot`"")
+    "-InstallRoot", "`"$InstallRoot`"")
+  if ($payload -ne "") { $iArgs += @("-PayloadDir", "`"$payload`"") }
   if ($Update) { $iArgs += "-Update" }
+  if ($Resume) { $iArgs += "-Resume" }
+  if ($Force) { $iArgs += "-Force" }
+  if ($FromStep -gt 0) { $iArgs += @("-FromStep", "$FromStep") }
   if ($ExpectedSha256 -ne "") { $iArgs += @("-ExpectedSha256", "`"$ExpectedSha256`"") }
   # Auth key travels only inside this already-elevated session (still visible
   # in this process command line: prefer interactive login when shoulder-surfing matters).
   if ($TailscaleAuthKey -ne "") { $iArgs += @("-TailscaleAuthKey", "`"$TailscaleAuthKey`"") }
   # Run in-process so output streams live; exit code propagates.
+  # 0 = ok, 1 = failed, 2 = paused with checkpoint (rilancia per riprendere).
   & powershell.exe @iArgs
   $code = $LASTEXITCODE
+  if ($code -eq 2) { Write-Host "Installer in pausa (checkpoint salvato). Rilancia lo stesso comando per riprendere." -ForegroundColor Cyan }
 } catch {
   Write-Host ""
   Write-Host "BOOTSTRAP FALLITO" -ForegroundColor Red

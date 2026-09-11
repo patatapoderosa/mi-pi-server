@@ -84,6 +84,16 @@ user HOME irrelevant.
 - On the Mac: `mac/setup-mac.sh` with the server tailnet name + the same HMAC.
 - Reboot test: reboot; with no login both tasks must be Running and Telegram online.
 
+### Resume (automatic)
+
+Rerunning the one-liner resumes an interrupted install: completed steps are
+re-verified against the real machine and skipped, failed steps rerun.
+Input mistakes reprompt in place (the window never closes on bad input).
+Transient errors retry automatically, then offer [R]etry / [S]kip / [D]etails /
+[E]xit-with-checkpoint. Optional flags: `-Force` (redo everything),
+`-FromStep N` (force-run from step N, earlier steps still verified).
+Exit codes: 0 = ok, 1 = failed, 2 = paused, relaunch to resume.
+
 ### Update / uninstall
 
 ```powershell

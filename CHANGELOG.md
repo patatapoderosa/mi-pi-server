@@ -1,5 +1,41 @@
 # Changelog
 
+## v0.2.2 — 2026-09-11
+
+### Fixed
+
+- Fixed false Telegram error on Windows: the installer showed
+  "ServerBot token non valido o rete assente" even for valid tokens.
+  Token validation now uses `Test-TelegramBotToken` (with
+  `-UseBasicParsing`, no IE engine on PS 5.1) which classifies the real
+  cause: 401/403 invalid vs DNS vs timeout vs TLS vs connection vs 5xx.
+  The misleading message is gone; each case gets accurate guidance.
+- Token is now validated with `getMe` BEFORE saving: existing valid tokens
+  are preserved, network failures never overwrite good config, and
+  `telegram.json` is written atomically only after verification.
+- User input errors no longer kill the setup: port/owner/HMAC/token/yes-no
+  prompts reprompt in a loop (`Read-Validated*` helpers) instead of
+  `SETUP FALLITO / exit 1`.
+- Added error taxonomy (UserInput / Transient / System / Fatal): transient
+  errors auto-retry 2s/4s/8s then offer [R]etry/[S]kip/[D]etails/[E]xit;
+  system errors show the same menu; fatal (integrity) errors save a
+  checkpoint and exit with resume instructions. Exit-with-checkpoint uses
+  exit code 2 (0 = ok, 1 = failed).
+- Added crash-safe resume: atomic `C:\PiServer\data\install-state.json`
+  checkpoint (tmp+rename, secrets never stored, corrupt file backed up),
+  per-step real-state verification (machine is source of truth), resume UX
+  listing already-OK steps, `-Force` / `-FromStep` flags, and bootstrap
+  download skip when the release is already deployed+verified.
+- Added ~90 smoke assertions (telegram taxonomy, validators, prompt loops,
+  retry/taxonomy/menu, checkpoint, log redaction, real-state verifiers).
+
+### Upgrade notes
+
+- No migration needed: rerun the one-liner (resolves `latest` → v0.2.2).
+  Interrupted installs resume automatically from the failed step.
+  `-Update` keeps working (deploy always re-runs in update mode).
+
+
 ## v0.2.1 — 2026-09-11
 
 ### Fixed

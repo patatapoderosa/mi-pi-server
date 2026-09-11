@@ -93,6 +93,9 @@ function Write-InstallLog {
     [string]$LogFile = "",
     [ValidateSet("INFO", "OK", "WARN", "FAIL")][string]$Level = "INFO"
   )
+  # Defense in depth: a Telegram bot token must never reach logs even if a
+  # caller interpolates one by mistake. Pattern covers '<digits>:<secret>'.
+  $Message = $Message -replace 'bot\d+:[A-Za-z0-9_-]{20,}', 'bot<redacted>'
   $line = "{0:yyyy-MM-dd HH:mm:ss} [{1}] {2}" -f (Get-Date), $Level, $Message
   if ($Level -eq "FAIL") { Write-Host $line -ForegroundColor Red }
   elseif ($Level -eq "WARN") { Write-Host $line -ForegroundColor Yellow }
@@ -292,6 +295,498 @@ function Invoke-AppStaging {
 
 <#
 .SYNOPSIS
+  Validate a Telegram ServerBot token via getMe, classifying failures.
+.DESCRIPTION
+  Returns @{ Ok, Kind, Message, BotId, BotUsername, Transient }. Never logs
+  the token or the full URL. -UseBasicParsing bypasses the IE engine on
+  PS 5.1 (a whole failure class on fresh Windows). -Invoker injects a fake
+  HTTP call for tests: scriptblock param($url, $timeoutSec).
+  Kind: ok | empty | invalid-token | malformed | dns | timeout | tls |
+  connection | server-busy | api-error | ie-engine | unknown.
+#>
+function Test-TelegramBotToken {
+  param([string]$Token, [int]$TimeoutSec = 20, [scriptblock]$Invoker = $null)
+  if ([string]::IsNullOrWhiteSpace($Token)) {
+    return @{ Ok = $false; Kind = "empty"; Message = "Token vuoto."; BotId = ""; BotUsername = ""; Transient = $false }
+  }
+  $url = ("https://api.telegram.org/bot" + $Token.Trim() + "/getMe")
+  try {
+    if ($null -ne $Invoker) { $me = & $Invoker $url $TimeoutSec }
+    else { $me = Invoke-RestMethod -Uri $url -TimeoutSec $TimeoutSec -UseBasicParsing }
+  } catch {
+    $facts = Get-TelegramFailureFacts -Exception $_
+    $c = Classify-TelegramFailure -StatusCode $facts.StatusCode -WebStatus $facts.WebStatus -Message $facts.Message
+    return @{ Ok = $false; Kind = $c.Kind; Message = $c.Message; BotId = ""; BotUsername = ""; Transient = $c.Transient }
+  }
+  return Test-TelegramGetMeResponse -Response $me
+}
+
+<#
+.SYNOPSIS
+  Pure shape check of a getMe response. No network, never throws.
+#>
+function Test-TelegramGetMeResponse {
+  param($Response)
+  try {
+    if ($null -eq $Response -or $Response.ok -ne $true) {
+      return @{ Ok = $false; Kind = "api-error"; Message = "Telegram ha risposto ok=false."; BotId = ""; BotUsername = ""; Transient = $false }
+    }
+    $id = ""; $un = ""
+    try { $id = [string]$Response.result.id } catch { }
+    try { $un = [string]$Response.result.username } catch { }
+    if ($id -notmatch "^\d+$") {
+      return @{ Ok = $false; Kind = "malformed"; Message = "Risposta getMe inattesa (id mancante)."; BotId = ""; BotUsername = ""; Transient = $false }
+    }
+    return @{ Ok = $true; Kind = "ok"; Message = "OK"; BotId = $id; BotUsername = $un; Transient = $false }
+  } catch {
+    return @{ Ok = $false; Kind = "malformed"; Message = "Risposta getMe inattesa."; BotId = ""; BotUsername = ""; Transient = $false }
+  }
+}
+
+<#
+.SYNOPSIS
+  Extract network facts from a failed web call. Pure, never throws.
+.DESCRIPTION
+  Handles PS 5.1 WebException (.Response.StatusCode + .Status) and PS 7
+  HttpResponseException (.StatusCode). Returns @{ StatusCode=[int];
+  WebStatus=[string]; Message=[string] }. Message never contains the token:
+  .NET web exceptions carry status text, not the request URL.
+#>
+function Get-TelegramFailureFacts {
+  param($Exception)
+  $code = 0; $ws = ""; $msg = ""
+  try {
+    $ex = $Exception
+    # NOTE: do NOT probe $Exception.Exception directly: under Set-StrictMode 2.0
+    # a missing property throws. -is is strict-safe.
+    if (($ex -is [System.Management.Automation.ErrorRecord]) -and ($null -ne $ex.Exception)) { $ex = $ex.Exception }
+    try { $msg = [string]$ex.Message } catch { }
+    try {
+      if ($null -ne $ex.Response -and $null -ne $ex.Response.StatusCode) {
+        $code = [int]$ex.Response.StatusCode.value__
+      } elseif ($null -ne $ex.StatusCode) {
+        $code = [int]$ex.StatusCode.value__
+      }
+    } catch { }
+    try {
+      if ($null -ne $ex.Status) { $ws = [string]$ex.Status }
+    } catch { }
+  } catch { }
+  return @{ StatusCode = $code; WebStatus = $ws; Message = $msg }
+}
+
+<#
+.SYNOPSIS
+  Classify a Telegram failure into Kind + Transient. Pure, never throws.
+#>
+function Classify-TelegramFailure {
+  param([int]$StatusCode = 0, [string]$WebStatus = "", [string]$Message = "")
+  if ($StatusCode -eq 401 -or $StatusCode -eq 403) {
+    return @{ Kind = "invalid-token"; Transient = $false; Message = "Token rifiutato da Telegram (HTTP $StatusCode): revoca o rigenera via BotFather." }
+  }
+  if ($StatusCode -eq 404) {
+    return @{ Kind = "malformed"; Transient = $false; Message = "Endpoint non trovato (HTTP 404): token malformato." }
+  }
+  if ($StatusCode -eq 429) {
+    return @{ Kind = "server-busy"; Transient = $true; Message = "Telegram rate-limit (HTTP 429): riprovo." }
+  }
+  if ($StatusCode -ge 500 -and $StatusCode -le 599) {
+    return @{ Kind = "server-busy"; Transient = $true; Message = "Telegram non disponibile (HTTP $StatusCode): riprovo." }
+  }
+  if ($StatusCode -ge 400 -and $StatusCode -lt 500) {
+    return @{ Kind = "api-error"; Transient = $false; Message = "Errore API Telegram (HTTP $StatusCode)." }
+  }
+  # PS 5.1 WebException text often carries the code when .Response is gone.
+  if ($Message -match "\((401|403)\)") {
+    return @{ Kind = "invalid-token"; Transient = $false; Message = "Token rifiutato da Telegram (HTTP $($Matches[1])): revoca o rigenera via BotFather." }
+  }
+  if ($Message -match "\(404\)") {
+    return @{ Kind = "malformed"; Transient = $false; Message = "Endpoint non trovato (HTTP 404): token malformato." }
+  }
+  if ($Message -match "\((429|5\d\d)\)") {
+    return @{ Kind = "server-busy"; Transient = $true; Message = "Telegram non disponibile (HTTP $($Matches[1])): riprovo." }
+  }
+  $wl = $WebStatus.ToLowerInvariant()
+  if ($wl -eq "nameresolutionfailure" -or $Message -match "could not be resolved|No such host|nome remoto|DNS") {
+    return @{ Kind = "dns"; Transient = $true; Message = "api.telegram.org non risolvibile (DNS/rete locale)." }
+  }
+  if ($wl -eq "timeout" -or $Message -match "timed out|timeout|scaduto") {
+    return @{ Kind = "timeout"; Transient = $true; Message = "Timeout verso api.telegram.org (rete lenta o proxy)." }
+  }
+  if ($wl -eq "securechannelfailure" -or $wl -eq "trustfailure" -or $Message -match "SSL/TLS|secure channel|TLS|certificat") {
+    return @{ Kind = "tls"; Transient = $false; Message = "Errore TLS/certificato verso api.telegram.org." }
+  }
+  if ($wl -match "^(connectfailure|connectionclosed|keepalivefailure|sendfailure|receivefailure|pipelinefailure)$" -or $Message -match "Unable to connect|connessione|refused|reset|forcibly closed|impossibile connettersi") {
+    return @{ Kind = "connection"; Transient = $true; Message = "Connessione a api.telegram.org fallita (rete/proxy/firewall)." }
+  }
+  if ($Message -match "Internet Explorer engine|first-launch|UseBasicParsing") {
+    return @{ Kind = "ie-engine"; Transient = $false; Message = "Motore IE non disponibile (usa -UseBasicParsing)." }
+  }
+  return @{ Kind = "unknown"; Transient = $false; Message = "Errore imprevisto: $Message" }
+}
+
+<#
+.SYNOPSIS
+  Persistent install checkpoint. Atomic writes, crash-safe reads.
+.DESCRIPTION
+  State shape: @{ schemaVersion=1; targetRelease; completedSteps=[ ];
+  skippedSteps=[ ]; currentStep; lastSuccessfulStep; lastErrorKind; updatedAt }.
+  NEVER stores secrets: Write-InstallState strips botToken/hmac/authkey-ish
+  keys defensively. Corrupt file -> backup + blank state (never abort).
+  Old schemaVersion -> blank state + Notice (rebuild by real verification).
+#>
+function Read-InstallState {
+  param([string]$Path)
+  $blank = @{ schemaVersion = 1; targetRelease = ""; completedSteps = @(); skippedSteps = @(); currentStep = ""; lastSuccessfulStep = ""; lastErrorKind = ""; updatedAt = "" }
+  if ([string]::IsNullOrWhiteSpace($Path) -or (-not (Test-Path -LiteralPath $Path))) {
+    return @{ Ok = $true; State = $blank; Corrupt = $false; Notice = "" }
+  }
+  try {
+    $raw = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
+    $j = $raw | ConvertFrom-Json -ErrorAction Stop
+    if ($null -eq $j -or $j.schemaVersion -ne 1) {
+      return @{ Ok = $true; State = $blank; Corrupt = $false; Notice = "Schema checkpoint non riconosciuto: ricostruisco con verifica reale." }
+    }
+    $st = @{ schemaVersion = 1; targetRelease = [string]$j.targetRelease; completedSteps = @(); skippedSteps = @(); currentStep = [string]$j.currentStep; lastSuccessfulStep = [string]$j.lastSuccessfulStep; lastErrorKind = [string]$j.lastErrorKind; updatedAt = [string]$j.updatedAt }
+    foreach ($s in @($j.completedSteps)) { if (-not [string]::IsNullOrWhiteSpace($s)) { $st.completedSteps += [string]$s } }
+    foreach ($s in @($j.skippedSteps)) { if (-not [string]::IsNullOrWhiteSpace($s)) { $st.skippedSteps += [string]$s } }
+    return @{ Ok = $true; State = $st; Corrupt = $false; Notice = "" }
+  } catch {
+    $bak = "$Path.corrupt-" + (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssZ")
+    try { Copy-Item -LiteralPath $Path -Destination $bak -Force -ErrorAction Stop } catch { $bak = "" }
+    return @{ Ok = $true; State = $blank; Corrupt = $true; Notice = "Checkpoint corrotto (backup: $bak): ricostruisco con verifica reale." }
+  }
+}
+function Write-InstallState {
+  param([string]$Path, $State)
+  try {
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    $d = Split-Path -Parent $Path
+    if (-not [string]::IsNullOrWhiteSpace($d) -and (-not (Test-Path -LiteralPath $d))) {
+      New-Item -ItemType Directory -Path $d -Force -ErrorAction Stop | Out-Null
+    }
+    $clean = @{}
+    foreach ($k in @($State.Keys)) {
+      if ($k -match "(?i)token|hmac|secret|authkey|password|passwd|pwd") { continue }
+      $clean[$k] = $State[$k]
+    }
+    $clean["updatedAt"] = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+    $tmp = "$Path.tmp-" + [Guid]::NewGuid().ToString("N")
+    ($clean | ConvertTo-Json -Depth 6) | Out-File -LiteralPath $tmp -Encoding utf8 -NoNewline -ErrorAction Stop
+    Move-Item -LiteralPath $tmp -Destination $Path -Force -ErrorAction Stop
+    return $true
+  } catch { return $false }
+}
+
+<#
+.SYNOPSIS
+  Verify a step against the REAL machine. Never throws; $false = rerun.
+.DESCRIPTION
+  The machine is the source of truth: a checkpoint claiming 'done' is
+  trusted only when the matching real check passes. -PiBin needed for
+  the health step. sleep always reruns (instant + idempotent).
+#>
+function Test-StepRealState {
+  param([string]$Step, $Paths, [string]$PiBin = "")
+  try {
+    switch ($Step) {
+      "windows" { return (Test-WindowsOS) }
+      "node" {
+        $n = Resolve-ToolPath "node"
+        if ($null -eq $n) { return $false }
+        $v = & $n -p "process.versions.node" 2>$null
+        return (Test-AtLeastNode22 -VersionString $v)
+      }
+      "pi" {
+        $p = Resolve-ToolPath "pi"
+        if ($null -eq $p) { return $false }
+        & $p --version 2>$null | Out-Null
+        return ($LASTEXITCODE -eq 0)
+      }
+      "pi-telegram" {
+        $p = Resolve-ToolPath "pi"
+        if ($null -eq $p) { return $false }
+        $l = (& $p list 2>$null | Out-String)
+        return ($l -match "pi-telegram")
+      }
+      "tailscale" {
+        $ip = Get-TailscaleIpv4
+        return (-not [string]::IsNullOrWhiteSpace($ip))
+      }
+      "deploy" {
+        if ($null -eq $Paths -or (-not (Test-Path -LiteralPath $Paths.App))) { return $false }
+        $m = Test-ReleaseManifest -PayloadRoot $Paths.App
+        if (-not $m.Ok) { return $false }
+        $vf = Join-Path $Paths.App "VERSION"
+        if (-not (Test-Path -LiteralPath $vf)) { return $false }
+        return ((Get-Content -LiteralPath $vf -Raw).Trim().Length -gt 0)
+      }
+      "config" {
+        if ($null -eq $Paths) { return $false }
+        $cf = Join-Path $Paths.AgentDir "remote-server.json"
+        if (-not (Test-Path -LiteralPath $cf)) { return $false }
+        $c = Get-Content -LiteralPath $cf -Raw | ConvertFrom-Json
+        return (Test-ValidPort $c.port)
+      }
+      "secrets" {
+        if ($null -eq $Paths) { return $false }
+        $tf = Join-Path $Paths.SecretsDir "server-bot-token"
+        $hf = Join-Path $Paths.SecretsDir "remote-hmac"
+        foreach ($f in @($tf, $hf)) {
+          if (-not (Test-Path -LiteralPath $f)) { return $false }
+          if (((Get-Content -LiteralPath $f -Raw).Trim().Length) -eq 0) { return $false }
+        }
+        $tj = Join-Path $Paths.AgentDir "telegram.json"
+        if (-not (Test-Path -LiteralPath $tj)) { return $false }
+        $t = Get-Content -LiteralPath $tj -Raw | ConvertFrom-Json
+        if ([string]::IsNullOrWhiteSpace($t.profiles.default.botToken)) { return $false }
+        return (Test-ValidOwnerId $t.profiles.default.allowedUserId)
+      }
+      "tasks" {
+        if ($env:OS -ne "Windows_NT") { return $false }
+        if ($null -eq $Paths) { return $false }
+        $a = Get-ScheduledTask -TaskName $Paths.TaskName -ErrorAction Stop
+        $b = Get-ScheduledTask -TaskName $Paths.RemoteTaskName -ErrorAction Stop
+        return (($null -ne $a) -and ($null -ne $b))
+      }
+      "sleep" { return $false }
+      "health" {
+        if ($null -eq $Paths) { return $false }
+        $pb = $PiBin
+        if ([string]::IsNullOrWhiteSpace($pb)) { $pb = Resolve-ToolPath "pi" }
+        $h = Invoke-HealthCheck -Paths $Paths -PiBin $pb
+        return ($h.Ok)
+      }
+    }
+    return $false
+  } catch { return $false }
+}
+
+<#
+.SYNOPSIS
+  Pure input validators. Never throw; return [bool].
+#>
+function Test-ValidPort {
+  param($Value)
+  try {
+    $s = ([string]$Value).Trim()
+    if ($s -notmatch "^\d{1,5}$") { return $false }
+    $n = [int]$s
+    return ($n -ge 1 -and $n -le 65535)
+  } catch { return $false }
+}
+function Test-ValidOwnerId {
+  param($Value)
+  try { return (([string]$Value).Trim() -match "^[1-9]\d*$") } catch { return $false }
+}
+function Test-ValidTokenFormat {
+  param($Value)
+  try { return (([string]$Value).Trim() -match "^\d+:[A-Za-z0-9_-]{20,}$") } catch { return $false }
+}
+function Test-ValidHmac {
+  param($Value)
+  try {
+    $s = [string]$Value
+    if ($s.Length -lt 16) { return $false }
+    if ($s -match "\s") { return $false }
+    return ($s -match "^[\x20-\x7E]+$")
+  } catch { return $false }
+}
+
+<#
+.SYNOPSIS
+  Prompt loop that never exits the process on bad input.
+.DESCRIPTION
+  -Validate is scriptblock param($value)->[bool]. -ReadFunc injects a fake
+  reader for tests: scriptblock param($prompt)->[string]. Empty input
+  returns -Default when set, otherwise reprompts. Returns the valid string.
+#>
+function Read-Validated {
+  param([string]$Prompt, [scriptblock]$Validate, [string]$InvalidMessage = "Valore non valido. Riprova.", [string]$Default = $null, [scriptblock]$ReadFunc = $null)
+  while ($true) {
+    if ($null -ne $ReadFunc) { $v = & $ReadFunc $Prompt }
+    else { $v = Read-Host $Prompt }
+    if ([string]::IsNullOrWhiteSpace($v) -and $null -ne $Default) { return $Default }
+    $ok = $false
+    try { $ok = & $Validate $v } catch { $ok = $false }
+    if ($ok) { return $v }
+    Write-Host $InvalidMessage -ForegroundColor Yellow
+  }
+}
+function Read-ValidatedPort {
+  param([string]$Prompt = "Remote API port [43128]", [string]$Default = "43128", [scriptblock]$ReadFunc = $null)
+  return Read-Validated -Prompt $Prompt -Validate { param($x) Test-ValidPort $x } -InvalidMessage "Porta non valida. Inserisci un numero tra 1 e 65535." -Default $Default -ReadFunc $ReadFunc
+}
+function Read-ValidatedOwnerId {
+  param([string]$Prompt = "Owner Telegram user id (numerico, da @userinfobot)", [string]$Default = $null, [scriptblock]$ReadFunc = $null)
+  return Read-Validated -Prompt $Prompt -Validate { param($x) Test-ValidOwnerId $x } -InvalidMessage "ID non valido. Deve essere numerico (solo cifre, non zero)." -Default $Default -ReadFunc $ReadFunc
+}
+function Read-ValidatedYesNo {
+  param([string]$Prompt, [string]$Default = "Y", [scriptblock]$ReadFunc = $null)
+  while ($true) {
+    if ($null -ne $ReadFunc) { $a = & $ReadFunc "$Prompt" }
+    else { $a = Read-Host "$Prompt" }
+    $t = ([string]$a).Trim().ToLowerInvariant()
+    if ($t -eq "" ) { $t = $Default.Trim().ToLowerInvariant() }
+    if ($t -eq "y" -or $t -eq "yes" -or $t -eq "s" -or $t -eq "si") { return $true }
+    if ($t -eq "n" -or $t -eq "no") { return $false }
+    Write-Host "Risposta non valida: digita Y (si) o N (no)." -ForegroundColor Yellow
+  }
+}
+function Read-ValidatedHmac {
+  param([string]$Prompt = "HMAC secret [INVIO = genera automaticamente] (nascosto)", [scriptblock]$ReadFunc = $null)
+  while ($true) {
+    if ($null -ne $ReadFunc) { $h = & $ReadFunc $Prompt }
+    else { $h = Read-HiddenInput -Prompt $Prompt }
+    if ([string]::IsNullOrWhiteSpace($h)) { return @{ Secret = (New-RandomHex -Bytes 32); Generated = $true } }
+    if (Test-ValidHmac $h) { return @{ Secret = [string]$h; Generated = $false } }
+    Write-Host "HMAC non valido: minimo 16 caratteri stampabili, senza spazi. Riprova (INVIO = genera)." -ForegroundColor Yellow
+  }
+}
+function Read-ValidatedHidden {
+  param([string]$Prompt, [scriptblock]$Validate, [string]$InvalidMessage = "Valore non valido. Riprova.", [scriptblock]$ReadFunc = $null)
+  while ($true) {
+    if ($null -ne $ReadFunc) { $v = & $ReadFunc $Prompt }
+    else { $v = Read-HiddenInput -Prompt $Prompt }
+    $ok = $false
+    try { $ok = & $Validate $v } catch { $ok = $false }
+    if ($ok) { return $v }
+    Write-Host $InvalidMessage -ForegroundColor Yellow
+  }
+}
+
+<#
+.SYNOPSIS
+  Step error taxonomy: New-StepError tags, Split-StepError reads.
+.DESCRIPTION
+  Bodies throw (New-StepError 'Transient'|'System'|'Fatal' 'msg').
+  Split-StepError returns @{ Kind; Text }, defaulting Kind to System for
+  raw .NET exceptions. Classify-SystemException maps raw network errors
+  to Transient kinds (timeout/dns/connection) so plain cmdlet throws
+  also retry instead of killing the setup.
+#>
+function New-StepError {
+  param([string]$Kind, [string]$Message)
+  return "[StepError:$Kind] $Message"
+}
+function Split-StepError {
+  param([string]$Message)
+  $m = [regex]::Match([string]$Message, "^\[StepError:(Transient|System|Fatal|UserInput)\]\s?(.*)$", "Singleline")
+  if ($m.Success) { return @{ Kind = $m.Groups[1].Value; Text = $m.Groups[2].Value } }
+  $c = Classify-SystemException -Message ([string]$Message)
+  return @{ Kind = $c.Kind; Text = ([string]$Message) }
+}
+function Classify-SystemException {
+  param([string]$Message = "")
+  $t = [string]$Message
+  if ($t -match "timed out|timeout|TimeoutSec|scaduto") { return @{ Kind = "Transient"; Note = "timeout" } }
+  if ($t -match "could not be resolved|No such host|nome remoto|DNS|NameResolution") { return @{ Kind = "Transient"; Note = "dns" } }
+  if ($t -match "Unable to connect|connessione|refused|reset|forcibly closed|impossibile connettersi|ConnectFailure|404.*tailscale|not connected|non connesso") { return @{ Kind = "Transient"; Note = "connection" } }
+  if ($t -match "checksum|Checksum|manifest|Manifest|corrupt|integrity|hmac-once|inconsistente") { return @{ Kind = "Fatal"; Note = "integrity" } }
+  return @{ Kind = "System"; Note = "" }
+}
+
+<#
+.SYNOPSIS
+  Retry delay schedule 2/4/8s. Pure, tested. Capped at 30s.
+#>
+function Get-RetryDelaySec {
+  param([int]$Attempt = 1, [int]$BaseDelaySec = 2)
+  try {
+    if ($Attempt -lt 1) { $Attempt = 1 }
+    $d = $BaseDelaySec
+    for ($i = 1; $i -lt $Attempt; $i++) { $d = $d * 2 }
+    if ($d -gt 30) { $d = 30 }
+    return $d
+  } catch { return $BaseDelaySec }
+}
+
+<#
+.SYNOPSIS
+  Generic retry engine. Pure side-effect-free apart from Action/Sleep.
+.DESCRIPTION
+  -Action: scriptblock returning a value or throwing. -IsTransient:
+  scriptblock param($exception)->[bool]. Sleeps BaseDelaySec*2^(n-1)
+  between attempts (0 in tests). Returns @{ Ok; Value; Attempts; Error }.
+  Never throws.
+#>
+function Invoke-WithRetry {
+  param([scriptblock]$Action, [scriptblock]$IsTransient, [int]$MaxAttempts = 3, [int]$BaseDelaySec = 2)
+  $res = @{ Ok = $false; Value = $null; Attempts = 0; Error = "" }
+  try {
+    if ($MaxAttempts -lt 1) { $MaxAttempts = 1 }
+    for ($n = 1; $n -le $MaxAttempts; $n++) {
+      $res.Attempts = $n
+      try {
+        $res.Value = & $Action
+        $res.Ok = $true
+        return $res
+      } catch {
+        $transient = $false
+        try { $transient = & $IsTransient $_ } catch { $transient = $false }
+        $res.Error = $_.Exception.Message
+        if (-not $transient -or $n -ge $MaxAttempts) { return $res }
+        Start-Sleep -Seconds (Get-RetryDelaySec -Attempt $n -BaseDelaySec $BaseDelaySec)
+      }
+    }
+    return $res
+  } catch {
+    $res.Error = $_.Exception.Message
+    return $res
+  }
+}
+
+<#
+.SYNOPSIS
+  Decide the next action after a step failure. Pure, tested.
+.DESCRIPTION
+  Returns 'retry' | 'menu' | 'fail'. Transient auto-retries while
+  Attempt < MaxAttempts, then menu. System always menus. Fatal (integrity)
+  never retries: checkpoint + exit. UserInput never reaches here (loops).
+#>
+function Resolve-StepAction {
+  param([string]$Kind, [int]$Attempt = 1, [int]$MaxAttempts = 3)
+  if ($Kind -eq "Fatal") { return "fail" }
+  if ($Kind -eq "Transient" -and $Attempt -lt $MaxAttempts) { return "retry" }
+  return "menu"
+}
+
+<#
+.SYNOPSIS
+  Interactive step menu. Returns 'retry' | 'skip' | 'exit'.
+.DESCRIPTION
+  -ReadFunc injects a fake reader for tests: scriptblock -> [string].
+  Default is R. -AllowSkip:$false hides S (security-critical steps).
+  D prints details then re-loops. Never throws.
+#>
+function Show-StepMenu {
+  param([string]$StepLabel, [string]$Title, [string]$ErrorMessage, [string]$Details = "", [switch]$AllowSkip, [scriptblock]$ReadFunc = $null, [string]$Default = "R")
+  $opts = "[R]iprova / [D]ettagli / [E]sci e riprendi dopo"
+  if ($AllowSkip) { $opts = "[R]iprova / [S]alta se sicuro / [D]ettagli / [E]sci e riprendi dopo" }
+  while ($true) {
+    Write-Host ""
+    Write-Host "------------------------------------------------" -ForegroundColor Red
+    Write-Host ("Errore nello step " + $StepLabel + " - " + $Title) -ForegroundColor Red
+    Write-Host "------------------------------------------------" -ForegroundColor Red
+    Write-Host $ErrorMessage -ForegroundColor Yellow
+    Write-Host "Il tuo progresso NON e perso (checkpoint salvato)."
+    if ($null -ne $ReadFunc) { $a = & $ReadFunc $opts }
+    else { $a = Read-Host "$opts [$Default]" }
+    $t = ([string]$a).Trim().ToLowerInvariant()
+    if ($t -eq "") { $t = $Default.Trim().ToLowerInvariant() }
+    if ($t -eq "r" -or $t -eq "riprova") { return "retry" }
+    if ($AllowSkip -and ($t -eq "s" -or $t -eq "salta")) { return "skip" }
+    if ($t -eq "e" -or $t -eq "esci") { return "exit" }
+    if ($t -eq "d" -or $t -eq "dettagli") {
+      if ($Details -ne "") { Write-Host $Details } else { Write-Host "(nessun dettaglio aggiuntivo)" }
+    } else {
+      Write-Host "Scelta non valida: R, D, E." -ForegroundColor Yellow
+    }
+  }
+}
+
+<#
+.SYNOPSIS
   Resolve a GitHub release to a ZIP URL plus its expected SHA256.
 .DESCRIPTION
   Version 'latest' uses releases/latest; otherwise releases/tags/<Version>.
@@ -396,6 +891,30 @@ function Save-JsonConfigPreserving {
   return "kept"
 }
 
+
+<#
+.SYNOPSIS
+  Crash-safe text write: tmp + flush + rename. Never throws (bool).
+.DESCRIPTION
+  A killed process can only leave the old file (intact) or a tmp file
+  (ignored); never a half-written target. -Encoding ascii|utf8.
+#>
+function Write-AtomicTextFile {
+  param([string]$Path, [string]$Content, [string]$Encoding = "ascii")
+  try {
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    if ($null -eq $Content) { $Content = "" }
+    $d = Split-Path -Parent $Path
+    if (-not [string]::IsNullOrWhiteSpace($d) -and (-not (Test-Path -LiteralPath $d))) {
+      New-Item -ItemType Directory -Path $d -Force -ErrorAction Stop | Out-Null
+    }
+    $tmp = "$Path.tmp-" + [Guid]::NewGuid().ToString("N")
+    if ($Encoding -eq "utf8") { $Content | Out-File -LiteralPath $tmp -Encoding utf8 -NoNewline -ErrorAction Stop }
+    else { $Content | Out-File -LiteralPath $tmp -Encoding ascii -NoNewline -ErrorAction Stop }
+    Move-Item -LiteralPath $tmp -Destination $Path -Force -ErrorAction Stop
+    return $true
+  } catch { return $false }
+}
 <#
 .SYNOPSIS
   Post-install health check. Fail closed: returns @{ Ok, Failures }.
