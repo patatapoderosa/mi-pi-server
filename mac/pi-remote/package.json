@@ -1,0 +1,10 @@
+{
+  "name": "pi-remote",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Mac-side Pi extension: natural-language remote control of the 24/7 Pi server node over Telegram (ControlBot transport, Keychain secrets).",
+  "type": "module",
+  "pi": {
+    "extensions": ["./index.ts"]
+  }
+}
