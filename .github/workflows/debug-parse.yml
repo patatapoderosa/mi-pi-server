@@ -9,26 +9,33 @@ jobs:
       - shell: powershell
         run: |
           $pr = [System.Management.Automation.Language.Parser]
-          $snips = @(
-            'npm install -g @earendil-works/pi-coding-agent',
-            '$x = Read-Host "Owner Telegram user id"',
-            'icacls $Secrets /inheritance:r /grant:r "$env:U"',
-            'if ($listed -match "pi-telegram") { Info "ok" }',
-            '$listed = (pi list 2>$null | Out-String)',
-            'try { pi install "npm:@llblab/pi-telegram" } catch { }',
-            '$v = node -p "process.versions.node.split(1,2)[0]"',
-            '$bak = "$Path.bak-$(Get-Date)"',
-            'Write-Host "a @userinfobot b"'
-          )
-          $i = 0
-          foreach ($s in $snips) {
-            $i++
+          $tx = Get-Content ./server/setup-old-pc.ps1 -Raw
+          $lns = $tx -split "`r?`n"
+          function Show-Errs($label, $errs) {
+            $hit = @($errs | Where-Object {
+              $_.Message -match "Missing argument"
+            })
+            if (@($hit).Count -gt 0) {
+              Write-Host ($label + " MISSING-ARG:")
+              foreach ($x in $hit) {
+                Write-Host ("  L" + $x.Extent.StartLineNumber)
+                Write-Host ("  " + $x.Message)
+              }
+            } else {
+              Write-Host ($label + " clean")
+            }
+          }
+          foreach ($n in @(85, 90, 95, 100, 105, 108, 110, 112)) {
+            $pre = ($lns[0..($n-1)] -join "`n")
+            $a = $null
+            $b = $null
+            [void]$pr::ParseInput($pre, [ref]$a, [ref]$b)
+            Show-Errs ("prefix-" + $n) $b
+          }
+          foreach ($ln in @(108, 109, 110, 111, 112, 113)) {
+            $s = $lns[$ln - 1]
             $a = $null
             $b = $null
             [void]$pr::ParseInput($s, [ref]$a, [ref]$b)
-            $c = @($b).Count
-            Write-Host ("snip" + $i + " errors=" + $c)
-            foreach ($x in $b) {
-              Write-Host ("  " + $x.Message)
-            }
+            Show-Errs ("line-" + $ln) $b
           }
