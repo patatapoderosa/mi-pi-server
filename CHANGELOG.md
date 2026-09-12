@@ -1,5 +1,51 @@
 # Changelog
 
+## v0.2.6 — 2026-09-12
+
+### Fixed
+
+- Fixed tasks never starting: Task Scheduler actions pointed at
+  `C:\PiServer\app\run-task.ps1` / `run-remote.ps1`, but the staged payload
+  keeps them under `app\installer\` (and both launchers resolve
+  `runtime-env.json`/logs from their own directory). Single layout contract
+  now: `Invoke-AppStaging` promotes `stage\installer\run-*.ps1` to
+  `stage\run-*.ps1` BEFORE the atomic swap and validates them via the new
+  `AppManifest`; live app without root launchers fails deploy real-state.
+- Fixed HMAC timestamp on non-English Windows: `[int](Get-Date -UFormat %s)`
+  yields `1789215834,20616` under it-IT and overflows in 2038. New
+  `Get-UnixTimestampSeconds` (`[DateTimeOffset]::UtcNow.ToUnixTimeSeconds()`,
+  Int64, culture-invariant) is now the only HMAC timestamp source.
+- Fixed remote process detection: health matched the CIM object instead of
+  `.CommandLine` (never matches). New null-safe `Test-CommandLineMatch` is
+  used by health, startup polling and the remote probe path.
+- Fixed resume trusting broken tasks: `Test-StepRealState('tasks')` only checked
+  existence. New `Test-TaskDefinition` requires the exact quoted launcher
+  (which must exist), working directory, SYSTEM principal and a single
+  action — stale v0.2.5 tasks force step 9 to re-run.
+- Step 9 now polls both tasks up to 20s (`Wait-TaskStartup`): instant-exit
+  payloads fail fast with State/LastTaskResult/launcher/log diagnostics
+  instead of dying silently before health.
+- `Invoke-HealthCheck` now reports per-task diagnostics (action, launcher,
+  State, LastTaskResult, log age, sanitized stderr tail) and validates Pi
+  auth via `Test-PiAuthentication` (the old bare `pi auth check` always
+  fails on pi 0.85.1, which made health unpassable).
+- Upgrade/recovery: `setup.ps1` passes the concrete release tag (never
+  `"latest"`) to the installer; `VERSION` stores the concrete tag and deploy
+  real-state compares it against the requested release. A broken v0.2.5
+  install self-repairs with a plain one-liner rerun: new deploy, launcher
+  promotion, task re-registration, verified startup.
+- Fixed `pi.cmd` spawn from Node on Windows (`spawn` cannot execute .cmd via
+  CreateProcess): new `server/spawn-pi.mjs` routes through
+  `cmd.exe /d /s /c` with one verbatim tail (fixed args only, no remote
+  input crosses the shell) and `stopPi` kills the whole tree via
+  `taskkill /T /F` so no orphaned pi survives shutdown.
+
+### Upgrade notes
+
+- Rerun the one-liner (resolves `latest` → v0.2.6). Broken v0.2.5 installs
+  (tasks pointing at missing launchers, failed health) repair automatically:
+  no checkpoint deletion, no reinstall, no `-Force`.
+
 ## v0.2.5 — 2026-09-12
 
 ### Fixed

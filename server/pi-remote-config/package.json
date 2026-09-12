@@ -1,6 +1,6 @@
 {
   "name": "pi-remote-config",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "private": true,
   "description": "Server-side Pi extension: whitelisted local config tools (server_config, server_status, service_control).",
   "type": "module",
