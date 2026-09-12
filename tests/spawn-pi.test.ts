@@ -66,7 +66,11 @@ function runAndCapture(
         } catch {
           /* already exited */
         }
-        reject(new Error("spawn timed out (no output). stdout=" + out + " stderr=" + err));
+        reject(
+          new Error(
+            "spawn timed out (no output). stdout=" + out + " stderr=" + err,
+          ),
+        );
       }
     }, timeoutMs);
     child.stdout?.on("data", (d: unknown) => {
@@ -93,33 +97,31 @@ function runAndCapture(
 }
 
 describe("spawnPi real execution (production path)", () => {
-  it(
-    "executes a temp script and captures output",
-    { timeout: 15000 },
-    async () => {
-      const dir = mkdtempSync(join(tmpdir(), "spawn-pi-test-"));
-      try {
-        const marker = "SPAWN-OK-987654321";
-        let target: string;
-        if (process.platform === "win32") {
-          target = join(dir, "fake-pi.cmd");
-          writeFileSync(target, `@echo ${marker}\r\n`);
-        } else {
-          target = join(dir, "fake-pi.sh");
-          writeFileSync(target, `#!/bin/sh\necho ${marker}\n`);
-          chmodSync(target, 0o755);
-        }
-        const got = await runAndCapture(target);
-        assert.match(
-          got.out,
-          new RegExp(marker),
-          "exit=" + got.code + " stderr=" + got.err,
-        );
-      } finally {
-        rmSync(dir, { recursive: true, force: true });
+  it("executes a temp script and captures output", {
+    timeout: 15000,
+  }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), "spawn-pi-test-"));
+    try {
+      const marker = "SPAWN-OK-987654321";
+      let target: string;
+      if (process.platform === "win32") {
+        target = join(dir, "fake-pi.cmd");
+        writeFileSync(target, `@echo ${marker}\r\n`);
+      } else {
+        target = join(dir, "fake-pi.sh");
+        writeFileSync(target, `#!/bin/sh\necho ${marker}\n`);
+        chmodSync(target, 0o755);
       }
-    },
-  );
+      const got = await runAndCapture(target);
+      assert.match(
+        got.out,
+        new RegExp(marker),
+        "exit=" + got.code + " stderr=" + got.err,
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("stopPi tree kill", () => {
@@ -127,44 +129,44 @@ describe("stopPi tree kill", () => {
     assert.doesNotThrow(() => stopPi(null));
     assert.doesNotThrow(() => stopPi(undefined));
     assert.doesNotThrow(() =>
-      stopPi({ exitCode: 0 } as unknown as import("node:child_process").ChildProcess),
+      stopPi({
+        exitCode: 0,
+      } as unknown as import("node:child_process").ChildProcess),
     );
   });
 
-  it(
-    "kills a long-running child (and its subtree on win32)",
-    { timeout: 20000 },
-    async () => {
-      const dir = mkdtempSync(join(tmpdir(), "spawn-pi-kill-"));
-      try {
-        let target: string;
-        if (process.platform === "win32") {
-          // Grandchild ping.exe must die with the tree: if only cmd.exe
-          // died, ping would hold stdout open and close would never fire.
-          target = join(dir, "sleeper.cmd");
-          writeFileSync(target, "@ping -n 20 127.0.0.1 >nul\r\n");
-        } else {
-          target = join(dir, "sleeper.sh");
-          writeFileSync(target, "#!/bin/sh\nsleep 20\n");
-          chmodSync(target, 0o755);
-        }
-        const child = spawnPi(target);
-        await new Promise((r) => setTimeout(r, 1500));
-        assert.equal(child.exitCode, null);
-        stopPi(child, "SIGTERM");
-        const code = await new Promise<number | null>((resolve) => {
-          const t = setTimeout(() => resolve(424242), 12000);
-          // NOTE: 'exit' (process gone), not 'close' (also waits for stdio
-          // pipes inherited by grandchildren).
-          child.on("exit", (c) => {
-            clearTimeout(t);
-            resolve(c);
-          });
-        });
-        assert.notEqual(code, 424242, "child did not exit after stopPi");
-      } finally {
-        rmSync(dir, { recursive: true, force: true });
+  it("kills a long-running child (and its subtree on win32)", {
+    timeout: 20000,
+  }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), "spawn-pi-kill-"));
+    try {
+      let target: string;
+      if (process.platform === "win32") {
+        // Grandchild ping.exe must die with the tree: if only cmd.exe
+        // died, ping would hold stdout open and close would never fire.
+        target = join(dir, "sleeper.cmd");
+        writeFileSync(target, "@ping -n 20 127.0.0.1 >nul\r\n");
+      } else {
+        target = join(dir, "sleeper.sh");
+        writeFileSync(target, "#!/bin/sh\nsleep 20\n");
+        chmodSync(target, 0o755);
       }
-    },
-  );
+      const child = spawnPi(target);
+      await new Promise((r) => setTimeout(r, 1500));
+      assert.equal(child.exitCode, null);
+      stopPi(child, "SIGTERM");
+      const code = await new Promise<number | null>((resolve) => {
+        const t = setTimeout(() => resolve(424242), 12000);
+        // NOTE: 'exit' (process gone), not 'close' (also waits for stdio
+        // pipes inherited by grandchildren).
+        child.on("exit", (c) => {
+          clearTimeout(t);
+          resolve(c);
+        });
+      });
+      assert.notEqual(code, 424242, "child did not exit after stopPi");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
