@@ -98,7 +98,7 @@ try {
 
   Write-Host "== manifest validation =="
   $pay = Join-Path $TmpRoot "payload"
-  foreach ($rel in @("server\pi-daemon.mjs", "server\pi-remote-config\index.ts",
+  foreach ($rel in @("server\pi-daemon.mjs", "server\spawn-pi.mjs", "server\pi-remote-config\index.ts",
       "server\pi-remote-config\package.json", "shared\protocol.ts",
       "shared\modules.ts", "shared\store.ts",
       "server\pi-remote-server\index.ts", "server\pi-remote-server\server.ts",
@@ -285,7 +285,7 @@ try {
 
   Write-Host "== staged deploy (Invoke-AppStaging) =="
   function New-MiniPayload([string]$dir) {
-    foreach ($rel in @("server\pi-daemon.mjs", "server\pi-remote-config\index.ts",
+    foreach ($rel in @("server\pi-daemon.mjs", "server\spawn-pi.mjs", "server\pi-remote-config\index.ts",
         "server\pi-remote-config\package.json", "shared\protocol.ts",
         "shared\modules.ts", "shared\store.ts",
         "installer\run-task.ps1", "installer\run-remote.ps1",
@@ -744,6 +744,140 @@ try {
     & $childHost -NoProfile -NonInteractive -File $childFile
     Assert-Equal $LASTEXITCODE 0 "fresh PowerShell: hydration senza UndefinedVariable"
   }
+
+  Write-Host "== runtime layout contract (Bug 1) =="
+  $layRoot = Join-Path $TmpRoot "layout"
+  New-Item -ItemType Directory -Path $layRoot -Force | Out-Null
+  $payL = Join-Path $layRoot "pay"
+  New-MiniPayload $payL
+  $appL = Join-Path $layRoot "app"
+  $stL = Invoke-AppStaging -PayloadDir $payL -AppPath $appL -Mode "fresh" -VersionLabel "v9.9.9-layout"
+  Assert-True $stL.Ok "staging con launcher OK"
+  Assert-True ((Test-Path -LiteralPath (Join-Path $appL "run-task.ps1")) -and (Test-Path -LiteralPath (Join-Path $appL "run-remote.ps1"))) "launcher promossi in app root"
+  Assert-Equal (Get-Content -LiteralPath (Join-Path $appL "run-task.ps1") -Raw) "payload:installer\run-task.ps1" "contenuto launcher preservato"
+  Assert-True ((Test-ReleaseManifest -PayloadRoot $appL -Manifest $script:AppManifest).Ok) "live app soddisfa AppManifest"
+  $payNoL = Join-Path $layRoot "payNoL"
+  New-MiniPayload $payNoL
+  Remove-Item -LiteralPath (Join-Path $payNoL "installer\run-task.ps1") -Force
+  "SENTINELLA-LAYOUT" | Out-File -LiteralPath (Join-Path $appL "server\pi-daemon.mjs") -Encoding ascii -NoNewline
+  $stNoL = Invoke-AppStaging -PayloadDir $payNoL -AppPath $appL -Mode "update" -VersionLabel "v9.9.9-nol"
+  Assert-True (-not $stNoL.Ok) "staging senza launcher rifiutato pre-swap"
+  Assert-Equal (Get-Content -LiteralPath (Join-Path $appL "server\pi-daemon.mjs") -Raw) "SENTINELLA-LAYOUT" "live intatta dopo promotion fallita"
+  $mOld = Test-ReleaseManifest -PayloadRoot $payL -Manifest $script:AppManifest
+  Assert-True ((-not $mOld.Ok) -and ($mOld.Missing -contains "run-task.ps1")) "layout v0.2.5 rilevato come incompleto"
+
+  Write-Host "== task real-state deep check (Bug 4) =="
+  function New-FakeTask {
+    param([string]$Exe, [string]$ArgList, [string]$WorkDir, [string]$User, [string]$State = "Ready")
+    $fa = [PSCustomObject]@{ Execute = $Exe; Arguments = $ArgList; WorkingDirectory = $WorkDir }
+    return [PSCustomObject]@{ Actions = @($fa); Principal = [PSCustomObject]@{ UserId = $User }; State = $State }
+  }
+  $taskRoot = Join-Path $TmpRoot "tasks"
+  New-Item -ItemType Directory -Path $taskRoot -Force | Out-Null
+  $goodLauncher = Join-Path $taskRoot "run-task.ps1"
+  "launcher" | Out-File -LiteralPath $goodLauncher -Encoding ascii -NoNewline
+  $goodWd = Join-Path $taskRoot "server"
+  New-Item -ItemType Directory -Path $goodWd -Force | Out-Null
+  $goodArgs = '-NoProfile -ExecutionPolicy Bypass -File "' + $goodLauncher + '"'
+  $global:ttGood = New-FakeTask -Exe "powershell.exe" -ArgList $goodArgs -WorkDir $goodWd -User "SYSTEM"
+  $rGood = { param($n) return $global:ttGood }
+  Assert-True (Test-TaskDefinition -TaskName "T" -ExpectedFile $goodLauncher -ExpectedWorkDir $goodWd -TaskReader $rGood) "task corretta = true"
+  $global:ttStale = New-FakeTask -Exe "powershell.exe" -ArgList '-NoProfile -ExecutionPolicy Bypass -File "C:\PiServer\app\installer\run-task.ps1"' -WorkDir $goodWd -User "SYSTEM"
+  $rStale = { param($n) return $global:ttStale }
+  Assert-True (-not (Test-TaskDefinition -TaskName "T" -ExpectedFile $goodLauncher -ExpectedWorkDir $goodWd -TaskReader $rStale)) "action stale v0.2.5 = false"
+  Assert-True (-not (Test-TaskDefinition -TaskName "T" -ExpectedFile (Join-Path $taskRoot "assente.ps1") -ExpectedWorkDir $goodWd -TaskReader $rGood)) "launcher mancante = false"
+  $ma1 = [PSCustomObject]@{ Execute = "powershell.exe"; Arguments = $goodArgs; WorkingDirectory = $goodWd }
+  $ma2 = [PSCustomObject]@{ Execute = "powershell.exe"; Arguments = $goodArgs; WorkingDirectory = $goodWd }
+  $global:ttMulti = [PSCustomObject]@{ Actions = @($ma1, $ma2); Principal = [PSCustomObject]@{ UserId = "SYSTEM" }; State = "Ready" }
+  $rMulti = { param($n) return $global:ttMulti }
+  Assert-True (-not (Test-TaskDefinition -TaskName "T" -ExpectedFile $goodLauncher -ExpectedWorkDir $goodWd -TaskReader $rMulti)) "action extra legacy = false"
+  $global:ttExe = New-FakeTask -Exe "cmd.exe" -ArgList $goodArgs -WorkDir $goodWd -User "SYSTEM"
+  $rExe = { param($n) return $global:ttExe }
+  Assert-True (-not (Test-TaskDefinition -TaskName "T" -ExpectedFile $goodLauncher -ExpectedWorkDir $goodWd -TaskReader $rExe)) "execute errato = false"
+  $global:ttWd = New-FakeTask -Exe "powershell.exe" -ArgList $goodArgs -WorkDir $taskRoot -User "SYSTEM"
+  $rWd = { param($n) return $global:ttWd }
+  Assert-True (-not (Test-TaskDefinition -TaskName "T" -ExpectedFile $goodLauncher -ExpectedWorkDir $goodWd -TaskReader $rWd)) "working dir errata = false"
+  $global:ttUser = New-FakeTask -Exe "powershell.exe" -ArgList $goodArgs -WorkDir $goodWd -User "Administrators"
+  $rUser = { param($n) return $global:ttUser }
+  Assert-True (-not (Test-TaskDefinition -TaskName "T" -ExpectedFile $goodLauncher -ExpectedWorkDir $goodWd -TaskReader $rUser)) "principal non-SYSTEM = false"
+  $rNull = { param($n) return $null }
+  Assert-True (-not (Test-TaskDefinition -TaskName "T" -ExpectedFile $goodLauncher -ExpectedWorkDir $goodWd -TaskReader $rNull)) "task assente = false"
+
+  Write-Host "== unix timestamp culture-invariant (Bug 2) =="
+  $oldCult = [Threading.Thread]::CurrentThread.CurrentCulture
+  try {
+    foreach ($cn in @("it-IT", "en-US", "de-DE")) {
+      try { [Threading.Thread]::CurrentThread.CurrentCulture = [Globalization.CultureInfo]::GetCultureInfo($cn) } catch { continue }
+      $tsc = Get-UnixTimestampSeconds
+      Assert-True ($tsc -match "^\d+$") ("timestamp " + $cn + " solo cifre")
+    }
+  } finally { [Threading.Thread]::CurrentThread.CurrentCulture = $oldCult }
+  $tsNum = Get-UnixTimestampSeconds
+  $tsLong = [long]0
+  Assert-True ([long]::TryParse($tsNum, [ref]$tsLong) -and ($tsLong -gt 1700000000)) "timestamp Int64 plausibile"
+  $libText = Get-Content -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) "PiServerLib.ps1") -Raw
+  Assert-True ($libText -notmatch "-UFormat %s") "niente UFormat residuo"
+  Assert-True ($libText -match "ToUnixTimeSeconds") "sorgente Int64 unica"
+  Assert-True ($libText -match '\$ts = Get-UnixTimestampSeconds') "probe usa helper"
+
+  Write-Host "== process CommandLine match (Bug 3) =="
+  $fp1 = [PSCustomObject]@{ CommandLine = "node.exe C:\PiServer\app\server\pi-remote-server\index.ts" }
+  Assert-True (Test-CommandLineMatch -Process $fp1 -Pattern "pi-remote-server") "match CommandLine"
+  Assert-True (-not (Test-CommandLineMatch -Process ([PSCustomObject]@{ CommandLine = $null }) -Pattern "pi-remote-server")) "CommandLine null = false"
+  Assert-True (-not (Test-CommandLineMatch -Process $null -Pattern "pi-remote-server")) "processo null = false"
+  Assert-True (-not (Test-CommandLineMatch -Process $fp1 -Pattern "pi-daemon\.mjs")) "pattern diverso = false"
+  Assert-True ($libText -match '-ProcessPattern "pi-remote-server"') "health cerca processo remoto"
+  Assert-True ($libText -notmatch '\$_ -match "pi-remote-server"') "niente match su oggetto CIM"
+
+  Write-Host "== task startup polling =="
+  $probeDead = { return $false }
+  $readerReady = { param($n) return [PSCustomObject]@{ State = "Ready" } }
+  $infoFail = { param($n) return [PSCustomObject]@{ LastTaskResult = 1 } }
+  $wDead = Wait-TaskStartup -TaskName "TKO" -LauncherPath (Join-Path $TmpRoot "nope.ps1") -ProcessMatch "zzz-inesistente" -LogPath (Join-Path $TmpRoot "nope.log") -TimeoutSec 30 -EarlyExitSec 0 -TaskReader $readerReady -TaskInfoReader $infoFail -ProcessProbe $probeDead
+  Assert-True ((-not $wDead.Ok) -and ($wDead.Detail -match "LastTaskResult") -and ($wDead.Detail -match "LauncherExists: False")) "exit immediato diagnosticato"
+  $probeLive = { return $true }
+  $wLive = Wait-TaskStartup -TaskName "TOK" -LauncherPath $goodLauncher -ProcessMatch "zzz" -LogPath (Join-Path $TmpRoot "nope.log") -TimeoutSec 5 -TaskReader $readerReady -TaskInfoReader $infoFail -ProcessProbe $probeLive
+  Assert-True ($wLive.Ok -and ($wLive.Detail -match "processo presente")) "processo vivo = ok"
+
+  Write-Host "== health diagnostics =="
+  $global:ttDiag = New-FakeTask -Exe "powershell.exe" -ArgList $goodArgs -WorkDir $goodWd -User "SYSTEM" -State "Ready"
+  $infoD = [PSCustomObject]@{ LastTaskResult = 1 }
+  $dMissing = Format-TaskDiagnostics -Task $global:ttDiag -TaskName "TDIAG" -ExpectedFile $goodLauncher -LogPath (Join-Path $taskRoot "assente.log") -ProcessPattern "zzz-inesistente" -TaskInfo $infoD -Processes @()
+  Assert-True ((@($dMissing) -match "log assente").Count -ge 1) "log assente diagnosticato"
+  Assert-True ((@($dMissing) -match "State=Ready").Count -ge 1) "contesto State presente"
+  Assert-True ((@($dMissing) -match "LastTaskResult=1").Count -ge 1) "contesto LastTaskResult presente"
+  $secLog = Join-Path $taskRoot "sec.log"
+  @("riga normale", "riga con bot123456:ABCDEFghijklmnopqrstuvwxyz1234567890 dentro", "hmac=deadbeef1234") | Out-File -LiteralPath $secLog -Encoding ascii
+  $st5 = Get-SanitizedLogTail -Path $secLog -MaxLines 5
+  Assert-True (($st5 -match "bot<redacted>") -and ($st5 -notmatch "ABCDEF")) "token redatto"
+  Assert-True (($st5 -match "hmac=<redacted>") -and ($st5 -notmatch "deadbeef")) "hmac redatto"
+  Assert-True ((Get-SanitizedLogTail -Path (Join-Path $taskRoot "assente.log")) -eq "") "tail assente = stringa vuota"
+
+  Write-Host "== resume v0.2.5 rotta -> autoriparazione =="
+  $setupText = Get-Content -LiteralPath (Join-Path $RepoRoot "setup.ps1") -Raw
+  Assert-True ($setupText -match '\$concreteTag = \[string\]\$rel\.tag_name') "bootstrap risolve tag concreto"
+  $wiText2 = Get-Content -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) "windows-installer.ps1") -Raw
+  Assert-True ($wiText2 -match '\$ver = \[string\]\$script:InstallState\.targetRelease') "VERSION da targetRelease concreto"
+  $oldRoot = Get-PiServerPaths -Root (Join-Path $TmpRoot "v255")
+  New-Item -ItemType Directory -Path $oldRoot.App -Force | Out-Null
+  foreach ($rel in $script:ReleaseManifest) {
+    $ofp = Join-Path $oldRoot.App $rel
+    $odd = Split-Path -Parent $ofp
+    if (-not (Test-Path -LiteralPath $odd)) { New-Item -ItemType Directory -Path $odd -Force | Out-Null }
+    ("v255:" + $rel) | Out-File -LiteralPath $ofp -Encoding ascii -NoNewline
+  }
+  "v0.2.5" | Out-File -LiteralPath $oldRoot.VersionFile -Encoding ascii -NoNewline
+  Assert-True (-not (Test-StepRealState -Step "deploy" -Paths $oldRoot -ExpectedRelease "v0.2.6")) "VERSION mismatch forza deploy"
+  Assert-True (-not (Test-StepRealState -Step "deploy" -Paths $oldRoot -ExpectedRelease "")) "layout v0.2.5 senza launcher fallisce AppManifest"
+  "v0.2.6" | Out-File -LiteralPath $oldRoot.VersionFile -Encoding ascii -NoNewline
+  "L1" | Out-File -LiteralPath $oldRoot.RunTask -Encoding ascii -NoNewline
+  "L2" | Out-File -LiteralPath $oldRoot.RunRemote -Encoding ascii -NoNewline
+  Assert-True (Test-StepRealState -Step "deploy" -Paths $oldRoot -ExpectedRelease "v0.2.6") "deploy riparato = true"
+  $oldWd = Split-Path -Parent $oldRoot.Daemon
+  $global:ttOld = New-FakeTask -Exe "powershell.exe" -ArgList ('-NoProfile -ExecutionPolicy Bypass -File "' + (Join-Path $oldRoot.App "installer\run-task.ps1") + '"') -WorkDir $oldWd -User "SYSTEM"
+  $rOld = { param($n) return $global:ttOld }
+  Assert-True (-not (Test-TaskDefinition -TaskName "T" -ExpectedFile $oldRoot.RunTask -ExpectedWorkDir $oldWd -TaskReader $rOld)) "task v0.2.5 invalida il real-state"
+  Remove-Variable -Name ttGood,ttStale,ttMulti,ttExe,ttWd,ttUser,ttDiag,ttOld -Scope Global -ErrorAction SilentlyContinue
 } finally {
   Remove-Item -LiteralPath $TmpRoot -Recurse -Force -ErrorAction SilentlyContinue
 }

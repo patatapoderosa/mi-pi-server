@@ -250,8 +250,10 @@ try {
   } else {
     $installer = Join-Path $InstallRoot "app\installer\windows-installer.ps1"
   }
+  $concreteTag = [string]$rel.tag_name
+  if ([string]::IsNullOrWhiteSpace($concreteTag)) { $concreteTag = $Version }
   $iArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$installer`"",
-    "-Repo", "`"$Repo`"", "-Version", "`"$Version`"",
+    "-Repo", "`"$Repo`"", "-Version", "`"$concreteTag`"",
     "-InstallRoot", "`"$InstallRoot`"")
   if ($payload -ne "") { $iArgs += @("-PayloadDir", "`"$payload`"") }
   if ($Update) { $iArgs += "-Update" }

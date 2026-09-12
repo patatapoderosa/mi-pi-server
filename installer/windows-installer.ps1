@@ -229,7 +229,7 @@ foreach ($s in $script:StepCatalog) {
   elseif ($Mode -eq "update" -and $s.Name -eq "deploy") { $run = $true }
   elseif ($script:InstallState.completedSteps -contains $s.Name) {
     $ok = $false
-    try { $ok = Test-StepRealState -Step $s.Name -Paths $Paths } catch { $ok = $false }
+    try { $ok = Test-StepRealState -Step $s.Name -Paths $Paths -ExpectedRelease $Version } catch { $ok = $false }
     if ($ok) { $run = $false }
   }
   $script:StepSkip[$s.Name] = (-not $run)
@@ -582,7 +582,8 @@ try {
   # Stage the new app FIRST via Invoke-AppStaging (lib): payload -> stage ->
   # validate -> swap. A failed staging never touches the live app/ (no rollback
   # needed here); in update mode the previous app/ is preserved as backup.
-  $ver = $Version
+  $ver = [string]$script:InstallState.targetRelease
+  if ([string]::IsNullOrWhiteSpace($ver) -or ($ver -eq "latest")) { $ver = $Version }
   if ($ver -eq "latest") { $ver = "latest@$(Get-Date -Format 'yyyyMMdd')" }
   $st = Invoke-AppStaging -PayloadDir $payload -AppPath $Paths.App -Mode $Mode -VersionLabel $ver
   if (-not $st.Ok) { throw (New-StepError "Fatal" ("Deploy staging fallito (app esistente intatta): " + $st.Error)) }
@@ -1005,10 +1006,16 @@ try {
   try {
     Start-ScheduledTask -TaskName $TaskName
     Start-ScheduledTask -TaskName $remoteTask
-    L "tasks avviati" "OK"
+    L "tasks avviati (verifico payload reale)" "OK"
   } catch {
     throw (New-StepError "System" "Registrati ma avvio fallito: $($_.Exception.Message)")
   }
+  $w1 = Wait-TaskStartup -TaskName $TaskName -LauncherPath $Paths.RunTask -ProcessMatch "pi-daemon\.mjs" -LogPath $Paths.ServerLog -TimeoutSec 20
+  if (-not $w1.Ok) { throw (New-StepError "System" $w1.Detail) }
+  L $w1.Detail "OK"
+  $w2 = Wait-TaskStartup -TaskName $remoteTask -LauncherPath $Paths.RunRemote -ProcessMatch "pi-remote-server" -LogPath $Paths.RemoteLog -TimeoutSec 20
+  if (-not $w2.Ok) { throw (New-StepError "System" $w2.Detail) }
+  L $w2.Detail "OK"
 
         Complete-InstallStep -Name "tasks"
         break

@@ -16,7 +16,7 @@
  * Extension errors surfacing as `extension_error` / `type: "extension_error"`
  * events are logged with [pi-server:extension] and never crash the daemon.
  */
-import { spawn } from "node:child_process";
+import { spawnPi } from "./spawn-pi.mjs";
 import { createInterface } from "node:readline";
 
 const LOG = "[pi-server]";
@@ -53,10 +53,7 @@ function sendRpc(obj) {
 
 function start() {
   log(`starting: ${PI_BIN} --mode rpc`);
-  child = spawn(PI_BIN, ["--mode", "rpc"], {
-    stdio: ["pipe", "pipe", "pipe"],
-    windowsHide: true,
-  });
+  child = spawnPi(PI_BIN);
 
   child.on("error", (err) => {
     logErr(`spawn failed: ${err.message} (is pi installed and on PATH?)`);

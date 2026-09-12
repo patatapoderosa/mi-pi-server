@@ -13,6 +13,7 @@ $ErrorActionPreference = "Stop"
 # Files the release payload must contain (relative to payload root).
 $script:ReleaseManifest = @(
   "server\pi-daemon.mjs",
+  "server\spawn-pi.mjs",
   "server\pi-remote-config\index.ts",
   "server\pi-remote-config\package.json",
   "shared\protocol.ts",
@@ -25,6 +26,18 @@ $script:ReleaseManifest = @(
   "server\pi-remote-server\server.ts",
   "server\pi-remote-server\migrate.ts",
   "server\pi-remote-server\tailscale.ts"
+)
+
+# Runtime layout contract (single source of truth): the payload ships launchers
+# under installer\, but the LIVE app serves them at app ROOT because both
+# launchers resolve runtime-env.json and logs relative to their own location
+# ($AppDir = parent of script). Invoke-AppStaging promotes
+# stage\installer\run-*.ps1 -> stage\run-*.ps1 BEFORE the atomic swap, so the
+# live app always satisfies this manifest. Task Scheduler actions MUST point
+# at Get-PiServerPaths RunTask/RunRemote (app root), never at installer\.
+$script:AppManifest = @($script:ReleaseManifest | ForEach-Object { $_ }) + @(
+  "run-task.ps1",
+  "run-remote.ps1"
 )
 
 function Test-IsAdmin {
@@ -127,9 +140,10 @@ function Test-FileChecksum {
 }
 
 function Test-ReleaseManifest {
-  param([string]$PayloadRoot)
+  param([string]$PayloadRoot, [string[]]$Manifest = @())
+  if ($Manifest.Count -eq 0) { $Manifest = $script:ReleaseManifest }
   $missing = @()
-  foreach ($rel in $script:ReleaseManifest) {
+  foreach ($rel in $Manifest) {
     $full = Join-Path $PayloadRoot $rel
     if (-not (Test-Path -LiteralPath $full)) { $missing += $rel }
   }
@@ -329,7 +343,16 @@ function Invoke-AppStaging {
       if ($VersionLabel -ne "") {
         $VersionLabel | Out-File -LiteralPath (Join-Path $stage "VERSION") -Encoding ascii -NoNewline -ErrorAction Stop
       }
-      $stMan = Test-ReleaseManifest -PayloadRoot $stage
+      # Promote task launchers to app ROOT before the swap (runtime contract:
+      # launchers resolve runtime-env.json/logs from their own directory, and
+      # Task Scheduler actions point at app root). Validated below: a failed
+      # promotion aborts BEFORE the swap, live app untouched.
+      foreach ($pair in @(@("installer\run-task.ps1", "run-task.ps1"), @("installer\run-remote.ps1", "run-remote.ps1"))) {
+        $lSrc = Join-Path $stage $pair[0]
+        if (-not (Test-Path -LiteralPath $lSrc)) { throw ("Launcher sorgente mancante nello stage: " + $pair[0]) }
+        Copy-Item -LiteralPath $lSrc -Destination (Join-Path $stage $pair[1]) -Force -ErrorAction Stop
+      }
+      $stMan = Test-ReleaseManifest -PayloadRoot $stage -Manifest $script:AppManifest
       if (-not $stMan.Ok) { throw ("Manifest dello stage incompleto: " + ($stMan.Missing -join ", ")) }
     } catch {
       Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
@@ -555,8 +578,40 @@ function Write-InstallState {
   trusted only when the matching real check passes. -PiBin needed for
   the health step. sleep always reruns (instant + idempotent).
 #>
+<#
+.SYNOPSIS
+  Deep validation of one managed scheduled task (Bug 4: existence is not enough).
+.DESCRIPTION
+  A tasks step is OK only if the task exists AND its single action runs
+  powershell.exe -File "<ExpectedFile>" (exact quoted launcher, which must
+  exist), the working directory matches, the principal is SYSTEM, and no
+  legacy/stale extra actions are present. -TaskReader injects
+  param($TaskName) -> task object for tests. Never throws.
+#>
+function Test-TaskDefinition {
+  param([string]$TaskName, [string]$ExpectedFile, [string]$ExpectedWorkDir, [scriptblock]$TaskReader = $null)
+  try {
+    if ([string]::IsNullOrWhiteSpace($TaskName) -or [string]::IsNullOrWhiteSpace($ExpectedFile)) { return $false }
+    if (-not (Test-Path -LiteralPath $ExpectedFile)) { return $false }
+    $t = $null
+    if ($null -ne $TaskReader) { $t = & $TaskReader $TaskName }
+    else { $t = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop }
+    if ($null -eq $t) { return $false }
+    $acts = @()
+    try { $acts = @($t.Actions) } catch { return $false }
+    if ($acts.Count -ne 1) { return $false }
+    if ([string]$acts[0].Execute -ne "powershell.exe") { return $false }
+    if (-not ([string]$acts[0].Arguments).Contains('"' + $ExpectedFile + '"')) { return $false }
+    if ([string]$acts[0].WorkingDirectory -ne $ExpectedWorkDir) { return $false }
+    $uid = ""
+    try { $uid = [string]$t.Principal.UserId } catch { return $false }
+    if ($uid -ne "SYSTEM") { return $false }
+    return $true
+  } catch { return $false }
+}
+
 function Test-StepRealState {
-  param([string]$Step, $Paths, [string]$PiBin = "", [scriptblock]$AuthRunner = $null)
+  param([string]$Step, $Paths, [string]$PiBin = "", [scriptblock]$AuthRunner = $null, [string]$ExpectedRelease = "", [scriptblock]$TaskReader = $null)
   try {
     switch ($Step) {
       "windows" { return (Test-WindowsOS) }
@@ -584,11 +639,14 @@ function Test-StepRealState {
       }
       "deploy" {
         if ($null -eq $Paths -or (-not (Test-Path -LiteralPath $Paths.App))) { return $false }
-        $m = Test-ReleaseManifest -PayloadRoot $Paths.App
+        $m = Test-ReleaseManifest -PayloadRoot $Paths.App -Manifest $script:AppManifest
         if (-not $m.Ok) { return $false }
         $vf = Join-Path $Paths.App "VERSION"
         if (-not (Test-Path -LiteralPath $vf)) { return $false }
-        return ((Get-Content -LiteralPath $vf -Raw).Trim().Length -gt 0)
+        $haveVer = ((Get-Content -LiteralPath $vf -Raw).Trim())
+        if ($haveVer.Length -eq 0) { return $false }
+        if (($ExpectedRelease -ne "") -and ($ExpectedRelease -ne "latest") -and ($haveVer -ne $ExpectedRelease)) { return $false }
+        return $true
       }
       "config" {
         if ($null -eq $Paths) { return $false }
@@ -621,9 +679,10 @@ function Test-StepRealState {
       "tasks" {
         if ($env:OS -ne "Windows_NT") { return $false }
         if ($null -eq $Paths) { return $false }
-        $a = Get-ScheduledTask -TaskName $Paths.TaskName -ErrorAction Stop
-        $b = Get-ScheduledTask -TaskName $Paths.RemoteTaskName -ErrorAction Stop
-        return (($null -ne $a) -and ($null -ne $b))
+        $wdMain = Split-Path -Parent $Paths.Daemon
+        $wdRemote = Split-Path -Parent $Paths.RemoteEntry
+        if (-not (Test-TaskDefinition -TaskName $Paths.TaskName -ExpectedFile $Paths.RunTask -ExpectedWorkDir $wdMain -TaskReader $TaskReader)) { return $false }
+        return (Test-TaskDefinition -TaskName $Paths.RemoteTaskName -ExpectedFile $Paths.RunRemote -ExpectedWorkDir $wdRemote -TaskReader $TaskReader)
       }
       "sleep" { return $false }
       "health" {
@@ -999,6 +1058,167 @@ function Write-AtomicTextFile {
   Failures entries instead of an exception. On non-Windows the Task
   Scheduler probes report failure (honest: the runtime needs Windows).
 #>
+<#
+.SYNOPSIS
+  Null-safe CommandLine regex match for Win32_Process objects.
+.DESCRIPTION
+  $_.CommandLine is $null for SYSTEM/idle processes; matching the CIM object
+  itself (instead of .CommandLine) never matches. Returns $false on $null.
+#>
+function Test-CommandLineMatch {
+  param($Process, [string]$Pattern)
+  try {
+    if ($null -eq $Process) { return $false }
+    $cl = [string]$Process.CommandLine
+    if ([string]::IsNullOrWhiteSpace($cl)) { return $false }
+    return ($cl -match $Pattern)
+  } catch { return $false }
+}
+
+<#
+.SYNOPSIS
+  Last sanitized lines of a log file (secrets never surface).
+.DESCRIPTION
+  Returns up to MaxLines tail lines joined by ' | ', each truncated to
+  MaxChars, with bot-token and HMAC/bearer-like secrets redacted.
+  Returns '' when missing/empty/unreadable. Never throws.
+#>
+function Get-SanitizedLogTail {
+  param([string]$Path, [int]$MaxLines = 5, [int]$MaxChars = 200)
+  try {
+    if (-not (Test-Path -LiteralPath $Path)) { return "" }
+    $lines = Get-Content -LiteralPath $Path -Tail $MaxLines -ErrorAction Stop
+    if ($null -eq $lines) { return "" }
+    $out = @()
+    foreach ($ln in @($lines)) {
+      $s = [string]$ln
+      $s = $s -replace 'bot\d+:[A-Za-z0-9_-]{20,}', 'bot<redacted>'
+      $s = $s -replace '(?i)(hmac|signature|bearer|authorization|bot[_-]?token|api[_-]?key)\s*[:=]\s*\S+', '$1=<redacted>'
+      if ($s.Length -gt $MaxChars) { $s = $s.Substring(0, $MaxChars) + "..." }
+      $out += $s.Trim()
+    }
+    return ($out -join " | ")
+  } catch { return "" }
+}
+
+<#
+.SYNOPSIS
+  Per-task health diagnostics: empty when healthy, actionable failures otherwise.
+.DESCRIPTION
+  Checks action contract (single powershell.exe action pointing at the exact
+  quoted launcher, which must exist), log presence/freshness, crash-loop
+  signatures and process presence. When anything fails, appends a context line
+  (State/LastTaskResult/action/launcher) plus a sanitized stderr tail.
+  $TaskInfo/$Processes inject live objects for tests (avoids Windows-only
+  cmdlets off-Windows). Never throws.
+#>
+function Format-TaskDiagnostics {
+  param($Task, [string]$TaskName, [string]$ExpectedFile, [string]$LogPath, [string]$ProcessPattern, [string]$ErrLogPath = "", $TaskInfo = $null, $Processes = $null)
+  $fails = @()
+  try {
+    $acts = @()
+    try { $acts = @($Task.Actions) } catch { }
+    if ($acts.Count -ne 1) {
+      $fails += "${TaskName}: action count=$($acts.Count) (attesa 1: possibile action legacy/stale)"
+    } else {
+      if ([string]$acts[0].Execute -ne "powershell.exe") { $fails += "${TaskName}: action Execute='$($acts[0].Execute)' (atteso powershell.exe)" }
+      if (-not ([string]$acts[0].Arguments).Contains('"' + $ExpectedFile + '"')) { $fails += "${TaskName}: action non punta al launcher atteso ($ExpectedFile)" }
+    }
+    if (-not (Test-Path -LiteralPath $ExpectedFile)) { $fails += "${TaskName}: launcher mancante: $ExpectedFile" }
+    if (-not (Test-Path -LiteralPath $LogPath)) {
+      $fails += "${TaskName}: log assente (task mai partita?): $LogPath"
+    } else {
+      try {
+        $age = (Get-Date) - (Get-Item -LiteralPath $LogPath).LastWriteTime
+        if ($age.TotalMinutes -gt 15) { $fails += "${TaskName}: log fermo da $([int]$age.TotalMinutes) min: $LogPath" }
+      } catch { }
+      try {
+        $tail = Get-Content -LiteralPath $LogPath -Tail 30 -ErrorAction Stop
+        if ($null -ne $tail) {
+          $crashes = @($tail | Where-Object { $_ -match "pi exited unexpectedly|spawn failed|uncaught" }).Count
+          if ($crashes -gt 3) { $fails += "${TaskName}: crash loop nel log ($crashes/30 righe)" }
+        }
+      } catch { }
+    }
+    $found = $false
+    if ($null -ne $Processes) {
+      foreach ($p in @($Processes)) { if (Test-CommandLineMatch -Process $p -Pattern $ProcessPattern) { $found = $true; break } }
+    }
+    if (-not $found) { $fails += "${TaskName}: processo assente (pattern $ProcessPattern)" }
+    if ($fails.Count -gt 0) {
+      $state = ""
+      $lrc = ""
+      $exec = ""
+      $argStr = ""
+      try { $state = [string]$Task.State } catch { }
+      try {
+        if ($null -ne $TaskInfo) { $lrc = [string]$TaskInfo.LastTaskResult }
+        else { $lrc = [string](Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction Stop).LastTaskResult }
+      } catch { }
+      try { if ($acts.Count -ge 1) { $exec = [string]$acts[0].Execute; $argStr = [string]$acts[0].Arguments } } catch { }
+      $lex = Test-Path -LiteralPath $ExpectedFile
+      $fails += "${TaskName}: State=$state LastTaskResult=$lrc Execute=$exec Args=$argStr LauncherExists=$lex"
+      if ((-not [string]::IsNullOrWhiteSpace($ErrLogPath)) -and (Test-Path -LiteralPath $ErrLogPath)) {
+        $st = Get-SanitizedLogTail -Path $ErrLogPath -MaxLines 5
+        if (-not [string]::IsNullOrWhiteSpace($st)) { $fails += "${TaskName}: stderr: $st" }
+      }
+    }
+  } catch { $fails += "${TaskName}: diagnostica interrotta: $($_.Exception.Message)" }
+  return $fails
+}
+
+<#
+.SYNOPSIS
+  Start a task and poll until its payload process is alive (fail fast on instant exit).
+.DESCRIPTION
+  Our launchers never exit on success, so State=Ready (or Disabled) with no
+  matching process means the payload died immediately: returns fail WITHOUT
+  waiting for the full timeout. Success = process CommandLine match found
+  (log presence reported, not required). Returns @{ Ok; Detail } with a
+  secret-free diagnostic block. -TaskReader/-TaskInfoReader/-ProcessProbe
+  inject fakes for tests. Never throws.
+#>
+function Wait-TaskStartup {
+  param([string]$TaskName, [string]$LauncherPath, [string]$ProcessMatch, [string]$LogPath, [int]$TimeoutSec = 20, [int]$EarlyExitSec = 6, [scriptblock]$TaskReader = $null, [scriptblock]$TaskInfoReader = $null, [scriptblock]$ProcessProbe = $null)
+  try {
+    $start = Get-Date
+    $lastState = ""
+    $lastRc = ""
+    while ((((Get-Date) - $start).TotalSeconds) -lt $TimeoutSec) {
+      $running = $false
+      try {
+        if ($null -ne $ProcessProbe) { $running = [bool](& $ProcessProbe) }
+        else {
+          $ps = Get-CimInstance Win32_Process -ErrorAction Stop
+          foreach ($p in @($ps)) { if (Test-CommandLineMatch -Process $p -Pattern $ProcessMatch) { $running = $true; break } }
+        }
+      } catch { $running = $false }
+      if ($running) {
+        $logOk = Test-Path -LiteralPath $LogPath
+        return @{ Ok = $true; Detail = "$TaskName avviato (processo presente, log presente=$logOk)" }
+      }
+      try {
+        if ($null -ne $TaskReader) { $rt = & $TaskReader $TaskName; $lastState = [string]$rt.State }
+        else { $lastState = [string](Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop).State }
+      } catch { }
+      try {
+        if ($null -ne $TaskInfoReader) { $ri = & $TaskInfoReader $TaskName; $lastRc = [string]$ri.LastTaskResult }
+        else { $lastRc = [string](Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction Stop).LastTaskResult }
+      } catch { }
+      $elapsed = ((Get-Date) - $start).TotalSeconds
+      if (($lastState -eq "Disabled") -or (($elapsed -ge $EarlyExitSec) -and ($lastState -eq "Ready"))) { break }
+      Start-Sleep -Seconds 2
+    }
+    $lex = Test-Path -LiteralPath $LauncherPath
+    $logEx = Test-Path -LiteralPath $LogPath
+    $logWord = "absent"
+    if ($logEx) { $logWord = "present" }
+    return @{ Ok = $false; Detail = "$TaskName startup failed | State: $lastState | LastTaskResult: $lastRc | Launcher: $LauncherPath | LauncherExists: $lex | Process: absent | Log: $logWord" }
+  } catch {
+    return @{ Ok = $false; Detail = "$TaskName startup check interrotto: $($_.Exception.Message)" }
+  }
+}
+
 function Invoke-HealthCheck {
   param($Paths, [string]$PiBin = "")
   $script:hcFail = @()
@@ -1027,46 +1247,31 @@ function Invoke-HealthCheck {
     if (-not (Test-WindowsOS)) {
       $script:hcFail += "non-Windows: Task Scheduler non verificabile"
     } else {
+      $allProcs = @()
+      try { $allProcs = @(Get-CimInstance Win32_Process -ErrorAction Stop) } catch { $allProcs = @() }
       $t = Get-ScheduledTask -TaskName $Paths.TaskName -ErrorAction SilentlyContinue
       if ($null -eq $t) {
         $script:hcFail += "task $($Paths.TaskName) assente"
       } else {
-        $log = $Paths.ServerLog
-        if (-not (Test-Path -LiteralPath $log)) {
-          $script:hcFail += "log assente (task mai partita?): $log"
-        } else {
-          $age = (Get-Date) - (Get-Item -LiteralPath $log).LastWriteTime
-          if ($age.TotalMinutes -gt 15) {
-            $script:hcFail += "log fermo da $([int]$age.TotalMinutes) min: $log"
-          }
-          $tail = Get-Content -LiteralPath $log -Tail 30 -ErrorAction SilentlyContinue
-          if ($null -ne $tail) {
-            $crashes = @($tail | Where-Object { $_ -match "pi exited unexpectedly|spawn failed|uncaught" }).Count
-            if ($crashes -gt 3) { $script:hcFail += "crash loop nel log ($crashes/30 righe)" }
-          }
-        }
-        $procs = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -match "pi-daemon\.mjs" }
-        if (($null -eq $procs) -or (@($procs).Count -eq 0)) {
-          $script:hcFail += "processo pi-daemon.mjs non in esecuzione"
-        }
-        $rt = Get-ScheduledTask -TaskName $Paths.RemoteTaskName -ErrorAction SilentlyContinue
-        if ($null -eq $rt) {
-          $script:hcFail += "task $($Paths.RemoteTaskName) assente"
-        } else {
-          $rprocs = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_ -match "pi-remote-server" }
-          if (($null -eq $rprocs) -or (@($rprocs).Count -eq 0)) {
-            $script:hcFail += "processo pi-remote-server non in esecuzione"
-          }
+        $ti = $null
+        try { $ti = Get-ScheduledTaskInfo -TaskName $Paths.TaskName -ErrorAction Stop } catch { }
+        foreach ($f in (Format-TaskDiagnostics -Task $t -TaskName $Paths.TaskName -ExpectedFile $Paths.RunTask -LogPath $Paths.ServerLog -ErrLogPath $Paths.ServerErrLog -ProcessPattern "pi-daemon\.mjs" -TaskInfo $ti -Processes $allProcs)) { $script:hcFail += $f }
+      }
+      $rt = Get-ScheduledTask -TaskName $Paths.RemoteTaskName -ErrorAction SilentlyContinue
+      if ($null -eq $rt) {
+        $script:hcFail += "task $($Paths.RemoteTaskName) assente"
+      } else {
+          $rti = $null
+          try { $rti = Get-ScheduledTaskInfo -TaskName $Paths.RemoteTaskName -ErrorAction Stop } catch { }
+          foreach ($f in (Format-TaskDiagnostics -Task $rt -TaskName $Paths.RemoteTaskName -ExpectedFile $Paths.RunRemote -LogPath $Paths.RemoteLog -ErrLogPath $Paths.RemoteErrLog -ProcessPattern "pi-remote-server" -TaskInfo $rti -Processes $allProcs)) { $script:hcFail += $f }
           $rp = Test-RemoteDaemon -Paths $Paths -TimeoutSec 10
           if (-not $rp.Ok) { $script:hcFail += "remote daemon: $($rp.Detail)" }
         }
       }
-    }
     if (-not [string]::IsNullOrWhiteSpace($PiBin)) {
-      $env:PI_CODING_AGENT_DIR = $Paths.AgentDir
       try {
-        & $PiBin auth check 2>&1 | Out-Null
-        if ($LASTEXITCODE -ne 0) { $script:hcFail += "pi auth check fallito (login mancante?)" }
+        $authHc = Test-PiAuthentication -PiExe $PiBin -AgentDir $Paths.AgentDir
+        if (-not $authHc.Authenticated) { $script:hcFail += "pi auth non valida ($($authHc.Reason))" }
       } catch {
         $script:hcFail += "pi auth check errore: $($_.Exception.Message)"
       }
@@ -1087,6 +1292,19 @@ function Invoke-HealthCheck {
   it) and signs exactly like the Mac client. Never throws: returns
   @{ Ok, Detail }. Never logs the HMAC or the signature.
 #>
+<#
+.SYNOPSIS
+  Culture-invariant Unix timestamp (whole seconds, Int64).
+.DESCRIPTION
+  The Get-Date UFormat percent-s verb is culture-dependent (it-IT yields a comma
+  decimal like '1789215834,20616', which breaks int casts and HMAC timestamps)
+  and [int] overflows in 2038.
+  This is the ONLY approved Unix-timestamp source for HMAC signing.
+#>
+function Get-UnixTimestampSeconds {
+  return [string]([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())
+}
+
 function Test-RemoteDaemon {
   param($Paths, [int]$TimeoutSec = 10)
   try {
@@ -1108,7 +1326,7 @@ function Test-RemoteDaemon {
       $tip = ($tsOut | ForEach-Object { "$_".Trim() } | Where-Object { $_ -match "^100\.(6[4-9]|[78]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}$" } | Select-Object -First 1)
       if (-not [string]::IsNullOrWhiteSpace($tip)) { $bind = $tip }
     } catch { }
-    $ts = [string][int](Get-Date -UFormat %s)
+    $ts = Get-UnixTimestampSeconds
     $nonce = [Guid]::NewGuid().ToString("N")
     $emptyHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     $base = "GET`n/v1/ping`n$ts`n$nonce`n$emptyHash"

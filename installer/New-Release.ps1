@@ -7,7 +7,7 @@
   manifest expects, plus SHA256SUMS.txt (BSD-style "<hash>  <file>" lines).
 
   Layout inside the ZIP (payload root):
-    server\pi-daemon.mjs
+    server\pi-daemon.mjs, spawn-pi.mjs
     server\pi-remote-config\index.ts + package.json
     server\pi-remote-server\index.ts, server.ts, migrate.ts, tailscale.ts
     shared\protocol.ts, modules.ts, store.ts
@@ -43,6 +43,7 @@ if ([string]::IsNullOrWhiteSpace($OutDir)) {
 
 $wanted = @(
   "server\pi-daemon.mjs",
+  "server\spawn-pi.mjs",
   "server\pi-remote-config\index.ts",
   "server\pi-remote-config\package.json",
   "server\pi-remote-server\index.ts",
