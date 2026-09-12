@@ -8,25 +8,30 @@ const RPC_ARGS = ["--mode", "rpc"];
  * Background: on Windows, Node's child_process.spawn uses CreateProcess,
  * which cannot execute .cmd/.bat shims (npm's `pi.cmd`) directly — the
  * spawn fails with ENOENT even when the file exists. The officially correct
- * route is cmd.exe /d /s /c with the quoted executable, fixed args only.
+ * route is cmd.exe /d /s /c with ONE verbatim tail: cmd's /S rule strips the
+ * OUTER quote pair, the INNER quoted exe (paths with spaces survive) plus
+ * fixed args remain. Node must not re-quote -> windowsVerbatimArguments.
  *
  * @param {string} piBin - trusted local path (runtime-env.json) or bare name.
- * @param {string} [platform] - injectable for tests (defaults to process.platform).
  *   NEVER remote input: only fixed literals (--mode rpc) cross the shell.
- * @returns {{ command: string, args: string[] }} ready for child_process.spawn
- *   with stdio pipe + windowsHide (caller adds its own options).
+ * @param {string} [platform] - injectable for tests (defaults to process.platform).
+ * @returns {{ command: string, args: string[], windowsVerbatimArguments: boolean }}
  */
 export function buildPiSpawn(piBin, platform = process.platform) {
   const bin = piBin && piBin.length > 0 ? piBin : "pi";
   if (platform === "win32" && !/\.(exe|com)$/i.test(bin)) {
-    const comspec =
-      process.env.ComSpec ?? "C:\\Windows\\System32\\cmd.exe";
+    const comspec = process.env.ComSpec ?? "C:\\Windows\\System32\\cmd.exe";
     return {
       command: comspec,
-      args: ["/d", "/s", "/c", `"${bin}"`, ...RPC_ARGS],
+      args: ["/d", "/s", "/c", `""${bin}" ${RPC_ARGS.join(" ")}"`],
+      windowsVerbatimArguments: true,
     };
   }
-  return { command: bin, args: [...RPC_ARGS] };
+  return {
+    command: bin,
+    args: [...RPC_ARGS],
+    windowsVerbatimArguments: false,
+  };
 }
 
 /**
@@ -34,10 +39,46 @@ export function buildPiSpawn(piBin, platform = process.platform) {
  * exercised by tests with a real temp .cmd on Windows).
  */
 export function spawnPi(piBin, options = {}) {
-  const { command, args } = buildPiSpawn(piBin);
-  return spawn(command, args, {
+  const spec = buildPiSpawn(piBin);
+  const child = spawn(spec.command, spec.args, {
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
+    windowsVerbatimArguments: !!spec.windowsVerbatimArguments,
     ...options,
   });
+  child.__piCmdWrapper = !!spec.windowsVerbatimArguments;
+  return child;
+}
+
+/**
+ * Stop a pi child started via spawnPi. On win32 the child may be a cmd.exe
+ * wrapper (batch runs pi as a GRANDCHILD): plain kill() would orphan pi, so
+ * taskkill /T /F takes down the whole tree first, then kill() finishes the
+ * wrapper itself. Best-effort, never throws (shutdown path).
+ */
+export function stopPi(child, signal) {
+  try {
+    if (!child || child.exitCode !== null) return;
+    if (
+      process.platform === "win32" &&
+      child.__piCmdWrapper === true &&
+      Number.isInteger(child.pid)
+    ) {
+      try {
+        spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], {
+          stdio: "ignore",
+          windowsHide: true,
+        });
+      } catch {
+        /* fall through to kill() */
+      }
+    }
+    try {
+      child.kill(signal);
+    } catch {
+      /* already gone */
+    }
+  } catch {
+    /* shutdown path is best-effort */
+  }
 }

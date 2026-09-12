@@ -16,7 +16,7 @@
  * Extension errors surfacing as `extension_error` / `type: "extension_error"`
  * events are logged with [pi-server:extension] and never crash the daemon.
  */
-import { spawnPi } from "./spawn-pi.mjs";
+import { spawnPi, stopPi } from "./spawn-pi.mjs";
 import { createInterface } from "node:readline";
 
 const LOG = "[pi-server]";
@@ -137,15 +137,14 @@ function shutdown(signal) {
   log(`received ${signal} — forwarding to pi (graceful, 15s)`);
   if (child && child.exitCode === null) {
     try {
-      child.kill(signal);
-    } catch {
+      stopPi(child, signal);
       // already gone
     }
     setTimeout(() => {
       if (child && child.exitCode === null) {
         logErr("pi did not exit in time — SIGKILL");
         try {
-          child.kill("SIGKILL");
+          stopPi(child, "SIGKILL");
         } catch {}
       }
       setTimeout(() => process.exit(0), 1000);

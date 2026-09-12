@@ -9,32 +9,32 @@ import assert from "node:assert/strict";
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildPiSpawn, spawnPi } from "../server/spawn-pi.mjs";
+import { buildPiSpawn, spawnPi, stopPi } from "../server/spawn-pi.mjs";
 
 describe("buildPiSpawn routing", () => {
-  it("win32 + .cmd routes through ComSpec with fixed args only", () => {
+  it("win32 + .cmd routes through ComSpec with one verbatim tail", () => {
     const r = buildPiSpawn("C:\\npm\\pi.cmd", "win32");
     assert.match(r.command, /cmd\.exe$/i);
     assert.deepEqual(r.args, [
       "/d",
       "/s",
       "/c",
-      '"C:\\npm\\pi.cmd"',
-      "--mode",
-      "rpc",
+      '""C:\\npm\\pi.cmd" --mode rpc"',
     ]);
+    assert.equal(r.windowsVerbatimArguments, true);
   });
 
   it("win32 + bare name still needs cmd (CreateProcess has no PATHEXT)", () => {
     const r = buildPiSpawn("pi", "win32");
     assert.match(r.command, /cmd\.exe$/i);
-    assert.ok(r.args.includes('"pi"'));
+    assert.deepEqual(r.args, ["/d", "/s", "/c", '""pi" --mode rpc"']);
   });
 
   it("win32 + .exe spawns directly", () => {
     const r = buildPiSpawn("C:\\x\\pi.exe", "win32");
     assert.equal(r.command, "C:\\x\\pi.exe");
     assert.deepEqual(r.args, ["--mode", "rpc"]);
+    assert.equal(r.windowsVerbatimArguments, false);
   });
 
   it("posix spawns directly", () => {
@@ -115,6 +115,53 @@ describe("spawnPi real execution (production path)", () => {
           new RegExp(marker),
           "exit=" + got.code + " stderr=" + got.err,
         );
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+});
+
+describe("stopPi tree kill", () => {
+  it("never throws on null/exited children", () => {
+    assert.doesNotThrow(() => stopPi(null));
+    assert.doesNotThrow(() => stopPi(undefined));
+    assert.doesNotThrow(() =>
+      stopPi({ exitCode: 0 } as unknown as import("node:child_process").ChildProcess),
+    );
+  });
+
+  it(
+    "kills a long-running child (and its subtree on win32)",
+    { timeout: 20000 },
+    async () => {
+      const dir = mkdtempSync(join(tmpdir(), "spawn-pi-kill-"));
+      try {
+        let target: string;
+        if (process.platform === "win32") {
+          // Grandchild ping.exe must die with the tree: if only cmd.exe
+          // died, ping would hold stdout open and close would never fire.
+          target = join(dir, "sleeper.cmd");
+          writeFileSync(target, "@ping -n 20 127.0.0.1 >nul\r\n");
+        } else {
+          target = join(dir, "sleeper.sh");
+          writeFileSync(target, "#!/bin/sh\nsleep 20\n");
+          chmodSync(target, 0o755);
+        }
+        const child = spawnPi(target);
+        await new Promise((r) => setTimeout(r, 1500));
+        assert.equal(child.exitCode, null);
+        stopPi(child, "SIGTERM");
+        const code = await new Promise<number | null>((resolve) => {
+          const t = setTimeout(() => resolve(424242), 12000);
+          // NOTE: 'exit' (process gone), not 'close' (also waits for stdio
+          // pipes inherited by grandchildren).
+          child.on("exit", (c) => {
+            clearTimeout(t);
+            resolve(c);
+          });
+        });
+        assert.notEqual(code, 424242, "child did not exit after stopPi");
       } finally {
         rmSync(dir, { recursive: true, force: true });
       }

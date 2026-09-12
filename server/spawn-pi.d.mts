@@ -6,9 +6,15 @@ export declare function buildPiSpawn(
 ): {
   command: string;
   args: string[];
+  windowsVerbatimArguments: boolean;
 };
 
 export declare function spawnPi(
   piBin: string,
   options?: Record<string, unknown>,
 ): ChildProcess;
+
+export declare function stopPi(
+  child: ChildProcess | null | undefined,
+  signal?: string,
+): void;
