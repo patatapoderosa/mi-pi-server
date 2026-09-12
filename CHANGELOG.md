@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.2.7 — 2026-09-12
+
+### Fixed
+
+- Fixed `SyntaxError: Missing catch or finally after try` in `server/pi-daemon.mjs`
+  `shutdown()`: the v0.2.6 refactor from `child.kill()` to `stopPi()` dropped
+  the `} catch {` line, so tasks died instantly with exit 1 and no daemon.
+  One-line restoration, behavior unchanged.
+- Structural gates so a broken runtime can never ship again: new
+  `Test-RuntimeSyntax` lib gate (`node --check` on both `.mjs` entrypoints,
+  fail-closed) is now enforced by CI (`node --check` step), by
+  `New-Release.ps1` BEFORE creating the ZIP (plus TS typecheck), and by
+  installer step 6 (`--check` on the DEPLOYED daemon) BEFORE any task is
+  registered.
+- Hardened both launchers against hand-edited `runtime-env.json`: optional
+  keys (`NpmGlobalBin`, `NodeArgs`) are read defensively under StrictMode
+  (found by the new Windows task-chain E2E).
+- Durable daemon boot marker: `pi-daemon.mjs` logs `starting pi-daemon
+  (bin=..., agentDir=...)` itself, since the task redirect truncates the
+  launcher's pre-launch line.
+- Added `Invoke-TaskE2E.ps1`: real Windows end-to-end (temp SYSTEM task with
+  a SPACED path, stub pi.cmd, real `Wait-TaskStartup` polling, State/Running
+  + LastTaskResult + log + 10s-liveness checks, full teardown). Runs in CI
+  on windows-latest under powershell.exe 5.1; self-dumps logs on failure.
+
+### Upgrade notes
+
+- Rerun the one-liner (resolves `latest` → v0.2.7). Broken v0.2.6 installs
+  (VERSION mismatch forces redeploy): no reinstall, no checkpoint deletion,
+  no new `/login`, no `-Force`.
+
 ## v0.2.6 — 2026-09-12
 
 ### Fixed
