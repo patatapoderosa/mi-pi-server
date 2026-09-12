@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.2.4 — 2026-09-12
+
+### Fixed
+
+- Fixed PowerShell 5.1 parse failure in `server/setup-old-pc.ps1`: the file is
+  UTF-8 without BOM and had em-dashes (U+2014) inside three double-quoted
+  strings. On 5.1 the file is decoded as ANSI, so byte `0x94` becomes U+201D
+  (right double quote) and the tokenizer closes the string early — cascading
+  into terminator/brace/argument errors. The three strings now use ASCII
+  `--` (pwsh 7 was unaffected: it defaults to UTF-8).
+- Fixed Windows smoke tests on Server SKUs (e.g. Windows Server 2025 CI):
+  `TaskSettings` has no battery properties there, and strict mode threw
+  `PropertyNotFound` on the `battery-proof` assertion. The assertion now
+  runs only when the property exists, otherwise SKIP.
+
+### Upgrade notes
+
+- No migration needed: rerun the one-liner (resolves `latest` → v0.2.4).
+
 ## v0.2.3 — 2026-09-12
 
 ### Fixed
