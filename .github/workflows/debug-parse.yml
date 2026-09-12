@@ -16,19 +16,15 @@ jobs:
             $a = $null
             $b = $null
             [void]$pr::ParseInput($pre, [ref]$a, [ref]$b)
-            $hit = @($b | Where-Object {
-              $_.Message -match "Missing argument"
-            })
-            if (@($hit).Count -gt 0) {
-              Write-Host ($label + " BAD")
-            } else {
-              Write-Host ($label + " ok")
+            Write-Host ($label + " n=" + @($b).Count)
+            foreach ($x in @($b)[0..5]) {
+              if ($null -eq $x) { break }
+              Write-Host ("  L" + $x.Extent.StartLineNumber)
+              Write-Host ("  " + $x.Message)
             }
           }
-          P "Q113" 1 113
-          P "Q115" 1 115
-          P "Q116" 1 116
-          P "Q117" 1 117
-          P "Q120" 1 120
-          P "S113" 113 113
-          P "S117-119" 117 119
+          P "P106" 1 106
+          P "P108" 1 108
+          P "P110" 1 110
+          P "P112" 1 112
+          P "P113" 1 113
