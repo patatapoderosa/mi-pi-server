@@ -172,6 +172,75 @@ function Resolve-ToolPath {
     return $null
   }
 }
+# Resume-safe runtime resolvers. The installer skips verified steps, so a step
+# that ran in a PREVIOUS PowerShell session never assigns its variables in THIS
+# session. These resolvers rebuild shared runtime state on demand from live
+# machine state (PATH, well-known locations, validated config hints).
+# They never throw and never touch the network: $null means "not found".
+function Get-PiCandidatePaths {
+  param([string]$RuntimeEnvPath = "")
+  $cands = @()
+  try {
+    $npm = Resolve-ToolPath "npm"
+    if ($null -ne $npm) {
+      try {
+        $prefix = ((& $npm prefix -g 2>$null | Out-String).Trim().Split("`n"))[0].Trim()
+        if (-not [string]::IsNullOrWhiteSpace($prefix)) {
+          $c = Join-Path $prefix "pi.cmd"
+          if (Test-Path -LiteralPath $c) { $cands += $c }
+        }
+      } catch { }
+    }
+    $fixed = @("C:\Program Files\nodejs\pi.cmd")
+    if (-not [string]::IsNullOrWhiteSpace($env:APPDATA)) { $fixed += (Join-Path $env:APPDATA "npm\pi.cmd") }
+    if (-not [string]::IsNullOrWhiteSpace(${env:ProgramFiles})) { $fixed += (Join-Path ${env:ProgramFiles} "nodejs\pi.cmd") }
+    foreach ($c in $fixed) {
+      if (Test-Path -LiteralPath $c) {
+        if ($cands -notcontains $c) { $cands += $c }
+      }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($RuntimeEnvPath) -and (Test-Path -LiteralPath $RuntimeEnvPath)) {
+      try {
+        $hint = ([string](Get-Content -LiteralPath $RuntimeEnvPath -Raw | ConvertFrom-Json).PiBin)
+        if (-not [string]::IsNullOrWhiteSpace($hint) -and (Test-Path -LiteralPath $hint)) {
+          if ($cands -notcontains $hint) { $cands += $hint }
+        }
+      } catch { }
+    }
+  } catch { }
+  return $cands
+}
+function Resolve-PiRuntime {
+  param([string]$RuntimeEnvPath = "")
+  try {
+    $p = Resolve-ToolPath "pi"
+    if ($null -ne $p -and (Test-Path -LiteralPath $p)) { return $p }
+    foreach ($c in (Get-PiCandidatePaths -RuntimeEnvPath $RuntimeEnvPath)) {
+      if (Test-Path -LiteralPath $c) { return $c }
+    }
+    return $null
+  } catch { return $null }
+}
+function Resolve-NodeRuntime {
+  try {
+    $n = Resolve-ToolPath "node"
+    if ($null -eq $n) { return $null }
+    $v = & $n -p "process.versions.node" 2>$null
+    if (Test-AtLeastNode22 -VersionString $v) { return $n }
+    return $null
+  } catch { return $null }
+}
+function Resolve-RemotePort {
+  param([string]$AgentDir = "")
+  try {
+    if ([string]::IsNullOrWhiteSpace($AgentDir)) { return "43128" }
+    $cf = Join-Path $AgentDir "remote-server.json"
+    if (-not (Test-Path -LiteralPath $cf)) { return "43128" }
+    $port = ([string](Get-Content -LiteralPath $cf -Raw | ConvertFrom-Json).port)
+    if (Test-ValidPort $port) { return $port.Trim() }
+    return "43128"
+  } catch { return "43128" }
+}
 function Test-WindowsOS {
   return ($env:OS -eq "Windows_NT")
 }

@@ -618,6 +618,132 @@ try {
   Assert-True (-not (Test-StepRealState -Step "secrets" -Paths $vRoot -PiBin $piFake -AuthRunner $runNotReady)) "secrets ko con auth invalida (resume riesegue)"
   Remove-Item -LiteralPath (Join-Path $vRoot.AgentDir "auth.json") -Force
   Assert-True (-not (Test-StepRealState -Step "secrets" -Paths $vRoot -PiBin $piFake -AuthRunner $runReady)) "secrets ko senza auth.json"
+
+  Write-Host "== runtime hydration (resume-safe) =="
+  $instPath = Join-Path $RepoRoot "installer\windows-installer.ps1"
+  $instText = Get-Content -LiteralPath $instPath -Raw
+  Assert-True ($instText -match '\$hmacShowOnce = ""') "init hmacShowOnce anti-strict"
+  Assert-True ($instText -match '\$piCmd = \$null') "init piCmd anti-strict"
+  Assert-True ($instText -match '\$NpmGlobalBin = \$null') "init NpmGlobalBin anti-strict"
+  Assert-True ($instText -match '\$appBackup = \$null') "init appBackup anti-strict"
+  Assert-True ($instText -match 'Set-StrictMode -Version 2\.0') "strict mode attivo"
+  Assert-True ($instText -notmatch 'Set-StrictMode -Off') "strict mai disabilitato"
+  Assert-True (((($instText -split 'Resolve-PiRuntime').Count - 1)) -ge 4) "Resolve-PiRuntime cablato"
+  Assert-True (((($instText -split 'Resolve-NodeRuntime').Count - 1)) -ge 3) "Resolve-NodeRuntime cablato"
+  Assert-True (((($instText -split 'Resolve-RemotePort').Count - 1)) -ge 3) "Resolve-RemotePort cablato"
+  Assert-True (((($instText -split 'Resolve-PiOrThrow').Count - 1)) -ge 5) "guard PiOrThrow negli step"
+  Assert-True (((($instText -split 'Resolve-NodeOrThrow').Count - 1)) -ge 2) "guard NodeOrThrow negli step"
+  $hydIdx = $instText.IndexOf('$NodeExe = Resolve-NodeRuntime')
+  $step1Idx = $instText.IndexOf('Step "1/11"')
+  Assert-True (($hydIdx -gt 0) -and ($hydIdx -lt $step1Idx)) "hydration incondizionata prima degli step"
+
+  $rpDir = Join-Path $TmpRoot "rp"
+  New-Item -ItemType Directory -Path $rpDir -Force | Out-Null
+  Assert-Equal (Resolve-RemotePort -AgentDir $rpDir) "43128" "porta default senza config"
+  Assert-Equal (Resolve-RemotePort -AgentDir "") "43128" "porta default senza dir"
+  '{"port":43129,"maxSkewSeconds":300,"allowedServices":["pi-server"]}' | Out-File -LiteralPath (Join-Path $rpDir "remote-server.json") -Encoding ascii -NoNewline
+  Assert-Equal (Resolve-RemotePort -AgentDir $rpDir) "43129" "porta da config valida"
+  '{"port":"abc"}' | Out-File -LiteralPath (Join-Path $rpDir "remote-server.json") -Encoding ascii -NoNewline
+  Assert-Equal (Resolve-RemotePort -AgentDir $rpDir) "43128" "porta invalida -> default"
+  '{"port":99999}' | Out-File -LiteralPath (Join-Path $rpDir "remote-server.json") -Encoding ascii -NoNewline
+  Assert-Equal (Resolve-RemotePort -AgentDir $rpDir) "43128" "porta fuori range -> default"
+  'not-json{{{' | Out-File -LiteralPath (Join-Path $rpDir "remote-server.json") -Encoding ascii -NoNewline
+  Assert-Equal (Resolve-RemotePort -AgentDir $rpDir) "43128" "config corrotto -> default"
+
+  $oldAppData = $env:APPDATA
+  try {
+    $fakeAppData = Join-Path $TmpRoot "appdata"
+    New-Item -ItemType Directory -Path (Join-Path $fakeAppData "npm") -Force | Out-Null
+    $fakeAppPi = Join-Path $fakeAppData "npm\pi.cmd"
+    "x" | Out-File -LiteralPath $fakeAppPi -Encoding ascii -NoNewline
+    $env:APPDATA = $fakeAppData
+    Assert-True ((@(Get-PiCandidatePaths) -contains $fakeAppPi)) "fallback APPDATA trovato"
+    $hintTarget = Join-Path $TmpRoot "hintpi\pi.cmd"
+    New-Item -ItemType Directory -Path (Split-Path -Parent $hintTarget) -Force | Out-Null
+    "x" | Out-File -LiteralPath $hintTarget -Encoding ascii -NoNewline
+    $envFile = Join-Path $TmpRoot "runtime-env-hint.json"
+    ('{"PiBin":"' + $hintTarget.Replace('\', '\\') + '"}') | Out-File -LiteralPath $envFile -Encoding ascii -NoNewline
+    Assert-True ((@(Get-PiCandidatePaths -RuntimeEnvPath $envFile) -contains $hintTarget)) "hint runtime-env valido usato"
+    $staleTarget = Join-Path $TmpRoot "stale-xyz\pi.cmd"
+    $staleFile = Join-Path $TmpRoot "runtime-env-stale.json"
+    ('{"PiBin":"' + $staleTarget.Replace('\', '\\') + '"}') | Out-File -LiteralPath $staleFile -Encoding ascii -NoNewline
+    Assert-True ((@(Get-PiCandidatePaths -RuntimeEnvPath $staleFile) -notcontains $staleTarget)) "hint stale ignorato"
+  } finally {
+    if ($null -eq $oldAppData) { Remove-Item Env:\APPDATA -ErrorAction SilentlyContinue }
+    else { $env:APPDATA = $oldAppData }
+  }
+
+  $oldPath = $env:PATH
+  try {
+    $fakeBin = Join-Path $TmpRoot "fakebin"
+    New-Item -ItemType Directory -Path $fakeBin -Force | Out-Null
+    if ($env:OS -eq "Windows_NT") {
+      $fakePi = Join-Path $fakeBin "pi.cmd"
+      "@echo off`r`nexit /b 0`r`n" | Out-File -LiteralPath $fakePi -Encoding ascii -NoNewline
+    } else {
+      $fakePi = Join-Path $fakeBin "pi"
+      "#!/bin/sh`nexit 0`n" | Out-File -LiteralPath $fakePi -Encoding ascii -NoNewline
+      try { & chmod +x $fakePi } catch { }
+    }
+    $env:PATH = $fakeBin + [IO.Path]::PathSeparator + $oldPath
+    Assert-Equal (Resolve-PiRuntime) $fakePi "pi trovato via PATH (step 2/3 skipped -> ricostruito)"
+    $nodeRes = Resolve-NodeRuntime
+    if ($null -eq (Resolve-ToolPath "node")) { Assert-True ($null -eq $nodeRes) "node assente -> null" }
+    else {
+      Assert-True (($null -ne $nodeRes) -and (Test-Path -LiteralPath $nodeRes)) "node presente -> path valido"
+      $nv = & $nodeRes -p "process.versions.node" 2>$null
+      Assert-True (Test-AtLeastNode22 -VersionString $nv) "node risolto >= 22"
+    }
+  } finally { $env:PATH = $oldPath }
+
+  $oldPath2 = $env:PATH
+  try {
+    $nopeEnv = Join-Path $TmpRoot "nope.json"
+    if ($env:OS -eq "Windows_NT") {
+      $fixedC = @((Join-Path $env:APPDATA "npm\pi.cmd"), "C:\Program Files\nodejs\pi.cmd", (Join-Path ${env:ProgramFiles} "nodejs\pi.cmd"))
+      $anyFixed = (@($fixedC | Where-Object { Test-Path -LiteralPath $_ }).Count -gt 0)
+      if ($anyFixed) { Skip-Test "pi-assente" "pi esiste fuori PATH (assenza non simulabile)" }
+      else {
+        $env:PATH = "C:\Windows\System32;C:\Windows"
+        Assert-True ($null -eq (Resolve-PiRuntime -RuntimeEnvPath $nopeEnv)) "pi assente -> null, nessun throw"
+      }
+    } else {
+      $env:PATH = "/usr/bin:/bin"
+      Assert-True ($null -eq (Resolve-PiRuntime -RuntimeEnvPath $nopeEnv)) "pi assente -> null, nessun throw"
+    }
+  } finally { $env:PATH = $oldPath2 }
+
+  $childHost = $null
+  if ($env:OS -eq "Windows_NT") {
+    $ps51 = Join-Path $PSHOME "powershell.exe"
+    if (Test-Path -LiteralPath $ps51) { $childHost = $ps51 }
+  }
+  if ($null -eq $childHost) {
+    $wc = Get-Command pwsh -ErrorAction SilentlyContinue
+    if ($null -ne $wc) { $childHost = $wc.Source }
+  }
+  if ($null -eq $childHost) { Skip-Test "fresh-session" "nessun host figlio disponibile" }
+  else {
+    $childLines = @(
+      '. "' + $LibPath + '"',
+      'Set-StrictMode -Version 2.0',
+      '$NodeExe = $null',
+      '$piCmd = $null',
+      '$NpmGlobalBin = $null',
+      '$RemotePort = $null',
+      '$strictOn = $false',
+      'try { $z = $noSuchVarHydrationCheck123 } catch { $strictOn = $true }',
+      'if (-not $strictOn) { exit 10 }',
+      '$piCmd = Resolve-PiRuntime',
+      '$RemotePort = Resolve-RemotePort -AgentDir ""',
+      'if ($RemotePort -ne "43128") { exit 11 }',
+      'if (($null -ne $piCmd) -and (-not (Test-Path -LiteralPath $piCmd))) { exit 12 }',
+      'exit 0')
+    $childFile = Join-Path $TmpRoot "fresh-hydration.ps1"
+    $childLines | Out-File -LiteralPath $childFile -Encoding ascii -NoNewline
+    & $childHost -NoProfile -NonInteractive -File $childFile
+    Assert-Equal $LASTEXITCODE 0 "fresh PowerShell: hydration senza UndefinedVariable"
+  }
 } finally {
   Remove-Item -LiteralPath $TmpRoot -Recurse -Force -ErrorAction SilentlyContinue
 }

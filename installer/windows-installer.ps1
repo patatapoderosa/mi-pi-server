@@ -91,6 +91,28 @@ function Fail([string]$why) {
   exit 1
 }
 
+# Resume-safe strict resolvers. The hydration block below initializes shared
+# runtime variables; these helpers re-resolve strictly at the top of every step
+# that needs them (a skipped step never ran in this session). They read the
+# outer variable (traverses up to script scope) and RETURN the resolved path:
+# callers assign the result. Throw StepError only when truly required.
+function Resolve-PiOrThrow([string]$why) {
+  $cur = $piCmd
+  if ($null -eq $cur -or -not (Test-Path -LiteralPath ([string]$cur))) {
+    $cur = Resolve-PiRuntime -RuntimeEnvPath $Paths.RuntimeEnv
+  }
+  if ($null -eq $cur) { throw (New-StepError "System" $why) }
+  return $cur
+}
+function Resolve-NodeOrThrow([string]$why) {
+  $cur = $NodeExe
+  if ($null -eq $cur -or -not (Test-Path -LiteralPath ([string]$cur))) {
+    $cur = Resolve-NodeRuntime
+  }
+  if ($null -eq $cur) { throw (New-StepError "System" $why) }
+  return $cur
+}
+
 # ---- 0. elevation (self-relaunch; works for direct runs, setup.ps1 pre-elevates pipe runs)
 if (-not (Test-IsAdmin)) {
   Write-Host "Riavvio come amministratore..." -ForegroundColor Yellow
@@ -227,6 +249,19 @@ if ($stFile.Corrupt -or $Force -or ($script:InstallState.lastSuccessfulStep -ne 
 $script:InstallState.targetRelease = $Version
 Save-StepState
 
+# ---- runtime context hydration (resume-safe, unconditional) ----
+# A step skipped by resume never ran in THIS PowerShell session, so shared
+# runtime variables must not depend on it. Re-resolve best effort here (never
+# throws: resolvers return $null / defaults when tools are not installed yet).
+# Each dependent step still re-resolves strictly before use; these inits only
+# guarantee StrictMode-safe reads and sane session defaults.
+$NodeExe = Resolve-NodeRuntime
+$piCmd = Resolve-PiRuntime -RuntimeEnvPath $Paths.RuntimeEnv
+if ($null -ne $piCmd) { $NpmGlobalBin = Split-Path -Parent $piCmd } else { $NpmGlobalBin = $null }
+$RemotePort = Resolve-RemotePort -AgentDir $Paths.AgentDir
+$appBackup = $null
+$hmacShowOnce = ""
+
 try {
   # ================= [1/11] Windows =================
   Step "1/11" "Controllo Windows"
@@ -299,7 +334,7 @@ try {
     }
     L "Node.js $v installato" "OK"
   }
-  $NodeExe = Resolve-ToolPath "node"
+  $NodeExe = Resolve-NodeRuntime
   if ($null -eq $NodeExe) { throw (New-StepError "System" "node.exe non risolvibile dopo l'installazione.") }
 
         Complete-InstallStep -Name "node"
@@ -320,7 +355,7 @@ try {
     while ($true) {
       $attempt++
       try {
-  $piCmd = Resolve-ToolPath "pi"
+  $piCmd = Resolve-PiRuntime -RuntimeEnvPath $Paths.RuntimeEnv
   if ($null -ne $piCmd) {
     try {
       $pv = & $piCmd --version 2>$null
@@ -333,7 +368,7 @@ try {
     $npm = Resolve-ToolPath "npm"
     if ($null -eq $npm) { throw (New-StepError "System" "npm non trovato (installazione Node incompleta?).") }
     & $npm install -g "@earendil-works/pi-coding-agent" --no-audit --no-fund
-    $piCmd = Resolve-ToolPath "pi"
+    $piCmd = Resolve-PiRuntime -RuntimeEnvPath $Paths.RuntimeEnv
     if ($null -eq $piCmd) {
       # npm global bin may not be on PATH yet: probe default locations.
       foreach ($cand in @(
@@ -366,6 +401,8 @@ try {
     while ($true) {
       $attempt++
       try {
+  $piCmd = Resolve-PiOrThrow "pi.cmd non risolvibile (step 3 saltato ma Pi assente). Riesegui senza resume o reinstalla Pi."
+  $NpmGlobalBin = Split-Path -Parent $piCmd
   $listed = ""
   try { $listed = (& $piCmd list 2>$null | Out-String) } catch { }
   if ($listed -match "pi-telegram") {
@@ -486,6 +523,9 @@ try {
     while ($true) {
       $attempt++
       try {
+  $NodeExe = Resolve-NodeOrThrow "node.exe non risolvibile (step 2 saltato ma Node assente). Riesegui senza resume o reinstalla Node 22."
+  $piCmd = Resolve-PiOrThrow "pi.cmd non risolvibile (step 3 saltato ma Pi assente). Riesegui senza resume o reinstalla Pi."
+  $NpmGlobalBin = Split-Path -Parent $piCmd
   $payload = $PayloadDir
   $tmpPayload = ""
   if ([string]::IsNullOrWhiteSpace($payload)) {
@@ -650,8 +690,7 @@ try {
   } else {
     L "remote-server.json: $st (user config preserved)" "OK"
   }
-  $RemotePort = ([string](Get-Content -LiteralPath $serverCfgPath -Raw | ConvertFrom-Json).port)
-  if ($RemotePort -notmatch "^\d+$") { $RemotePort = "43128" }
+  $RemotePort = Resolve-RemotePort -AgentDir $Paths.AgentDir
   L "remote API port: $RemotePort" "OK"
 
         Complete-InstallStep -Name "config"
@@ -672,6 +711,7 @@ try {
     while ($true) {
       $attempt++
       try {
+  $piCmd = Resolve-PiOrThrow "pi.cmd non risolvibile (step 3 saltato ma Pi assente). Riesegui senza resume o reinstalla Pi."
   L "--- step 8/11 (secrets+login)"
   if (-not (Test-Path -LiteralPath $Paths.SecretsDir)) {
     New-Item -ItemType Directory -Path $Paths.SecretsDir -Force | Out-Null
@@ -911,6 +951,7 @@ try {
     while ($true) {
       $attempt++
       try {
+  $RemotePort = Resolve-RemotePort -AgentDir $Paths.AgentDir
   $action = New-ScheduledTaskAction -Execute "powershell.exe" `
     -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$($Paths.RunTask)`"" `
     -WorkingDirectory (Split-Path -Parent $Paths.Daemon)
@@ -1013,6 +1054,7 @@ try {
     while ($true) {
       $attempt++
       try {
+  $piCmd = Resolve-PiOrThrow "pi.cmd non risolvibile (step 3 saltato ma Pi assente). Riesegui senza resume o reinstalla Pi."
   Start-Sleep -Seconds 10
   $hc = Invoke-HealthCheck -Paths $Paths -PiBin $piCmd
   if (-not $hc.Ok) {
