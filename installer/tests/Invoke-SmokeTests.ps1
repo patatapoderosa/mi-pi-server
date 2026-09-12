@@ -878,6 +878,70 @@ try {
   $rOld = { param($n) return $global:ttOld }
   Assert-True (-not (Test-TaskDefinition -TaskName "T" -ExpectedFile $oldRoot.RunTask -ExpectedWorkDir $oldWd -TaskReader $rOld)) "task v0.2.5 invalida il real-state"
   Remove-Variable -Name ttGood,ttStale,ttMulti,ttExe,ttWd,ttUser,ttDiag,ttOld -Scope Global -ErrorAction SilentlyContinue
+
+  Write-Host "== runtime syntax gate (daemon try/catch v0.2.6) =="
+  $nodeCmd = Get-Command node -ErrorAction SilentlyContinue
+  if ($null -eq $nodeCmd) {
+    Skip-Test "runtime syntax gate" "node assente"
+  } else {
+    $rtOk = Test-RuntimeSyntax -NodeExe $nodeCmd.Source -Files @(
+      (Join-Path $RepoRoot "server\pi-daemon.mjs"),
+      (Join-Path $RepoRoot "server\spawn-pi.mjs"))
+    Assert-True $rtOk.Ok "node --check daemon + spawn = exit 0"
+    $synDir = Join-Path $TmpRoot "syntax"
+    New-Item -ItemType Directory -Path $synDir -Force | Out-Null
+    'console.log("ok");' | Out-File -LiteralPath (Join-Path $synDir "good.mjs") -Encoding ascii -NoNewline
+    'try { foo() }' | Out-File -LiteralPath (Join-Path $synDir "bad.mjs") -Encoding ascii -NoNewline
+    $rtBad = Test-RuntimeSyntax -NodeExe $nodeCmd.Source -Files @((Join-Path $synDir "good.mjs"), (Join-Path $synDir "bad.mjs"))
+    Assert-True ((-not $rtBad.Ok) -and ((@($rtBad.Failures) -match "bad\.mjs").Count -ge 1)) "fixture try-senza-catch rifiutata"
+    $rtNoNode = Test-RuntimeSyntax -NodeExe (Join-Path $TmpRoot "no-such-node") -Files @((Join-Path $synDir "good.mjs"))
+    Assert-True (-not $rtNoNode.Ok) "node assente = fail closed"
+    $rtNoFiles = Test-RuntimeSyntax -NodeExe $nodeCmd.Source -Files @()
+    Assert-True (-not $rtNoFiles.Ok) "nessun file = fail closed"
+  }
+  $wiText3 = Get-Content -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) "windows-installer.ps1") -Raw
+  $gateIdx = $wiText3.IndexOf("Test-RuntimeSyntax -NodeExe")
+  $regIdx = $wiText3.IndexOf("Register-ScheduledTask")
+  Assert-True (($gateIdx -gt 0) -and ($regIdx -gt $gateIdx)) "step 6 valida daemon PRIMA dei task"
+  Assert-True ($wiText3 -match 'Join-Path \(Split-Path -Parent \$Paths\.Daemon\) "spawn-pi\.mjs"') "step 6 controlla anche spawn-pi.mjs"
+  $nrText = Get-Content -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) "New-Release.ps1") -Raw
+  $nrGateIdx = $nrText.IndexOf("Test-RuntimeSyntax")
+  $nrZipIdx = $nrText.IndexOf("Compress-Archive")
+  Assert-True (($nrGateIdx -gt 0) -and ($nrZipIdx -gt $nrGateIdx)) "release builder valida PRIMA dello ZIP"
+  Assert-True ($nrText -match "npm.*run typecheck") "release builder richiede typecheck TS"
+  $ciText = Get-Content -LiteralPath (Join-Path $RepoRoot ".github\workflows\ci.yml") -Raw
+  Assert-True ($ciText -match "node --check server/pi-daemon\.mjs") "CI controlla pi-daemon.mjs"
+  Assert-True ($ciText -match "node --check server/spawn-pi\.mjs") "CI controlla spawn-pi.mjs"
+
+  Write-Host "== release builder rifiuta daemon rotto =="
+  $psChild = Join-Path $PSHOME "powershell.exe"
+  if (-not (Test-Path -LiteralPath $psChild)) {
+    $pwshCmd = Get-Command pwsh -ErrorAction SilentlyContinue
+    if ($null -ne $pwshCmd) { $psChild = "pwsh" } else { $psChild = "" }
+  }
+  if ([string]::IsNullOrWhiteSpace($psChild)) {
+    Skip-Test "release refusal" "nessun host figlio disponibile"
+  } else {
+    $fixRepo = Join-Path $TmpRoot "fixrepo"
+    New-Item -ItemType Directory -Path $fixRepo -Force | Out-Null
+    foreach ($rel in @("server\pi-daemon.mjs", "server\spawn-pi.mjs", "server\pi-remote-config\index.ts",
+        "server\pi-remote-config\package.json", "server\pi-remote-server\index.ts", "server\pi-remote-server\server.ts",
+        "server\pi-remote-server\migrate.ts", "server\pi-remote-server\tailscale.ts", "shared\protocol.ts",
+        "shared\modules.ts", "shared\store.ts", "installer\PiServerLib.ps1", "installer\windows-installer.ps1",
+        "installer\run-task.ps1", "installer\run-remote.ps1")) {
+      $fd = Join-Path $fixRepo $rel
+      $dd = Split-Path -Parent $fd
+      if (-not (Test-Path -LiteralPath $dd)) { New-Item -ItemType Directory -Path $dd -Force | Out-Null }
+      "x" | Out-File -LiteralPath $fd -Encoding ascii -NoNewline
+    }
+    'try { foo() }' | Out-File -LiteralPath (Join-Path $fixRepo "server\pi-daemon.mjs") -Encoding ascii -NoNewline
+    $fixOut = Join-Path $TmpRoot "fixout"
+    $nrPath = Join-Path (Split-Path -Parent $PSScriptRoot) "New-Release.ps1"
+    $nrOut = & $psChild -NoProfile -NonInteractive -File $nrPath -RepoRoot $fixRepo -OutDir $fixOut -Version "v9.9.9-neg" 2>&1 | Out-String
+    Assert-True ($LASTEXITCODE -ne 0) "builder esce non-zero su daemon rotto"
+    Assert-True ((@(Get-ChildItem -LiteralPath $fixOut -Filter "*.zip" -ErrorAction SilentlyContinue)).Count -eq 0) "nessuno ZIP creato"
+    Assert-True ($nrOut -match "(?i)syntax|pi-daemon") "motivo cita la sintassi"
+  }
 } finally {
   Remove-Item -LiteralPath $TmpRoot -Recurse -Force -ErrorAction SilentlyContinue
 }

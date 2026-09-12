@@ -138,6 +138,7 @@ function shutdown(signal) {
   if (child && child.exitCode === null) {
     try {
       stopPi(child, signal);
+    } catch {
       // already gone
     }
     setTimeout(() => {

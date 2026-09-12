@@ -67,6 +67,29 @@ foreach ($rel in $wanted) {
   }
 }
 
+# Pre-ZIP runtime gates: a release is shippable only if every runtime
+# entrypoint parses. v0.2.6 shipped a syntactically broken pi-daemon.mjs
+# because nothing checked it.
+. (Join-Path (Split-Path -Parent $PSCommandPath) "PiServerLib.ps1")
+$rtGate = Test-RuntimeSyntax -Files @(
+  (Join-Path $RepoRoot "server\pi-daemon.mjs"),
+  (Join-Path $RepoRoot "server\spawn-pi.mjs"))
+if (-not $rtGate.Ok) {
+  Write-Host "RELEASE FALLITA" -ForegroundColor Red
+  Write-Host ("Motivo: runtime JS non valido: " + ($rtGate.Failures -join "; "))
+  exit 1
+}
+Write-Host "runtime JS syntax OK (pi-daemon.mjs, spawn-pi.mjs)" -ForegroundColor Green
+try {
+  & npm --prefix "$RepoRoot" run typecheck 2>&1 | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw "exit $LASTEXITCODE" }
+} catch {
+  Write-Host "RELEASE FALLITA" -ForegroundColor Red
+  Write-Host ("Motivo: typecheck TS fallito: " + $_.Exception.Message)
+  exit 1
+}
+Write-Host "typecheck TS OK" -ForegroundColor Green
+
 if (-not (Test-Path -LiteralPath $OutDir)) {
   New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
 }

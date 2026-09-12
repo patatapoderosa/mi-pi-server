@@ -630,6 +630,9 @@ try {
   }
   if (-not $stripped) { throw (New-StepError "System" "Node cannot type-check the remote daemon entry (node --check failed). Upgrade Node 22.") }
   L "node type-stripping: $(if ($nodeStripArgs.Count -eq 0) { 'native (no flag)' } else { $nodeStripArgs -join ' ' })" "OK"
+  $rtSyn = Test-RuntimeSyntax -NodeExe $NodeExe -Files @($Paths.Daemon, (Join-Path (Split-Path -Parent $Paths.Daemon) "spawn-pi.mjs"))
+  if (-not $rtSyn.Ok) { throw (New-StepError "System" ("Runtime JS non valido PRIMA dei task (deploy corrotto?): " + ($rtSyn.Failures -join "; "))) }
+  L "runtime JS syntax OK (pi-daemon.mjs, spawn-pi.mjs)" "OK"
 
   # runtime-env.json with absolute paths (SYSTEM-safe).
   @{

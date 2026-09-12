@@ -244,6 +244,47 @@ function Resolve-NodeRuntime {
     return $null
   } catch { return $null }
 }
+<#
+.SYNOPSIS
+  Fail-closed syntax gate for JS runtime entrypoints (Bug: v0.2.6 shipped
+  pi-daemon.mjs with a try-without-catch because nothing ran node --check
+  on it).
+.DESCRIPTION
+  Runs `node --check` on every file (exit 0 required). Missing node, missing
+  files, or any parse failure returns Ok=$false with actionable Failures.
+  Never throws. Used by New-Release.ps1 (pre-ZIP), installer step 6
+  (pre-task) and CI/smoke tests — single source of truth.
+#>
+function Test-RuntimeSyntax {
+  param([string]$NodeExe = "", [string[]]$Files = @())
+  $fails = @()
+  try {
+    $node = $NodeExe
+    if ([string]::IsNullOrWhiteSpace($node)) {
+      $c = Get-Command node -ErrorAction SilentlyContinue
+      if ($null -ne $c) { $node = $c.Source }
+    }
+    if ([string]::IsNullOrWhiteSpace($node) -or (-not (Test-Path -LiteralPath $node))) {
+      return @{ Ok = $false; Failures = @("node non disponibile per --check") }
+    }
+    if ($Files.Count -eq 0) { return @{ Ok = $false; Failures = @("nessun file da validare") } }
+    foreach ($f in $Files) {
+      if ([string]::IsNullOrWhiteSpace($f) -or (-not (Test-Path -LiteralPath $f))) {
+        $fails += "file mancante: $f"
+        continue
+      }
+      try {
+        & $node --check $f 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) { $fails += "syntax check fallito (exit $LASTEXITCODE): $f" }
+      } catch {
+        $fails += "syntax check errore ($($_.Exception.Message)): $f"
+      }
+    }
+  } catch {
+    $fails += "validazione interrotta: $($_.Exception.Message)"
+  }
+  return @{ Ok = ($fails.Count -eq 0); Failures = $fails }
+}
 function Resolve-RemotePort {
   param([string]$AgentDir = "")
   try {
