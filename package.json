@@ -1,6 +1,6 @@
 {
   "name": "pi-remote-system",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "private": true,
   "description": "Self-hosted 24/7 Pi Coding Agent node on an old PC: phone control via Telegram ServerBot, Mac control via HMAC-signed HTTP over Tailscale. No VPS, no port forwarding.",
   "type": "module",

@@ -1,5 +1,42 @@
 # Changelog
 
+## v0.2.8 — 2026-09-12
+
+### Fixed
+
+- Fixed upgrade v0.2.6 -> v0.2.7 dying at step 6/11: with no `-Update` flag
+  the installer used delete-path staging while the live runtime held locks
+  inside `app\` (cwd + `EADDRINUSE` on 43128). The one-liner now
+  auto-detects upgrade mode (`Test-ShouldAutoUpdate`: installed VERSION
+  differs from target) with backup-preserving semantics; `-Update` stays
+  as explicit override.
+- New `Stop-PiServerRuntime`: stops both tasks, tree-kills only processes
+  whose command line lives under the app root (never arbitrary PIDs, never
+  self), waits for exit, and verifies our port is released. Wired as a
+  `-PreSwapAction` hook inside `Invoke-AppStaging`, so staging still
+  validates first and the live app is untouched on failure.
+- Dependency invalidation: a deploy rerun forces tasks restart + health
+  rerun; a checkpoint targetRelease mismatch forces deploy rerun.
+- New `Clear-OwnPortListener` pre-start gate: free port proceeds, stale OWN
+  listener is tree-killed + rechecked, FOREIGN listener fails with
+  diagnostics and is never killed.
+- Transactional rollback extracted to `Invoke-AppRollback` (stop new
+  runtime, retried app removal, backup restore, ext/shared restore, task
+  restart, health recheck, full report) and keyed on backup existence
+  instead of `$Mode`, so auto-updates roll back too.
+- Split PowerShell transcript to `installer-transcript.log`: transcript and
+  structured `installer.log` no longer contend for one handle on 5.1.
+- Added `Invoke-UpgradeE2E.ps1`: real Windows E2E (live cwd lock + real
+  TCP listener + real stop/swap/rollback, temp dirs only, full teardown).
+  Runs in CI on windows-latest under powershell.exe 5.1.
+
+### Upgrade notes
+
+- Rerun the one-liner (resolves `latest` → v0.2.8). Broken v0.2.6/v0.2.7
+  installs self-repair: VERSION mismatch forces redeploy, stale tasks
+  re-register, no reinstall, no checkpoint deletion, no new `/login`,
+  no `-Force`.
+
 ## v0.2.7 — 2026-09-12
 
 ### Fixed
