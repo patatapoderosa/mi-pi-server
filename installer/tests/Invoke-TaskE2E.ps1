@@ -112,6 +112,8 @@ try {
   try { $logRaw = Get-Content -LiteralPath $logPath -Raw -ErrorAction Stop } catch { }
   if ($logRaw -match "starting pi-daemon") { Ok "log contiene starting pi-daemon" }
   else { Fail "log senza starting pi-daemon" }
+  if ($logRaw -match "stub-pi\.cmd") { Ok "daemon ha ricevuto il .cmd con spazi" }
+  else { Fail "PI_BIN con spazi non arrivato al daemon" }
 
   Start-Sleep -Seconds 10
   $esc = [regex]::Escape((Join-Path $app "server\pi-daemon.mjs"))

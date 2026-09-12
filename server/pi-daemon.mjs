@@ -52,7 +52,7 @@ function sendRpc(obj) {
 }
 
 function start() {
-  log(`starting: ${PI_BIN} --mode rpc`);
+  log(`starting pi-daemon (bin=${PI_BIN}, agentDir=${process.env["PI_CODING_AGENT_DIR"] ?? "?"})`);
   child = spawnPi(PI_BIN);
 
   child.on("error", (err) => {
