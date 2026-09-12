@@ -70,6 +70,10 @@ Phone flow is direct: DM → ServerBot → Pi → `server_status`/`server_config
 | `PATCH /v1/modules/:name/config` | signed | `{patch}` → validated atomic write + backup |
 | `POST /v1/modules/:name/enable` | signed | flips `enabled` on |
 | `POST /v1/modules/:name/disable` | signed | flips `enabled` off |
+| `GET /v1/model` | signed | configured startup default (settings.json) + restart note |
+| `GET /v1/models` | signed | live Pi catalog with per-provider auth (capped) |
+| `POST /v1/model/validate` | signed | dry-run selection check (read-only) |
+| `POST /v1/model` | signed + core gates | validated atomic settings write + backup |
 
 Auth (every `/v1/*` route except `/v1/health`), verification order:
 headers → signature (constant-time) → freshness → persisted anti-replay →
@@ -123,6 +127,34 @@ rotate logs and launch the processes in the foreground so the tasks stay
 Running. Secrets ACL: SYSTEM+Administrators.
 Pi provider credentials: the interactive `/login` runs as the installing user,
 then `auth.json` is copied into the data dir (idempotent, backed up).
+
+## Remote Model Management (`server_model`)
+
+First-class capability (not a module): model data is dynamic (live Pi
+catalog), the write target is Pi-owned `<agent>/settings.json` (not
+`server-config/`), and validation needs subprocess calls. Verified against
+Pi 0.85.1 code + real CLI output (never assumed):
+
+- Settings keys `defaultProvider` / `defaultModel` / `defaultThinkingLevel`
+  are real (settings-manager + official settings.md); thinking levels are
+  `off/minimal/low/medium/high/xhigh/max` (default `medium`).
+- The 24/7 Pi runs `pi --mode rpc` with no model flags, so the startup
+  model = settings default (if authed) else first-available fallback.
+  `settings.json` edits apply at next Pi start only — the live session
+  keeps its boot-time model. `GET /v1/model` reports the configured
+  default explicitly separate from the (unknown) live model, never
+  pretending they match.
+- `GET /v1/models` shells fixed `pi --list-models` (deterministic table
+  parse, header-validated) plus `pi auth check --provider P --json
+  --no-refresh` per distinct provider (10 providers / 100 rows caps).
+- `POST /v1/model` mirrors Pi's own `resolveCliModel` rules
+  (case-insensitive provider, `provider/model` inference, ambiguity
+  rejection), requires ready auth, then backup + atomic write preserving
+  all other settings. `applyNow:true` records intent only — no remote
+  restart channel exists.
+- Mac tools: `server_model_get` / `server_model_list` / `server_model_set`;
+  ServerBot: `server_model` tool (get/list/set/validate) in
+  `server/pi-remote-config`, sharing `shared/pi-model.ts` pure logic.
 
 ## Adding a new module (no protocol/auth/transport changes)
 

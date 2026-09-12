@@ -19,6 +19,7 @@ $script:ReleaseManifest = @(
   "shared\protocol.ts",
   "shared\modules.ts",
   "shared\store.ts",
+  "shared\pi-model.ts",
   "installer\run-task.ps1",
   "installer\run-remote.ps1",
   "installer\windows-installer.ps1",
@@ -1576,7 +1577,7 @@ function Invoke-HealthCheck {
     if (-not (Test-Path -LiteralPath $idx)) {
       $script:hcFail += "extension mancante: $idx"
     }
-    foreach ($name in @("protocol.ts", "modules.ts", "store.ts")) {
+    foreach ($name in @("protocol.ts", "modules.ts", "store.ts", "pi-model.ts")) {
       $sf = Join-Path $Paths.SharedDir $name
       if (-not (Test-Path -LiteralPath $sf)) {
         $script:hcFail += "shared mancante: $sf"

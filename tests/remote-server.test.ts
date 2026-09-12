@@ -610,3 +610,206 @@ describe("client transport failures", () => {
     }
   });
 });
+
+describe("server_model routes (fake pi on PATH)", () => {
+  let s: Started;
+  let binDir = "";
+  let oldPath = "";
+  let oldComSpec: string | undefined;
+
+  function writeFakePi(dir: string): void {
+    if (process.platform === "win32") {
+      writeFileSync(
+        join(dir, "pi.cmd"),
+        "@echo off\r\n" +
+          'if "%1"=="--list-models" (\r\n' +
+          "  echo provider  model         context  max-out  thinking  images\r\n" +
+          "  echo anthropic  claude-opus-4-8  200K  32K  yes  no\r\n" +
+          "  echo openai  gpt-5.5  400K  128K  no  no\r\n" +
+          "  exit /b 0\r\n" +
+          ")\r\n" +
+          'if "%1"=="auth" (\r\n' +
+          '  if "%4"=="anthropic" (\r\n' +
+          '    echo {"status":"ready","provider":"anthropic","authType":"api_key"}\r\n' +
+          "    exit /b 0\r\n" +
+          "  )\r\n" +
+          '  echo {"status":"not_ready","provider":"%4","reason":"credentials_not_configured"}\r\n' +
+          "  exit /b 1\r\n" +
+          ")\r\n" +
+          "exit /b 2\r\n",
+      );
+    } else {
+      writeFileSync(
+        join(dir, "pi"),
+        "#!/bin/sh\n" +
+          'if [ "$1" = "--list-models" ]; then\n' +
+          '  printf "%s\\n" "provider  model         context  max-out  thinking  images" "anthropic  claude-opus-4-8  200K  32K  yes  no" "openai  gpt-5.5  400K  128K  no  no"\n' +
+          "  exit 0\n" +
+          "fi\n" +
+          'if [ "$1" = "auth" ]; then\n' +
+          '  if [ "$4" = "anthropic" ]; then\n' +
+          '    printf "%s\\n" "{\\"status\\":\\"ready\\",\\"provider\\":\\"anthropic\\",\\"authType\\":\\"api_key\\"}"\n' +
+          "    exit 0\n" +
+          "  fi\n" +
+          '  printf "%s\\n" "{\\"status\\":\\"not_ready\\",\\"provider\\":\\"$4\\",\\"reason\\":\\"credentials_not_configured\\"}"\n' +
+          "  exit 1\n" +
+          "fi\n" +
+          "exit 2\n",
+        { mode: 0o755 },
+      );
+    }
+  }
+
+  beforeEach(async () => {
+    s = await boot();
+    binDir = mkdtempSync(join(tmpdir(), "pi-fakebin-"));
+    writeFakePi(binDir);
+    oldPath = process.env.PATH ?? "";
+    process.env.PATH =
+      binDir + (process.platform === "win32" ? ";" : ":") + oldPath;
+    oldComSpec = process.env.ComSpec;
+  });
+
+  afterEach(async () => {
+    process.env.PATH = oldPath;
+    if (oldComSpec === undefined) delete process.env.ComSpec;
+    else process.env.ComSpec = oldComSpec;
+    await close(s);
+    rmSync(s.agentDir, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+  });
+
+  it("GET /v1/model reports unset when no settings.json", async () => {
+    const r = await signed(s.port, "/v1/model", {});
+    assert.equal(r.status, 200);
+    const b = r.json["body"] as Record<string, unknown>;
+    assert.equal(b["provider"], null);
+    assert.equal(b["source"], "unset");
+    assert.equal(b["requiresRestart"], false);
+    assert.equal(b["liveModel"], null);
+    assert.ok(String(b["settingsPath"]).endsWith("settings.json"));
+  });
+
+  it("GET /v1/model reports configured default", async () => {
+    writeFileSync(
+      join(s.agentDir, "settings.json"),
+      JSON.stringify({
+        defaultProvider: "anthropic",
+        defaultModel: "claude-opus-4-8",
+        theme: "dark",
+      }),
+    );
+    const r = await signed(s.port, "/v1/model", {});
+    assert.equal(r.status, 200);
+    const b = r.json["body"] as Record<string, unknown>;
+    assert.equal(b["provider"], "anthropic");
+    assert.equal(b["model"], "claude-opus-4-8");
+    assert.equal(b["source"], "settings.json");
+    assert.equal(b["requiresRestart"], true);
+  });
+
+  it("GET /v1/models lists catalog with per-provider auth", async () => {
+    const r = await signed(s.port, "/v1/models", {});
+    assert.equal(r.status, 200);
+    const b = r.json["body"] as {
+      models: Array<Record<string, unknown>>;
+      truncated: boolean;
+    };
+    assert.equal(b.models.length, 2);
+    const a = b.models[0];
+    assert.equal(a["provider"], "anthropic");
+    assert.equal(a["id"], "claude-opus-4-8");
+    assert.equal(a["authenticated"], true);
+    assert.equal(a["authType"], "api_key");
+    assert.equal(a["thinking"], true);
+    const o = b.models[1];
+    assert.equal(o["provider"], "openai");
+    assert.equal(o["authenticated"], false);
+    assert.equal(b.truncated, false);
+  });
+
+  it("POST /v1/model/validate accepts a good selection dry-run", async () => {
+    const r = await signed(s.port, "/v1/model/validate", {
+      method: "POST",
+      body: JSON.stringify({ provider: "anthropic", model: "claude-opus-4-8" }),
+    });
+    assert.equal(r.status, 200);
+    const b = r.json["body"] as Record<string, unknown>;
+    assert.equal(b["valid"], true);
+    assert.equal(b["provider"], "anthropic");
+  });
+
+  it("POST /v1/model/validate rejects unknown model", async () => {
+    const r = await signed(s.port, "/v1/model/validate", {
+      method: "POST",
+      body: JSON.stringify({ provider: "anthropic", model: "nope-99" }),
+    });
+    assert.equal(r.status, 400);
+    assert.equal(r.json["error"], "model_not_found");
+  });
+
+  it("POST /v1/model/validate rejects unauthenticated provider", async () => {
+    const r = await signed(s.port, "/v1/model/validate", {
+      method: "POST",
+      body: JSON.stringify({ provider: "openai", model: "gpt-5.5" }),
+    });
+    assert.equal(r.status, 400);
+    assert.equal(r.json["error"], "provider_not_authenticated");
+  });
+
+  it("POST /v1/model writes default, preserves rest, backups", async () => {
+    writeFileSync(
+      join(s.agentDir, "settings.json"),
+      JSON.stringify({ theme: "dark" }),
+    );
+    const r = await signed(s.port, "/v1/model", {
+      method: "POST",
+      body: JSON.stringify({
+        provider: "anthropic",
+        model: "claude-opus-4-8",
+        thinkingLevel: "high",
+      }),
+    });
+    assert.equal(r.status, 200);
+    const b = r.json["body"] as Record<string, unknown>;
+    assert.equal(b["provider"], "anthropic");
+    assert.equal(b["thinkingLevel"], "high");
+    assert.equal(b["requiresRestart"], true);
+    assert.equal(b["applied"], false);
+    assert.ok(typeof b["backup"] === "string");
+    const raw = JSON.parse(
+      readFileSync(join(s.agentDir, "settings.json"), "utf8"),
+    ) as Record<string, unknown>;
+    assert.equal(raw["theme"], "dark");
+    assert.equal(raw["defaultModel"], "claude-opus-4-8");
+  });
+
+  it("POST /v1/model rejects bad thinking level and unknown fields", async () => {
+    const bad = await signed(s.port, "/v1/model", {
+      method: "POST",
+      body: JSON.stringify({ model: "claude-opus-4-8", thinkingLevel: "ultra" }),
+    });
+    assert.equal(bad.status, 400);
+    assert.match(String(bad.json["error"]), /invalid_thinking_level/);
+    const unk = await signed(s.port, "/v1/model", {
+      method: "POST",
+      body: JSON.stringify({ model: "x", shell: "rm -rf /" }),
+    });
+    assert.equal(unk.status, 400);
+    assert.match(String(unk.json["error"]), /unknown_field/);
+  });
+
+  it("POST /v1/model honors maintenance gate", async () => {
+    mkdirSync(join(s.agentDir, "server-config"), { recursive: true });
+    writeFileSync(
+      join(s.agentDir, "server-config", "core.json"),
+      JSON.stringify({ maintenanceMode: true }),
+    );
+    const r = await signed(s.port, "/v1/model", {
+      method: "POST",
+      body: JSON.stringify({ provider: "anthropic", model: "claude-opus-4-8" }),
+    });
+    assert.equal(r.status, 403);
+    assert.equal(r.json["error"], "maintenance");
+  });
+});

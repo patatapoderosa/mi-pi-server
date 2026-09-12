@@ -100,7 +100,7 @@ try {
   $pay = Join-Path $TmpRoot "payload"
   foreach ($rel in @("server\pi-daemon.mjs", "server\spawn-pi.mjs", "server\pi-remote-config\index.ts",
       "server\pi-remote-config\package.json", "shared\protocol.ts",
-      "shared\modules.ts", "shared\store.ts",
+      "shared\modules.ts", "shared\store.ts", "shared\pi-model.ts",
       "server\pi-remote-server\index.ts", "server\pi-remote-server\server.ts",
       "server\pi-remote-server\migrate.ts", "server\pi-remote-server\tailscale.ts",
       "installer\run-task.ps1", "installer\run-remote.ps1",
@@ -287,7 +287,7 @@ try {
   function New-MiniPayload([string]$dir) {
     foreach ($rel in @("server\pi-daemon.mjs", "server\spawn-pi.mjs", "server\pi-remote-config\index.ts",
         "server\pi-remote-config\package.json", "shared\protocol.ts",
-        "shared\modules.ts", "shared\store.ts",
+        "shared\modules.ts", "shared\store.ts", "shared\pi-model.ts",
         "installer\run-task.ps1", "installer\run-remote.ps1",
         "installer\windows-installer.ps1",
         "server\pi-remote-server\index.ts", "server\pi-remote-server\server.ts",

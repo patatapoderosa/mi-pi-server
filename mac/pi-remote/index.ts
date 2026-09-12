@@ -200,10 +200,12 @@ function summarizeModules(body: unknown): string {
     ?.modules;
   if (!Array.isArray(mods)) return "No module list in reply.";
   return mods
-    .map(
-      (m) =>
-        `- ${m.name}${m.enabled === null ? "" : m.enabled ? " (enabled)" : " (disabled)"}: ${JSON.stringify(m.config)}`,
-    )
+    .map((m) => {
+      let state = "";
+      if (m.enabled === true) state = " (enabled)";
+      else if (m.enabled === false) state = " (disabled)";
+      return `- ${m.name}${state}: ${JSON.stringify(m.config)}`;
+    })
     .join("\n");
 }
 
@@ -444,6 +446,165 @@ export default function piRemoteExtension(pi: ExtensionAPI): void {
           ? Math.min(120, Math.max(5, params.timeoutSeconds))
           : undefined;
       return toggleModule(params.module as string, false, timeout);
+    },
+  });
+  pi.registerTool({
+    name: "server_model_get",
+    label: "Server Model Get",
+    description:
+      "Ask which default model the 24/7 Pi server node (Windows, over Tailscale) will use at startup: provider, model id, thinking level, settings source. " +
+      "Use this automatically when the user asks — in any language — which model the server uses: " +
+      "'che modello usa il server?', 'which model does the server use?', 'server default model'. " +
+      "This is the CONFIGURED startup default from the server settings.json; the live session keeps its boot-time model until Pi restarts.",
+    promptSnippet:
+      "server_model_get reads the server startup model default via signed HTTPS",
+    promptGuidelines: [
+      "Whenever the user asks which model the server uses or has configured, call server_model_get — do not answer from memory.",
+      "Always report whether a restart is needed for a pending default to take effect."
+    ],
+    parameters: Type.Object({ timeoutSeconds: TimeoutSchema }),
+    executionMode: "sequential",
+    async execute(_toolCallId, params): Promise<TextResult> {
+      try {
+        const { cfg, hmac } = await setupCall();
+        const timeout =
+          typeof params.timeoutSeconds === "number"
+            ? Math.min(120, Math.max(5, params.timeoutSeconds))
+            : undefined;
+        const resp = await remoteCall(cfg, hmac, "GET", "/v1/model", undefined, timeout);
+        if (!resp.ok) {
+          return {
+            content: [{ type: "text", text: `❌ Server refused (${resp.error ?? "unknown"}): ${resp.message ?? "no detail"}` }],
+            details: { ok: false, error: resp.error },
+          };
+        }
+        const b = resp.body as { provider?: unknown; model?: unknown; thinkingLevel?: unknown; source?: unknown; requiresRestart?: unknown; note?: unknown };
+        const lines =
+          b.provider
+            ? [`🤖 server startup default: ${b.provider}/${b.model}`, `thinking: ${b.thinkingLevel ?? "(Pi default)"}`, `source: ${b.source ?? "settings.json"}`, b.requiresRestart ? "takes effect at next Pi start (restart PiHomeServer to apply now)" : "active", `${b.note ?? ""}`]
+            : ["🤖 server has no default model configured (Pi falls back to first available at startup)." ];
+        return {
+          content: [{ type: "text", text: lines.join("\n") }],
+          details: { ok: true, body: resp.body },
+        };
+      } catch (err) {
+        return failResult("Server model get failed", err);
+      }
+    },
+  });
+  pi.registerTool({
+    name: "server_model_list",
+    label: "Server Model List",
+    description:
+      "List the models REALLY available on the 24/7 Pi server node (Windows, over Tailscale): live Pi catalog with per-provider auth status. " +
+      "Use this automatically when the user asks — in any language — what the server offers: " +
+      "'mostrami i modelli disponibili sul server', 'list server models', 'what models can the server use?'.",
+    promptSnippet:
+      "server_model_list fetches the live server model catalog with auth status via signed HTTPS",
+    promptGuidelines: [
+      "Whenever the user asks which models are available on the server, call server_model_list — do not answer from memory.",
+      "Only models with ready auth (authenticated: true) can be set as default."
+    ],
+    parameters: Type.Object({ timeoutSeconds: TimeoutSchema }),
+    executionMode: "sequential",
+    async execute(_toolCallId, params): Promise<TextResult> {
+      try {
+        const { cfg, hmac } = await setupCall();
+        const timeout =
+          typeof params.timeoutSeconds === "number"
+            ? Math.min(120, Math.max(5, params.timeoutSeconds))
+            : 60;
+        const resp = await remoteCall(cfg, hmac, "GET", "/v1/models", undefined, timeout);
+        if (!resp.ok) {
+          return {
+            content: [{ type: "text", text: `❌ Server refused (${resp.error ?? "unknown"}): ${resp.message ?? "no detail"}` }],
+            details: { ok: false, error: resp.error },
+          };
+        }
+        const body = resp.body as { models?: Array<{ provider?: unknown; id?: unknown; thinking?: unknown; images?: unknown; context?: unknown; authenticated?: unknown }> ; truncated?: unknown };
+        const models = Array.isArray(body.models) ? body.models : [];
+        if (models.length === 0) {
+          return {
+            content: [{ type: "text", text: "🤖 server reports no available models (no logins on the server?)." }],
+            details: { ok: true, body: resp.body },
+          };
+        }
+        const lines = models.map((m) => {
+          const flags = [`${m.authenticated === true ? "✅" : "🔒"} ${m.provider}/${m.id}`];
+          const caps: string[] = [];
+          if (m.thinking === true) caps.push("thinking");
+          if (m.images === true) caps.push("images");
+          if (typeof m.context === "string") caps.push(`${m.context} ctx`);
+          return `- ${flags[0]}${caps.length > 0 ? ` (${caps.join(", ")})` : ""}`;
+        });
+        if (body.truncated === true) lines.push("…truncated to 100 rows.");
+        return {
+          content: [{ type: "text", text: lines.join("\n") }],
+          details: { ok: true, body: resp.body },
+        };
+      } catch (err) {
+        return failResult("Server model list failed", err);
+      }
+    },
+  });
+  pi.registerTool({
+    name: "server_model_set",
+    label: "Server Model Set",
+    description:
+      "Set the default model of the 24/7 Pi server node (Windows, over Tailscale): provider + model id, optional thinking level and apply-now flag. " +
+      "Use this automatically when the user asks — in any language — to change the server default: " +
+      "'imposta openai/gpt-... come default sul server', 'metti X come modello predefinito e applicalo subito'. " +
+      "The server validates the selection against its LIVE catalog (unknown/ambiguous/unauthenticated models are refused). " +
+      "The change applies at next Pi start; applyNow:true only records intent, a PiHomeServer restart is still required.",
+    promptSnippet:
+      "server_model_set writes the server startup model default via signed HTTPS",
+    promptGuidelines: [
+      "Whenever the user wants to change the server default model, call server_model_set with provider + model.",
+      "If unsure which model, call server_model_list first and pick an authenticated one.",
+      "After setting, always report whether a PiHomeServer restart is needed."
+    ],
+    parameters: Type.Object({
+      provider: Type.Optional(Type.String({ description: "Provider id, e.g. openai (optional if model is provider/model)" })),
+      model: Type.String({ description: "Model id, e.g. gpt-5.5 (exact id as listed)" }),
+      thinkingLevel: Type.Optional(Type.Union([
+        Type.Literal("off"),
+        Type.Literal("minimal"),
+        Type.Literal("low"),
+        Type.Literal("medium"),
+        Type.Literal("high"),
+        Type.Literal("xhigh"),
+        Type.Literal("max"),
+      ], { description: "Startup thinking level (optional)" })),
+      applyNow: Type.Optional(Type.Boolean({ description: "Record intent to apply immediately (still requires a PiHomeServer restart)" })),
+      timeoutSeconds: TimeoutSchema,
+    }),
+    executionMode: "sequential",
+    async execute(_toolCallId, params): Promise<TextResult> {
+      try {
+        const { cfg, hmac } = await setupCall();
+        const payload: Record<string, unknown> = { model: params.model as string };
+        if (typeof params.provider === "string") payload["provider"] = params.provider;
+        if (typeof params.thinkingLevel === "string") payload["thinkingLevel"] = params.thinkingLevel;
+        if (typeof params.applyNow === "boolean") payload["applyNow"] = params.applyNow;
+        const timeout =
+          typeof params.timeoutSeconds === "number"
+            ? Math.min(120, Math.max(5, params.timeoutSeconds))
+            : 60;
+        const resp = await remoteCall(cfg, hmac, "POST", "/v1/model", payload, timeout);
+        if (!resp.ok) {
+          return {
+            content: [{ type: "text", text: `❌ Server refused (${resp.error ?? "unknown"}): ${resp.message ?? "no detail"}` }],
+            details: { ok: false, error: resp.error },
+          };
+        }
+        const b = resp.body as { provider?: unknown; model?: unknown; thinkingLevel?: unknown; requiresRestart?: unknown; message?: unknown };
+        return {
+          content: [{ type: "text", text: `✅ server default is now ${b.provider}/${b.model} (thinking: ${b.thinkingLevel ?? "(unchanged)"}). ${b.message ?? ""}` }],
+          details: { ok: true, body: resp.body },
+        };
+      } catch (err) {
+        return failResult("Server model set failed", err);
+      }
     },
   });
 }

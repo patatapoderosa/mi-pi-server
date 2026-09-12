@@ -3,6 +3,7 @@ import type { ChildProcess } from "node:child_process";
 export declare function buildPiSpawn(
   piBin: string,
   platform?: string,
+  extraArgs?: string[],
 ): {
   command: string;
   args: string[];

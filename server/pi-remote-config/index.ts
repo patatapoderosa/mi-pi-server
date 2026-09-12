@@ -40,6 +40,15 @@ import {
   resolveAgentDir,
 } from "../../shared/store.ts";
 import { readAppVersion } from "../pi-remote-server/server.ts";
+import { buildPiSpawn } from "../spawn-pi.mjs";
+import {
+  isValidThinkingLevel,
+  normalizeSelection,
+  parseListModelsTable,
+  readConfiguredDefault,
+  writeConfiguredDefault,
+  type PiModelInfo,
+} from "../../shared/pi-model.ts";
 
 const execFileAsync = promisify(execFile);
 const LOG = "[remote-config]";
@@ -565,4 +574,166 @@ export default function remoteConfigExtension(pi: ExtensionAPI): void {
       };
     },
   });
+  pi.registerTool({
+    name: "server_model",
+    label: "Server Model",
+    description:
+      "Inspect or change THIS server node's Pi startup default model (settings.json defaultProvider/defaultModel). " +
+      "Actions: get (configured default + source), list (live Pi catalog with per-provider auth), " +
+      "set (validate against live catalog + backup + atomic write; applies at next Pi start), " +
+      "validate (dry run, nothing written). Unknown/ambiguous/unauthenticated models are refused.",
+    promptSnippet:
+      "server_model gets/lists/sets/validates this node Pi startup default model",
+    promptGuidelines: [
+      "Use server_model when the user asks which model this server uses, what models are available here, or wants to change the default.",
+      "After set, always report that a restart is needed to apply (live session keeps its boot-time model).",
+    ],
+    parameters: Type.Object({
+      action: Type.Union(
+        [
+          Type.Literal("get"),
+          Type.Literal("list"),
+          Type.Literal("set"),
+          Type.Literal("validate"),
+        ],
+        { description: "get default, list catalog, set default, or dry-run validate" },
+      ),
+      provider: Type.Optional(Type.String({ description: "Provider id, e.g. openai" })),
+      model: Type.Optional(Type.String({ description: "Model id, e.g. gpt-5.5 (exact id as listed)" })),
+      thinkingLevel: Type.Optional(Type.String({ description: "Startup thinking level (set only)" })),
+      applyNow: Type.Optional(Type.Boolean({ description: "Record intent to apply immediately (still needs a restart)" })),
+    }),
+    async execute(_toolCallId, params): Promise<TextResult> {
+      const p = paths();
+      const action = params.action as "get" | "list" | "set" | "validate";
+      const fail = (text: string, error: unknown): TextResult => ({
+        content: [{ type: "text", text }],
+        details: { error },
+      });
+      if (action === "get") {
+        try {
+          const cfg = readConfiguredDefault(p.agentDir);
+          const text = cfg.provider
+            ? `🤖 startup default: ${cfg.provider}/${cfg.model} (thinking: ${cfg.thinkingLevel ?? "(Pi default)"}, source: ${cfg.source}). Takes effect at next Pi start; live session keeps its boot-time model.`
+            : "🤖 no default model configured (Pi falls back to first available at startup).";
+          return { content: [{ type: "text", text }], details: { ...cfg } };
+        } catch (err) {
+          return fail(`Refused: ${err instanceof Error ? err.message : "read_failed"}`, "settings_unreadable");
+        }
+      }
+      if (action === "list") {
+        const cat = await modelCatalogHere(p.agentDir);
+        if (!cat.ok) return fail(`Refused: ${cat.message}`, cat.error);
+        if (cat.models.length === 0) {
+          return { content: [{ type: "text", text: "🤖 no available models (no logins on this server?)." }], details: { models: [] } };
+        }
+        const authed = await authedProvidersHere(p.agentDir, cat.models);
+        const lines = cat.models.slice(0, 100).map((m) => {
+          const ok = authed.includes(m.provider);
+          return `- ${ok ? "✅" : "🔒"} ${m.provider}/${m.id}${m.thinking ? " (thinking)" : ""}`;
+        });
+        return {
+          content: [{ type: "text", text: lines.join("\n") }],
+          details: { models: cat.models.slice(0, 100).map((m) => ({ ...m, authenticated: authed.includes(m.provider) })) },
+        };
+      }
+      const model = typeof params.model === "string" ? params.model.trim() : "";
+      if (model.length === 0) {
+        return fail(`Refused: model_required`, "model_required");
+      }
+      const provider = typeof params.provider === "string" ? params.provider.trim() : undefined;
+      const thinkingRaw = params.thinkingLevel as unknown;
+      if (thinkingRaw !== undefined && thinkingRaw !== null && !isValidThinkingLevel(thinkingRaw)) {
+        return fail(`Refused: invalid_thinking_level`, "invalid_thinking_level");
+      }
+      const cat = await modelCatalogHere(p.agentDir);
+      if (!cat.ok) return fail(`Refused: ${cat.message}`, cat.error);
+      const authed = await authedProvidersHere(p.agentDir, cat.models);
+      const norm = normalizeSelection({ provider, model }, cat.models, authed);
+      if (!norm.ok) return fail(`Refused: ${norm.error}`, norm.error.split(":")[0]);
+      if (!authed.includes(norm.provider)) {
+        return fail(`Refused: provider_not_authenticated (${norm.provider} has no ready auth)`, "provider_not_authenticated");
+      }
+      if (action === "validate") {
+        return {
+          content: [{ type: "text", text: `✅ ${norm.provider}/${norm.model} is available and authenticated (dry run, nothing written).` }],
+          details: { valid: true, provider: norm.provider, model: norm.model },
+        };
+      }
+      try {
+        const { backup } = writeConfiguredDefault(p.agentDir, {
+          provider: norm.provider,
+          model: norm.model,
+          thinkingLevel: typeof thinkingRaw === "string" ? (thinkingRaw as string) : null,
+        });
+        const applyNow = params.applyNow === true;
+        return {
+          content: [{ type: "text", text: `✅ server default is now ${norm.provider}/${norm.model}.${applyNow ? " Restart the PiHomeServer task to apply now." : " Applies at next Pi start."}${backup ? ` (backup: ${backup})` : ""}` }],
+          details: { provider: norm.provider, model: norm.model, backup, requiresRestart: true, applied: false },
+        };
+      } catch (err) {
+        return fail(`Refused: ${err instanceof Error ? err.message : "write_failed"}`, "settings_write_failed");
+      }
+    },
+  });
+
+  async function modelCatalogHere(
+    agentDir: string,
+  ): Promise<{ ok: true; models: PiModelInfo[] } | { ok: false; error: string; message: string }> {
+    const r = await runPiHere(agentDir, ["--list-models"], 30000);
+    if (!r.ok) return { ok: false, error: "pi_unavailable", message: "pi --list-models failed." };
+    const parsed = parseListModelsTable(r.stdout);
+    if (!parsed.ok) return { ok: false, error: "pi_output_unparseable", message: "Could not parse pi --list-models output." };
+    return { ok: true, models: parsed.models };
+  }
+
+  async function authedProvidersHere(agentDir: string, models: PiModelInfo[]): Promise<string[]> {
+    const providers = [...new Set(models.map((m) => m.provider))].slice(0, 10);
+    const out: string[] = [];
+    for (const prov of providers) {
+      if (!/^[A-Za-z0-9_.-]+$/.test(prov)) continue;
+      const r = await runPiHere(agentDir, ["auth", "check", "--provider", prov, "--json", "--no-refresh"], 10000);
+      if (!r.ok) continue;
+      try {
+        const lines = r.stdout
+          .split(/\r?\n/)
+          .map((l) => l.trim())
+          .filter((l) => l.length > 0);
+        for (let i = lines.length - 1; i >= 0; i--) {
+          try {
+            const j = JSON.parse(lines[i]) as { status?: unknown };
+            if (j && j.status === "ready") out.push(prov);
+            break;
+          } catch {
+            // keep scanning upward
+          }
+        }
+      } catch {
+        // treat as not ready
+      }
+    }
+    return out;
+  }
+
+  async function runPiHere(
+    agentDir: string,
+    args: string[],
+    timeoutMs: number,
+  ): Promise<{ ok: boolean; stdout: string }> {
+    // No PI_CODING_AGENT_DIR scoping needed: this tool runs inside the server
+    // Pi process itself, whose env already carries the server agent dir
+    // (run-task.ps1 sets it before spawn). Inherited env is correct by construction.
+    const spec = buildPiSpawn("pi", process.platform, args);
+    try {
+      const { stdout } = await execFileAsync(spec.command, spec.args, {
+        timeout: timeoutMs,
+        windowsHide: true,
+        windowsVerbatimArguments: !!spec.windowsVerbatimArguments,
+        maxBuffer: 1024 * 1024,
+      });
+      return { ok: true, stdout: String(stdout ?? "") };
+    } catch {
+      return { ok: false, stdout: "" };
+    }
+  }
 }

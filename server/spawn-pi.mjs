@@ -15,21 +15,23 @@ const RPC_ARGS = ["--mode", "rpc"];
  * @param {string} piBin - trusted local path (runtime-env.json) or bare name.
  *   NEVER remote input: only fixed literals (--mode rpc) cross the shell.
  * @param {string} [platform] - injectable for tests (defaults to process.platform).
+ * @param {string[]} [extraArgs] - fixed literals appended after the binary (defaults to --mode rpc). Caller allowlists every element; never remote input.
  * @returns {{ command: string, args: string[], windowsVerbatimArguments: boolean }}
  */
-export function buildPiSpawn(piBin, platform = process.platform) {
+export function buildPiSpawn(piBin, platform = process.platform, extraArgs = RPC_ARGS) {
   const bin = piBin && piBin.length > 0 ? piBin : "pi";
+  const tail = Array.isArray(extraArgs) ? extraArgs : RPC_ARGS;
   if (platform === "win32" && !/\.(exe|com)$/i.test(bin)) {
     const comspec = process.env.ComSpec ?? "C:\\Windows\\System32\\cmd.exe";
     return {
       command: comspec,
-      args: ["/d", "/s", "/c", `""${bin}" ${RPC_ARGS.join(" ")}"`],
+      args: ["/d", "/s", "/c", `""${bin}" ${tail.join(" ")}"`],
       windowsVerbatimArguments: true,
     };
   }
   return {
     command: bin,
-    args: [...RPC_ARGS],
+    args: [...tail],
     windowsVerbatimArguments: false,
   };
 }

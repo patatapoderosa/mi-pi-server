@@ -70,6 +70,13 @@ code and no state change. The Mac surfaces them as tool errors.
   (`allowedServices` in `remote-server.json`): no commands, paths, or scripts
   can pass through it.
 
+- `server_model` runs only fixed Pi CLI commands (`--list-models`,
+  `auth check --provider <allowlisted-id> --json --no-refresh` where the
+  provider comes from Pi's own catalog, never raw client input) and reads
+  / writes exactly one fixed path (`<agentDir>/settings.json`, never
+  `~/.pi`). Responses carry catalog metadata + booleans only — no tokens,
+  keys, auth.json content, or environment secrets. Writes are backup +
+  atomic rename; corrupt settings files are refused, never overwritten.
 ## Supply chain (Windows installer)
 
 - Honest trust root: `setup.ps1` is downloaded over HTTPS from
