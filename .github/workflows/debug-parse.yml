@@ -11,31 +11,30 @@ jobs:
           $pr = [System.Management.Automation.Language.Parser]
           $tx = Get-Content ./server/setup-old-pc.ps1 -Raw
           $lns = $tx -split "`r?`n"
-          function Show-Errs($label, $errs) {
-            $hit = @($errs | Where-Object {
-              $_.Message -match "Missing argument"
-            })
-            if (@($hit).Count -gt 0) {
-              Write-Host ($label + " MISSING-ARG:")
-              foreach ($x in $hit) {
-                Write-Host ("  L" + $x.Extent.StartLineNumber)
-                Write-Host ("  " + $x.Message)
-              }
-            } else {
-              Write-Host ($label + " clean")
-            }
-          }
-          foreach ($n in @(85, 90, 95, 100, 105, 108, 110, 112)) {
-            $pre = ($lns[0..($n-1)] -join "`n")
+          function T($label, $from, $to) {
+            $pre = ($lns[($from-1)..($to-1)] -join "`n")
             $a = $null
             $b = $null
             [void]$pr::ParseInput($pre, [ref]$a, [ref]$b)
-            Show-Errs ("prefix-" + $n) $b
+            $hit = @($b | Where-Object {
+              $_.Message -match "Missing argument"
+            })
+            if (@($hit).Count -gt 0) {
+              Write-Host ($label + " BAD:")
+              foreach ($x in $hit) {
+                Write-Host ("  " + $x.Message)
+              }
+            } else {
+              $o = @($b).Count
+              Write-Host ($label + " ok(other=" + $o + ")")
+            }
           }
-          foreach ($ln in @(108, 109, 110, 111, 112, 113)) {
-            $s = $lns[$ln - 1]
-            $a = $null
-            $b = $null
-            [void]$pr::ParseInput($s, [ref]$a, [ref]$b)
-            Show-Errs ("line-" + $ln) $b
-          }
+          T "L111" 111 111
+          T "L105-113" 105 113
+          T "L100-112" 100 112
+          T "L85-95" 85 95
+          T "L115-122" 115 122
+          $l112 = $lns[111]
+          $hex = ([BitConverter]::ToString(
+            [Text.Encoding]::UTF8.GetBytes($l112)))
+          Write-Host ("L112-hex=" + $hex)
