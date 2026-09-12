@@ -219,7 +219,11 @@ try {
     Assert-Equal $s.ExecutionTimeLimit "PT0S" "no time limit"
     Assert-True ($s.RestartCount -ge 3) "restart on failure"
     Assert-True ($s.StartWhenAvailable) "start when available"
-    Assert-True ($s.AllowStartIfOnBatteries -and $s.DontStopIfGoingOnBatteries) "battery-proof"
+    if ($s.PSObject.Properties.Name -contains "AllowStartIfOnBatteries") {
+      Assert-True ($s.AllowStartIfOnBatteries -and $s.DontStopIfGoingOnBatteries) "battery-proof"
+    } else {
+      Skip-Test "battery-proof" "Server SKU: no battery settings"
+    }
   } else {
     Skip-Test "task settings" "non-Windows (Get-ScheduledTask assente)"
   }
