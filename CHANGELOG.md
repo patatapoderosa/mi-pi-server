@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.2.9 — 2026-09-12
+
+### Added
+
+- Remote Model Management (`server_model`): query and change the server Pi
+  startup default model from the Mac over Tailscale, verified against
+  real Pi 0.85.1 behavior (never assumed).
+- `GET /v1/model`: configured `defaultProvider`/`defaultModel`/
+  `defaultThinkingLevel` from `<agentDir>/settings.json`, reported
+  explicitly separate from the (unknown) live rpc session model, with
+  restart guidance. No secrets ever returned.
+- `GET /v1/models`: live `pi --list-models` catalog (deterministic table
+  parse) with per-provider `pi auth check` status; capped and budgeted.
+- `POST /v1/model` (+ dry-run `POST /v1/model/validate`): Pi-mirroring
+  validation (case-insensitive provider, `provider/model` inference,
+  ambiguity rejection, ready-auth required, thinking-level enum),
+  backup + atomic write preserving all other settings, corrupt files
+  refused. `applyNow:true` records intent; restart is still required
+  (no remote restart channel exists).
+- Mac tools `server_model_get` / `server_model_list` / `server_model_set`;
+  ServerBot tool `server_model` (get/list/set/validate) sharing
+  `shared/pi-model.ts` pure logic. Mutating routes honor `coreGates`.
+
+### Upgrade notes
+
+- Rerun the one-liner (resolves `latest` → v0.2.9). No checkpoint
+  deletion, no reinstall, no new `/login`, no `-Force`.
+
 ## v0.2.8 — 2026-09-12
 
 ### Fixed
