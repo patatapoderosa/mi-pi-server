@@ -9,28 +9,9 @@ jobs:
       - shell: powershell
         run: |
           $tx = Get-Content ./server/setup-old-pc.ps1 -Raw
-          $tk = $null
-          $te = $null
-          $pr = [System.Management.Automation.Language.Parser]
-          [void]$pr::Tokenize($tx, [ref]$tk, [ref]$te)
-          Write-Host ("toks=" + @($tk).Count)
-          Write-Host ("tokerrors=" + @($te).Count)
-          foreach ($e in $te) {
-            $ln = $e.Extent.StartLineNumber
-            Write-Host ("TOKERR L" + $ln + ": " + $e.Message)
-          }
-          foreach ($t in $tk) {
-            $k = [string]$t.Kind
-            $big = $t.Text.Length -gt 150
-            $str = ($k -like "String*")
-            if ($big -and $str) {
-              $ln2 = $t.Extent.StartLineNumber
-              $pv = $t.Text.Substring(0, 100)
-              Write-Host ("BIGSTR L" + $ln2 + ": " + $pv)
-            }
-          }
           $lns = $tx -split "`r?`n"
           Write-Host ("total-lines=" + $lns.Count)
+          $pr = [System.Management.Automation.Language.Parser]
           $n = 40
           while ($n -lt $lns.Count) {
             $pre = ($lns[0..($n-1)] -join "`n")
@@ -43,9 +24,9 @@ jobs:
             $hit2 = @($b | Where-Object {
               $_.Message -match "Missing closing"
             })
-            $msg = "prefix=" + $n + " interesting="
-            $msg += @($hit).Count + @($hit2).Count
-            Write-Host $msg
+            $c1 = @($hit).Count
+            $c2 = @($hit2).Count
+            Write-Host ("prefix=" + $n + " bad=" + ($c1 + $c2))
             foreach ($x in $hit) {
               Write-Host ("   L" + $x.Extent.StartLineNumber)
               Write-Host ("   " + $x.Message)
