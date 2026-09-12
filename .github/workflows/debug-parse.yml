@@ -11,8 +11,8 @@ jobs:
           $pr = [System.Management.Automation.Language.Parser]
           $tx = Get-Content ./server/setup-old-pc.ps1 -Raw
           $lns = $tx -split "`r?`n"
-          function P($label, $to) {
-            $pre = ($lns[0..($to-1)] -join "`n")
+          function P($label, $from, $to) {
+            $pre = ($lns[($from-1)..($to-1)] -join "`n")
             $a = $null
             $b = $null
             [void]$pr::ParseInput($pre, [ref]$a, [ref]$b)
@@ -22,8 +22,9 @@ jobs:
               Write-Host ("  " + $x.Message)
             }
           }
-          P "P80" 80
-          P "P84" 84
-          P "P86" 86
-          P "P88" 88
-          P "P92" 92
+          P "P87" 1 87
+          P "P89" 1 89
+          P "P90" 1 90
+          P "P91" 1 91
+          P "S89" 89 89
+          P "S90" 90 90
