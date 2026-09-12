@@ -798,39 +798,100 @@ try {
   # ---- Pi login (same step 8/11: no credentials = no server) ----
   Write-Host ""
   Write-Host "[8/11 seguito] Autenticazione Pi" -ForegroundColor Cyan
-  $env:PI_CODING_AGENT_DIR = $Paths.AgentDir
-  $authOk = $false
-  try {
-    & $piCmd auth check 2>&1 | Out-Null
-    if ($LASTEXITCODE -eq 0) { $authOk = $true }
-  } catch { }
-  if (-not $authOk) {
-    Write-Host ""
-    Write-Host "[!] Pi richiede autenticazione provider." -ForegroundColor Yellow
-    Write-Host "    Si aprira Pi: completa /login nel tuo browser/terminale, poi esci."
-    try {
-      & $piCmd
-    } catch { }
-    Write-Host "Premi INVIO quando hai terminato il login..."
-    [void](Read-Host)
-    # The interactive login above ran as YOU (user profile). Copy the
-    # credentials into the service data dir so the SYSTEM task can use them.
-    $userAuth = Join-Path (Join-Path $env:USERPROFILE ".pi\agent") "auth.json"
-    $svcAuth = Join-Path $Paths.AgentDir "auth.json"
-    if (-not (Test-Path -LiteralPath $svcAuth) -and (Test-Path -LiteralPath $userAuth)) {
-      Copy-Item -LiteralPath $userAuth -Destination $svcAuth -Force
-      & icacls $svcAuth /inheritance:r /grant:r "SYSTEM:F" /grant:r "Administrators:F" | Out-Null
-      L "auth.json copiato dal profilo utente al data dir" "OK"
+  $userAgentDir = Join-Path $env:USERPROFILE ".pi\agent"
+  $piAuthDone = $false
+  while (-not $piAuthDone) {
+    $authServer = Test-PiAuthentication -PiExe $piCmd -AgentDir $Paths.AgentDir
+    if ($authServer.Authenticated) {
+      L ("Pi autenticato in server dir (provider=" + $authServer.Provider + ")") "OK"
+      $aclCheck = Test-AuthAcl -Path $authServer.SourcePath
+      if (-not $aclCheck.Ok) {
+        Write-Host ("ACL auth server da verificare: " + $aclCheck.Detail) -ForegroundColor Yellow
+        L ("ACL auth server: " + $aclCheck.Detail) "WARN"
+      }
+      $piAuthDone = $true
+      break
     }
-    try {
-      & $piCmd auth check 2>&1 | Out-Null
-      if ($LASTEXITCODE -eq 0) { $authOk = $true }
-    } catch { }
-    if (-not $authOk) {
-      throw (New-StepError "System" "Pi ancora senza credenziali (pi auth check fallisce). Completa /login e scegli Riprova.")
+    $authUser = Test-PiAuthentication -PiExe $piCmd -AgentDir $userAgentDir
+    $srvFile = Join-Path $Paths.AgentDir "auth.json"
+    $usrFile = Join-Path $userAgentDir "auth.json"
+    Write-Host ""
+    Write-Host "Autenticazione Pi non rilevata nella directory del server." -ForegroundColor Yellow
+    Write-Host ("  Pi executable: " + $piCmd)
+    Write-Host ("  Server agent dir: " + $Paths.AgentDir)
+    Write-Host ("  User agent dir:   " + $userAgentDir)
+    if (Test-Path -LiteralPath $srvFile) {
+      Write-Host ("  Auth server: presente ma non valida (" + $authServer.Reason + ")")
+    } else {
+      Write-Host "  Auth server: assente"
+    }
+    if (Test-Path -LiteralPath $usrFile) {
+      if ($authUser.Authenticated) {
+        Write-Host ("  Auth user: valida (provider=" + $authUser.Provider + ")")
+      } else {
+        Write-Host ("  Auth user: presente ma non valida (" + $authUser.Reason + ")")
+      }
+    } else {
+      Write-Host "  Auth user: assente"
+    }
+    Write-Host ("  Verifica: " + $authServer.Reason)
+    $choice = Show-PiAuthMenu -HasUserAuth ($authUser.Authenticated)
+    if ($choice -eq "exit") {
+      $script:InstallState.currentStep = "secrets"
+      $script:InstallState.lastErrorKind = "UserExit"
+      Save-StepState
+      Write-Host ""
+      Write-Host "Uscita con checkpoint. Per riprendere, rilancia lo stesso comando." -ForegroundColor Cyan
+      Write-Host ("Stato: " + $script:StatePath)
+      exit 2
+    } elseif ($choice -eq "retry") {
+      continue
+    } elseif ($choice -eq "migrate") {
+      if (-not $authUser.Authenticated) {
+        Write-Host "Login utente non valido: migrazione annullata, fai login diretto." -ForegroundColor Yellow
+        continue
+      }
+      Write-Host "Autenticazione Pi esistente trovata nel profilo utente."
+      if (Read-ValidatedYesNo -Prompt "Copiarla nella directory del server? [Y/n]" -Default "Y") {
+        $mig = Copy-PiAuthToServerDir -UserAuthPath $usrFile -ServerAuthPath $srvFile
+        if (-not $mig.Ok) {
+          Write-Host ("Migrazione fallita: " + $mig.Detail) -ForegroundColor Red
+          L ("Migrazione auth fallita: " + $mig.Detail) "FAIL"
+          continue
+        }
+        if ($mig.Backup -ne "") { L ("Backup auth server precedente: " + $mig.Backup) "WARN" }
+        L "auth.json migrata nel data dir (originale preservato)" "OK"
+        $acl2 = Test-AuthAcl -Path $srvFile
+        if (-not $acl2.Ok) {
+          Write-Host ("ACL post-migrazione da verificare: " + $acl2.Detail) -ForegroundColor Yellow
+        }
+      } else {
+        Write-Host "Migrazione saltata: fai login diretto." -ForegroundColor Yellow
+      }
+      continue
+    } else {
+      Write-Host ""
+      Write-Host "Si apre Pi usando la directory dati del server:" -ForegroundColor Cyan
+      Write-Host (" " + $Paths.AgentDir)
+      Write-Host "Esegui /login, completa l'autenticazione, poi esci da Pi."
+      $oldDir = $null
+      $hadOld = $false
+      try { $hadOld = Test-Path Env:\PI_CODING_AGENT_DIR; if ($hadOld) { $oldDir = $env:PI_CODING_AGENT_DIR } } catch { }
+      try {
+        $env:PI_CODING_AGENT_DIR = $Paths.AgentDir
+        & $piCmd
+      } catch { }
+      finally {
+        try {
+          if ($hadOld) { $env:PI_CODING_AGENT_DIR = $oldDir }
+          else { Remove-Item Env:\PI_CODING_AGENT_DIR -ErrorAction SilentlyContinue }
+        } catch { }
+      }
+      L "Sessione Pi interattiva terminata, riverifico auth server dir" "INFO"
+      continue
     }
   }
-  L "Pi autenticato (pi auth check OK)" "OK"
+  L "Pi autenticato (verifica ufficiale auth check)" "OK"
 
         Complete-InstallStep -Name "secrets"
         break

@@ -78,8 +78,10 @@ user HOME irrelevant.
   (never logged; the auth key is accepted only when `setup.ps1` already runs
   elevated — it is never forwarded through the auto-elevation relaunch).
 - Tailscale: authorize the PC in the browser when asked (or pass the auth key).
-- If Pi has no credentials: complete `/login` when the installer asks
-  (it opens Pi once), press ENTER.
+- Pi login: the installer opens Pi with `PI_CODING_AGENT_DIR=C:\PiServer\data`,
+  so `/login` lands directly where the SYSTEM tasks read it. A login already
+  done in your user profile is offered for migration (auth.json only).
+  Verification uses the official `pi auth check --provider <id> --json`.
 - On the phone: open the ServerBot DM and send `/start` (pairing).
 - On the Mac: `mac/setup-mac.sh` with the server tailnet name + the same HMAC.
 - Reboot test: reboot; with no login both tasks must be Running and Telegram online.

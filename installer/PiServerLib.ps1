@@ -487,7 +487,7 @@ function Write-InstallState {
   the health step. sleep always reruns (instant + idempotent).
 #>
 function Test-StepRealState {
-  param([string]$Step, $Paths, [string]$PiBin = "")
+  param([string]$Step, $Paths, [string]$PiBin = "", [scriptblock]$AuthRunner = $null)
   try {
     switch ($Step) {
       "windows" { return (Test-WindowsOS) }
@@ -540,7 +540,14 @@ function Test-StepRealState {
         if (-not (Test-Path -LiteralPath $tj)) { return $false }
         $t = Get-Content -LiteralPath $tj -Raw | ConvertFrom-Json
         if ([string]::IsNullOrWhiteSpace($t.profiles.default.botToken)) { return $false }
-        return (Test-ValidOwnerId $t.profiles.default.allowedUserId)
+        if (-not (Test-ValidOwnerId $t.profiles.default.allowedUserId)) { return $false }
+        $pb2 = $PiBin
+        if ([string]::IsNullOrWhiteSpace($pb2)) { $pb2 = Resolve-ToolPath "pi" }
+        if ([string]::IsNullOrWhiteSpace($pb2)) { return $false }
+        $authReal = $null
+        if ($null -ne $AuthRunner) { $authReal = Test-PiAuthentication -PiExe $pb2 -AgentDir $Paths.AgentDir -Runner $AuthRunner }
+        else { $authReal = Test-PiAuthentication -PiExe $pb2 -AgentDir $Paths.AgentDir }
+        return ([bool]$authReal.Authenticated)
       }
       "tasks" {
         if ($env:OS -ne "Windows_NT") { return $false }
@@ -1049,6 +1056,207 @@ function Test-RemoteDaemon {
     return @{ Ok = $false; Detail = "refused: $($j.error)" }
   } catch {
     return @{ Ok = $false; Detail = $_.Exception.Message }
+  }
+}
+
+<#
+.SYNOPSIS
+  Verify REAL Pi authentication for one agent dir via the official CLI.
+.DESCRIPTION
+  Runs `<pi> auth check --provider <id> --json --no-refresh` for every
+  provider key found in <AgentDir>\auth.json (contract verified on pi
+  0.85.1: getAgentDir() honors PI_CODING_AGENT_DIR, auth lives in
+  auth.json, bare `auth check` always fails, exit 0=ready 1=not_ready
+  2=invalid). PI_CODING_AGENT_DIR is scoped to the child call only
+  (saved/restored, never left behind). Returns
+  @{ Authenticated=[bool]; Provider=""; SourcePath=""; Reason="" }.
+  Only provider IDs (key names), status and reason ever surface: credential
+  values are never read into output, logs, or errors. Never throws.
+  -Runner injects a fake executor for tests: scriptblock
+  param($PiExe, $ArgList, $AgentDir) -> @{ ExitCode=[int]; Stdout=[string] }.
+#>
+function Test-PiAuthentication {
+  param([string]$PiExe, [string]$AgentDir, [scriptblock]$Runner = $null)
+  if ([string]::IsNullOrWhiteSpace($PiExe) -or (-not (Test-Path -LiteralPath $PiExe))) {
+    return @{ Authenticated = $false; Provider = ""; SourcePath = ""; Reason = "pi-not-found" }
+  }
+  if ([string]::IsNullOrWhiteSpace($AgentDir)) {
+    return @{ Authenticated = $false; Provider = ""; SourcePath = ""; Reason = "no-agent-dir" }
+  }
+  $authPath = Join-Path $AgentDir "auth.json"
+  if (-not (Test-Path -LiteralPath $authPath)) {
+    return @{ Authenticated = $false; Provider = ""; SourcePath = $authPath; Reason = "no-auth-file" }
+  }
+  $providers = @()
+  try {
+    $raw = Get-Content -LiteralPath $authPath -Raw -ErrorAction Stop
+    $data = $raw | ConvertFrom-Json -ErrorAction Stop
+    if ($null -ne $data -and ($data -is [System.Management.Automation.PSCustomObject])) {
+      foreach ($prop in @($data.PSObject.Properties)) { $providers += [string]$prop.Name }
+    }
+  } catch {
+    return @{ Authenticated = $false; Provider = ""; SourcePath = $authPath; Reason = "corrupt-auth-file" }
+  }
+  if ($providers.Count -eq 0) {
+    return @{ Authenticated = $false; Provider = ""; SourcePath = $authPath; Reason = "no-providers" }
+  }
+  if ($null -eq $Runner) {
+    $Runner = {
+      param($Exe, $ArgList, $Dir)
+      $hadOld = $false
+      $old = $null
+      try { $hadOld = Test-Path Env:\PI_CODING_AGENT_DIR; if ($hadOld) { $old = $env:PI_CODING_AGENT_DIR } } catch { }
+      try {
+        $env:PI_CODING_AGENT_DIR = $Dir
+        $out = & $Exe @ArgList 2>&1 | Out-String
+        $code = 900
+        try { $code = [int]$LASTEXITCODE } catch { }
+        return @{ ExitCode = $code; Stdout = [string]$out }
+      } catch {
+        return @{ ExitCode = 900; Stdout = "" }
+      } finally {
+        try {
+          if ($hadOld) { $env:PI_CODING_AGENT_DIR = $old }
+          else { Remove-Item Env:\PI_CODING_AGENT_DIR -ErrorAction SilentlyContinue }
+        } catch { }
+      }
+    }
+  }
+  $lastReason = "no-ready-provider"
+  foreach ($prov in $providers) {
+    $args = @("auth", "check", "--provider", $prov, "--json", "--no-refresh")
+    try {
+      $res = & $Runner $PiExe $args $AgentDir
+    } catch {
+      return @{ Authenticated = $false; Provider = ""; SourcePath = $authPath; Reason = "check-failed" }
+    }
+    $code = 900
+    $status = ""
+    $reason = ""
+    try {
+      if ($null -ne $res) {
+        try { $code = [int]$res.ExitCode } catch { }
+        $txt = ([string]$res.Stdout).Trim()
+        if ($txt -ne "") {
+          $lines = @($txt -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+          for ($i = $lines.Count - 1; $i -ge 0; $i--) {
+            try {
+              $j = $lines[$i] | ConvertFrom-Json -ErrorAction Stop
+              if ($null -ne $j -and $null -ne $j.status) {
+                $status = [string]$j.status
+                try { if ($null -ne $j.reason) { $reason = [string]$j.reason } } catch { }
+                try { if ($null -ne $j.provider) { $prov = [string]$j.provider } } catch { }
+                break
+              }
+            } catch { }
+          }
+        }
+      }
+    } catch { }
+    if (($status -eq "ready") -and ($code -eq 0)) {
+      return @{ Authenticated = $true; Provider = $prov; SourcePath = $authPath; Reason = "" }
+    }
+    if ($reason -ne "") { $lastReason = $prov + ": " + $reason }
+    elseif ($status -ne "") { $lastReason = $prov + ": " + $status }
+    else { $lastReason = $prov + ": check-failed" }
+  }
+  return @{ Authenticated = $false; Provider = ""; SourcePath = $authPath; Reason = $lastReason }
+}
+
+<#
+.SYNOPSIS
+  Check SYSTEM readability of an auth file via icacls. Windows-only.
+.DESCRIPTION
+  Returns @{ Ok=[bool]; Detail="" }. Non-Windows always returns Ok=$false
+  (callers gate on OS; tests assert the shape, never fake-pass).
+#>
+function Test-AuthAcl {
+  param([string]$Path)
+  try {
+    if ($env:OS -ne "Windows_NT") { return @{ Ok = $false; Detail = "non-windows" } }
+    if ([string]::IsNullOrWhiteSpace($Path) -or (-not (Test-Path -LiteralPath $Path))) {
+      return @{ Ok = $false; Detail = "missing" }
+    }
+    $acl = & icacls $Path 2>$null | Out-String
+    if ([string]::IsNullOrWhiteSpace($acl)) { return @{ Ok = $false; Detail = "icacls-empty" } }
+    $rights = @()
+    foreach ($m in @([regex]::Matches($acl, "SYSTEM:\(([^)]*)\)"))) { $rights += $m.Groups[1].Value }
+    foreach ($r in $rights) {
+      if ($r -match "F") { return @{ Ok = $true; Detail = "SYSTEM:F" } }
+    }
+    foreach ($r in $rights) {
+      if ($r -match "R") { return @{ Ok = $true; Detail = "SYSTEM:R" } }
+    }
+    return @{ Ok = $false; Detail = "no-system-rights" }
+  } catch { return @{ Ok = $false; Detail = "error" } }
+}
+
+<#
+.SYNOPSIS
+  Migrate a user auth.json into the server dir. Atomic, validated, ACL'd.
+.DESCRIPTION
+  Copies ONLY auth.json (never the whole profile dir): backs up any existing
+  server file via Backup-File, copies through a temp file + Move-Item rename
+  (same volume = atomic), preserves the original, then locks the copy to
+  SYSTEM+Administrators on Windows. Never reads file contents into output:
+  Detail carries only paths and status words. Returns
+  @{ Ok=[bool]; Backup=""; Detail="" }. Never throws.
+#>
+function Copy-PiAuthToServerDir {
+  param([string]$UserAuthPath, [string]$ServerAuthPath)
+  try {
+    if ([string]::IsNullOrWhiteSpace($UserAuthPath) -or (-not (Test-Path -LiteralPath $UserAuthPath))) {
+      return @{ Ok = $false; Backup = ""; Detail = "user-missing" }
+    }
+    if ([string]::IsNullOrWhiteSpace($ServerAuthPath)) {
+      return @{ Ok = $false; Backup = ""; Detail = "server-path-empty" }
+    }
+    $dir = Split-Path -Parent $ServerAuthPath
+    if (-not [string]::IsNullOrWhiteSpace($dir) -and (-not (Test-Path -LiteralPath $dir))) {
+      New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop | Out-Null
+    }
+    $bak = ""
+    if (Test-Path -LiteralPath $ServerAuthPath) {
+      try { $bak = Backup-File -Path $ServerAuthPath } catch { $bak = "" }
+    }
+    $tmp = "$ServerAuthPath.tmp-" + [Guid]::NewGuid().ToString("N")
+    Copy-Item -LiteralPath $UserAuthPath -Destination $tmp -Force -ErrorAction Stop
+    Move-Item -LiteralPath $tmp -Destination $ServerAuthPath -Force -ErrorAction Stop
+    if ($env:OS -eq "Windows_NT") {
+      & icacls $ServerAuthPath /inheritance:r /grant:r "SYSTEM:F" /grant:r "Administrators:F" | Out-Null
+      if ($LASTEXITCODE -ne 0) { return @{ Ok = $false; Backup = $bak; Detail = "acl-failed" } }
+    }
+    return @{ Ok = $true; Backup = $bak; Detail = "copied" }
+  } catch {
+    return @{ Ok = $false; Backup = ""; Detail = "copy-failed" }
+  }
+}
+
+<#
+.SYNOPSIS
+  Pi-auth menu: login / migrate / retry / exit. Returns the choice string.
+.DESCRIPTION
+  -ReadFunc injects a fake reader for tests: scriptblock -> [string].
+  M (migrate) is offered only when -HasUserAuth. Invalid input reprompts
+  (the menu itself never exits the process). Never throws.
+#>
+function Show-PiAuthMenu {
+  param([bool]$HasUserAuth, [scriptblock]$ReadFunc = $null, [string]$Default = "R")
+  $opts = "[L]ogin ora / [R]iprova rilevamento / [E]sci e riprendi dopo"
+  if ($HasUserAuth) { $opts = "[L]ogin ora / [M]igra login utente / [R]iprova rilevamento / [E]sci e riprendi dopo" }
+  while ($true) {
+    Write-Host ""
+    if ($null -ne $ReadFunc) { $a = & $ReadFunc $opts }
+    else { $a = Read-Host "$opts [$Default]" }
+    $t = ([string]$a).Trim().ToLowerInvariant()
+    if ($t -eq "") { $t = $Default.Trim().ToLowerInvariant() }
+    if ($t -eq "l" -or $t -eq "login") { return "login" }
+    if ($t -eq "m" -or $t -eq "migra") {
+      if ($HasUserAuth) { return "migrate" }
+    }
+    if ($t -eq "r" -or $t -eq "riprova") { return "retry" }
+    if ($t -eq "e" -or $t -eq "esci") { return "exit" }
+    Write-Host "Scelta non valida: L, R, E." -ForegroundColor Yellow
   }
 }
 

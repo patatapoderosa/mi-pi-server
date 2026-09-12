@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.2.3 — 2026-09-12
+
+### Fixed
+
+- Fixed Pi-login loop on Windows: step 8/11 kept asking for `/login` even
+  after a successful login. Two root causes: (1) the verifier ran bare
+  `pi auth check`, which always fails on pi 0.85.1 (it requires
+  `--provider`/`--model`); (2) auth lived in `%USERPROFILE%\.pi\agent`
+  while the server reads `C:\PiServer\data` (`PI_CODING_AGENT_DIR`).
+- New `Test-PiAuthentication` verifier uses the official contract
+  (`auth.json` in `getAgentDir()`, `auth check --provider <id> --json
+  --no-refresh`, exit 0 = ready): login is recognized once, resume skips
+  step 8 automatically.
+- Interactive `/login` now runs with `PI_CODING_AGENT_DIR=C:\PiServer\data`
+  scoped to that process only (saved/restored, never left behind).
+- Safe migration of an existing user login: offered only when the user
+  auth verifies, copies ONLY `auth.json` (atomic tmp+rename, original
+  preserved, existing server file backed up), locks it to
+  SYSTEM+Administrators, re-verifies afterwards. No blind full-profile copy.
+- Failure menu with diagnostics (exe paths, both agent dirs, found/not
+  found, reason — never secrets): [L]ogin / [M]igrate / [R]etry / [E]xit
+  with checkpoint. No infinite loop.
+- Added ~35 smoke assertions (verifier matrix, env restore, user/server
+  confusion, menu, atomic migration, ACL shape, resume verifier).
+
+### Upgrade notes
+
+- No migration needed: rerun the one-liner (resolves `latest` → v0.2.3).
+  A login done in the user profile is offered for migration; a login already
+  in the server dir is recognized immediately.
+
+
 ## v0.2.2 — 2026-09-11
 
 ### Fixed

@@ -12,6 +12,8 @@
   SHA256SUMS strict parsing (LF/CRLF/BOM/spacing/asterisk/multi-file plus
   negatives and conflicting-duplicate fail-closed) with setup.ps1 mirror-sync,
   atomic staged deploy (clean/nested/fresh/update/backup/failure-intact),
+  pi authentication verifier (valid/invalid/corrupt/missing auth, env restore,
+  user-vs-server confusion, menu, atomic migration, ACL shape, resume verifier),
   and the no-secrets-in-logs guarantee.
 
   Windows-only parts (Task Scheduler registration, icacls, powercfg) are
@@ -495,6 +497,123 @@ try {
   $threw3 = $false
   try { $null = Test-StepRealState -Step "deploy" -Paths $null } catch { $threw3 = $true }
   Assert-True (-not $threw3) "verifier non lancia mai"
+
+  Write-Host "== pi authentication verifier =="
+  $fakeBin = Join-Path $TmpRoot "fakebin"
+  New-Item -ItemType Directory -Path $fakeBin -Force | Out-Null
+  $piFake = Join-Path $fakeBin "pi-fake.exe"
+  "fake" | Out-File -LiteralPath $piFake -Encoding ascii -NoNewline
+  $noAuthDir = Join-Path $TmpRoot "noauthdir"
+  New-Item -ItemType Directory -Path $noAuthDir -Force | Out-Null
+  $srvDir = Join-Path $TmpRoot "srvagent"
+  New-Item -ItemType Directory -Path $srvDir -Force | Out-Null
+  $usrDir = Join-Path $TmpRoot "usragent"
+  New-Item -ItemType Directory -Path $usrDir -Force | Out-Null
+  $fakeKey = "sk-ant-fake-UNITTEST-999"
+  $goodJson = '{"anthropic":{"type":"api_key","key":"' + $fakeKey + '"}}'
+  $goodJson | Out-File -LiteralPath (Join-Path $srvDir "auth.json") -Encoding ascii -NoNewline
+  $runReady = { param($E, $A, $D) return @{ ExitCode = 0; Stdout = '{"status":"ready","provider":"anthropic","authType":"api_key"}' } }
+  $runNotReady = { param($E, $A, $D) return @{ ExitCode = 1; Stdout = '{"status":"not_ready","provider":"anthropic","reason":"credentials_not_configured"}' } }
+  $runInvalid = { param($E, $A, $D) return @{ ExitCode = 2; Stdout = '{"status":"invalid","provider":"anthropic","reason":"invalid_state"}' } }
+  $runThrow = { param($E, $A, $D) throw "runner-boom" }
+  $runGarbage = { param($E, $A, $D) return @{ ExitCode = 0; Stdout = "hello" } }
+  $rReady = Test-PiAuthentication -PiExe $piFake -AgentDir $srvDir -Runner $runReady
+  Assert-True ($rReady.Authenticated -and ($rReady.Provider -eq "anthropic") -and ($rReady.SourcePath -eq (Join-Path $srvDir "auth.json"))) "auth valida riconosciuta"
+  Assert-True ((($rReady | ConvertTo-Json -Depth 3) -notmatch "UNITTEST-999")) "secret mai nel risultato"
+  $rNotReady = Test-PiAuthentication -PiExe $piFake -AgentDir $srvDir -Runner $runNotReady
+  Assert-True ((-not $rNotReady.Authenticated) -and ($rNotReady.Reason -match "credentials_not_configured")) "auth non pronta rifiutata"
+  $rInvalid = Test-PiAuthentication -PiExe $piFake -AgentDir $srvDir -Runner $runInvalid
+  Assert-True ((-not $rInvalid.Authenticated) -and ($rInvalid.Reason -match "invalid")) "auth invalida rifiutata"
+  $rThrow = Test-PiAuthentication -PiExe $piFake -AgentDir $srvDir -Runner $runThrow
+  Assert-True ((-not $rThrow.Authenticated) -and ($rThrow.Reason -eq "check-failed")) "runner che lancia non propaga"
+  $rGarbage = Test-PiAuthentication -PiExe $piFake -AgentDir $srvDir -Runner $runGarbage
+  Assert-True (-not $rGarbage.Authenticated) "output non-JSON rifiutato"
+  $rNoFile = Test-PiAuthentication -PiExe $piFake -AgentDir $noAuthDir -Runner $runReady
+  Assert-True ((-not $rNoFile.Authenticated) -and ($rNoFile.Reason -eq "no-auth-file")) "auth.json assente"
+  $badDir = Join-Path $TmpRoot "badauth"
+  New-Item -ItemType Directory -Path $badDir -Force | Out-Null
+  "not-json{{{" | Out-File -LiteralPath (Join-Path $badDir "auth.json") -Encoding ascii -NoNewline
+  $rBad = Test-PiAuthentication -PiExe $piFake -AgentDir $badDir -Runner $runReady
+  Assert-True ((-not $rBad.Authenticated) -and ($rBad.Reason -eq "corrupt-auth-file")) "auth.json corrotto"
+  $emptyDir = Join-Path $TmpRoot "emptyauth"
+  New-Item -ItemType Directory -Path $emptyDir -Force | Out-Null
+  "{}" | Out-File -LiteralPath (Join-Path $emptyDir "auth.json") -Encoding ascii -NoNewline
+  $rEmpty = Test-PiAuthentication -PiExe $piFake -AgentDir $emptyDir -Runner $runReady
+  Assert-True ((-not $rEmpty.Authenticated) -and ($rEmpty.Reason -eq "no-providers")) "auth.json vuoto"
+  $rNoPi = Test-PiAuthentication -PiExe (Join-Path $TmpRoot "nonesiste.exe") -AgentDir $srvDir -Runner $runReady
+  Assert-True ((-not $rNoPi.Authenticated) -and ($rNoPi.Reason -eq "pi-not-found")) "pi mancante"
+  $threw4 = $false
+  try { $null = Test-PiAuthentication -PiExe $null -AgentDir $null -Runner $null } catch { $threw4 = $true }
+  Assert-True (-not $threw4) "verifier non lancia mai (null)"
+  $env:PI_CODING_AGENT_DIR = "SENTINEL-XYZ"
+  $null = Test-PiAuthentication -PiExe $piFake -AgentDir $srvDir -Runner $runThrow
+  Assert-Equal $env:PI_CODING_AGENT_DIR "SENTINEL-XYZ" "env globale intatto (runner fake)"
+  Remove-Item Env:\PI_CODING_AGENT_DIR -ErrorAction SilentlyContinue
+  $nodeExe = (Get-Command node -ErrorAction SilentlyContinue).Source
+  if ($null -eq $nodeExe) { Skip-Test "env restore (default runner)" "node assente" }
+  else {
+    $env:PI_CODING_AGENT_DIR = "SENTINEL-XYZ"
+    $null = Test-PiAuthentication -PiExe $nodeExe -AgentDir $srvDir
+    Assert-Equal $env:PI_CODING_AGENT_DIR "SENTINEL-XYZ" "env ripristinato (default runner)"
+    Remove-Item Env:\PI_CODING_AGENT_DIR -ErrorAction SilentlyContinue
+  }
+  $script:seenDirs = @()
+  $runCapA = { param($E, $A, $D) $script:seenDirs += "A:" + $D; return @{ ExitCode = 0; Stdout = '{"status":"ready","provider":"provA"}' } }
+  $runCapB = { param($E, $A, $D) $script:seenDirs += "B:" + $D; return @{ ExitCode = 0; Stdout = '{"status":"ready","provider":"provB"}' } }
+  $usrDir2 = Join-Path $TmpRoot "usragent2"
+  New-Item -ItemType Directory -Path $usrDir2 -Force | Out-Null
+  '{"provB":{"type":"api_key","key":"x"}}' | Out-File -LiteralPath (Join-Path $usrDir2 "auth.json") -Encoding ascii -NoNewline
+  $rS = Test-PiAuthentication -PiExe $piFake -AgentDir $srvDir -Runner $runCapA
+  $rU = Test-PiAuthentication -PiExe $piFake -AgentDir $usrDir2 -Runner $runCapB
+  Assert-True (($rS.Provider -eq "provA") -and ($rU.Provider -eq "provB")) "server-dir e user-dir non confusi"
+  Assert-True (($script:seenDirs -contains ("A:" + $srvDir)) -and ($script:seenDirs -contains ("B:" + $usrDir2))) "runner riceve la dir corretta"
+
+  Write-Host "== pi-auth menu + migrazione =="
+  Assert-Equal (Show-PiAuthMenu -HasUserAuth $true -ReadFunc { param($o) return "l" }) "login" "menu L"
+  Assert-Equal (Show-PiAuthMenu -HasUserAuth $true -ReadFunc { param($o) return "m" }) "migrate" "menu M con user auth"
+  $script:menuN = 0
+  $mNoM = Show-PiAuthMenu -HasUserAuth $false -ReadFunc { param($o) $script:menuN++; if ($script:menuN -eq 1) { return "m" } else { return "e" } }
+  Assert-Equal $mNoM "exit" "menu M senza user auth = reprompt poi E"
+  $script:menuN = 0
+  $mBad = Show-PiAuthMenu -HasUserAuth $false -ReadFunc { param($o) $script:menuN++; if ($script:menuN -eq 1) { return "xyz" } else { return "r" } }
+  Assert-Equal $mBad "retry" "menu invalido = reprompt"
+  $mDef = Show-PiAuthMenu -HasUserAuth $false -ReadFunc { param($o) return "" }
+  Assert-Equal $mDef "retry" "menu vuoto = default R"
+  $migSrc = Join-Path $TmpRoot "mig-user-auth.json"
+  $migDst = Join-Path $TmpRoot "mig-srv-auth.json"
+  $goodJson | Out-File -LiteralPath $migSrc -Encoding ascii -NoNewline
+  $mig1 = Copy-PiAuthToServerDir -UserAuthPath $migSrc -ServerAuthPath $migDst
+  Assert-True ($mig1.Ok -and ($mig1.Backup -eq "")) "migrazione ok senza backup"
+  Assert-Equal (Get-Content -LiteralPath $migDst -Raw) $goodJson "contenuto migrato identico"
+  Assert-Equal (Get-Content -LiteralPath $migSrc -Raw) $goodJson "originale preservato"
+  Assert-True ((($mig1 | ConvertTo-Json -Depth 3) -notmatch "UNITTEST-999")) "secret mai nel risultato migrazione"
+  "vecchio" | Out-File -LiteralPath $migDst -Encoding ascii -NoNewline
+  $mig2 = Copy-PiAuthToServerDir -UserAuthPath $migSrc -ServerAuthPath $migDst
+  Assert-True ($mig2.Ok -and ($mig2.Backup -ne "") -and (Test-Path -LiteralPath $mig2.Backup)) "migrazione con backup esistente"
+  Assert-Equal (Get-Content -LiteralPath $migDst -Raw) $goodJson "contenuto sostituito"
+  $mig3 = Copy-PiAuthToServerDir -UserAuthPath (Join-Path $TmpRoot "assente.json") -ServerAuthPath $migDst
+  Assert-True ((-not $mig3.Ok) -and ($mig3.Detail -eq "user-missing")) "sorgente mancante"
+  Assert-True ((@(Get-ChildItem -LiteralPath $TmpRoot -Filter "mig-srv-auth.json.tmp-*")).Count -eq 0) "nessun tmp residuo"
+  $aclShape = Test-AuthAcl -Path (Join-Path $TmpRoot "assente.json")
+  Assert-True ((-not $aclShape.Ok) -and ($aclShape.Detail -ne "")) "acl: shape su path mancante"
+  if ($env:OS -ne "Windows_NT") { Skip-Test "ACL SYSTEM positiva" "non-Windows (icacls assente)" }
+  else {
+    $aclPos = Test-AuthAcl -Path $migDst
+    Assert-True $aclPos.Ok "ACL SYSTEM presente dopo migrazione (solo Windows)"
+  }
+
+  Write-Host "== verifier secrets con auth reale =="
+  $vRoot = Get-PiServerPaths -Root (Join-Path $TmpRoot "VPi")
+  New-Item -ItemType Directory -Path $vRoot.SecretsDir -Force | Out-Null
+  New-Item -ItemType Directory -Path $vRoot.AgentDir -Force | Out-Null
+  "tok" | Out-File -LiteralPath (Join-Path $vRoot.SecretsDir "server-bot-token") -Encoding ascii -NoNewline
+  "hm" | Out-File -LiteralPath (Join-Path $vRoot.SecretsDir "remote-hmac") -Encoding ascii -NoNewline
+  '{"profiles":{"default":{"botToken":"x","allowedUserId":123}}}' | Out-File -LiteralPath (Join-Path $vRoot.AgentDir "telegram.json") -Encoding ascii -NoNewline
+  $goodJson | Out-File -LiteralPath (Join-Path $vRoot.AgentDir "auth.json") -Encoding ascii -NoNewline
+  Assert-True (Test-StepRealState -Step "secrets" -Paths $vRoot -PiBin $piFake -AuthRunner $runReady) "secrets ok con auth valida (resume salta)"
+  Assert-True (-not (Test-StepRealState -Step "secrets" -Paths $vRoot -PiBin $piFake -AuthRunner $runNotReady)) "secrets ko con auth invalida (resume riesegue)"
+  Remove-Item -LiteralPath (Join-Path $vRoot.AgentDir "auth.json") -Force
+  Assert-True (-not (Test-StepRealState -Step "secrets" -Paths $vRoot -PiBin $piFake -AuthRunner $runReady)) "secrets ko senza auth.json"
 } finally {
   Remove-Item -LiteralPath $TmpRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
