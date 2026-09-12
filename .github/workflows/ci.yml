@@ -16,7 +16,9 @@ jobs:
       - run: npm install --no-audit --no-fund
       - run: npm test
       - name: Runtime JS syntax (daemon entrypoints)
-        run: node --check server/pi-daemon.mjs && node --check server/spawn-pi.mjs
+        run: |
+          node --check server/pi-daemon.mjs
+          node --check server/spawn-pi.mjs
       - run: npm run typecheck
 
   windows-ps51:
@@ -45,7 +47,8 @@ jobs:
               $pt = [System.Management.Automation.Language.Parser]
               [void]$pt::ParseFile($f, [ref]$toks, [ref]$errs2)
               foreach ($e in $errs2) {
-                $errs += "$($_.Name):$($e.Extent.StartLineNumber): $($e.Message)"
+                $where = "$($_.Name):$($e.Extent.StartLineNumber)"
+                $errs += "${where}: $($e.Message)"
               }
             }
           if ($errs.Count -gt 0) {
@@ -68,3 +71,8 @@ jobs:
         run: |
           powershell.exe -NoProfile -NonInteractive `
             -File installer/tests/Invoke-TaskE2E.ps1
+      - name: Upgrade-transaction E2E on real Windows (live lock + swap)
+        shell: powershell
+        run: |
+          powershell.exe -NoProfile -NonInteractive `
+            -File installer/tests/Invoke-UpgradeE2E.ps1

@@ -81,6 +81,7 @@ function Get-PiServerPaths {
     RuntimeEnv = Join-Path $app "runtime-env.json"
     VersionFile = Join-Path $app "VERSION"
     InstallerLog = Join-Path $logs "installer.log"
+    InstallerTranscript = Join-Path $logs "installer-transcript.log"
     ServerLog = Join-Path $logs "pi-server.log"
     ServerErrLog = Join-Path $logs "pi-server-error.log"
     RemoteLog = Join-Path $logs "remote-server.log"
@@ -359,7 +360,7 @@ function Get-ReleaseChecksum {
   removed and the live app is untouched (swap never ran).
 #>
 function Invoke-AppStaging {
-  param([string]$PayloadDir, [string]$AppPath, [string]$Mode = "fresh", [string]$VersionLabel = "")
+  param([string]$PayloadDir, [string]$AppPath, [string]$Mode = "fresh", [string]$VersionLabel = "", [scriptblock]$PreSwapAction = $null)
   $res = @{ Ok = $false; Error = ""; BackupPath = $null }
   try {
     if ([string]::IsNullOrWhiteSpace($PayloadDir) -or (-not (Test-Path -LiteralPath $PayloadDir))) {
@@ -395,6 +396,11 @@ function Invoke-AppStaging {
       }
       $stMan = Test-ReleaseManifest -PayloadRoot $stage -Manifest $script:AppManifest
       if (-not $stMan.Ok) { throw ("Manifest dello stage incompleto: " + ($stMan.Missing -join ", ")) }
+      if ($null -ne $PreSwapAction) {
+        $hookMsg = $null
+        try { $hookMsg = & $PreSwapAction } catch { $hookMsg = $_.Exception.Message }
+        if (-not [string]::IsNullOrWhiteSpace([string]$hookMsg)) { throw ("Pre-swap fallito: " + [string]$hookMsg) }
+      }
     } catch {
       Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
       throw
@@ -424,6 +430,300 @@ function Invoke-AppStaging {
     $res.Error = $_.Exception.Message
     return $res
   }
+}
+
+<#
+.SYNOPSIS
+  Pure decision: does this run need update (backup-preserving) semantics?
+.DESCRIPTION
+  Fresh installs (no installed version) never update. A concrete target that
+  differs from the installed version always updates. An unresolved "latest"
+  target with an existing install updates too (fail-safe direction: a newer
+  payload must never be deployed over a live app with the delete path).
+  Never throws.
+#>
+function Test-ShouldAutoUpdate {
+  param([string]$InstalledVersion = "", [string]$TargetVersion = "")
+  try {
+    $have = ([string]$InstalledVersion).Trim()
+    $want = ([string]$TargetVersion).Trim()
+    if ($have -eq "") { return $false }
+    if (($want -eq "") -or ($want -eq "latest")) { return $true }
+    return ($have -ne $want)
+  } catch { return $false }
+}
+
+<#
+.SYNOPSIS
+  Who listens on a TCP port (Windows Get-NetTCPConnection, injectable).
+.DESCRIPTION
+  Returns @{ Listening; Pid; Name; CommandLine; Detail }. -ConnectionReader
+  is scriptblock param($Port)->array of objects with LocalPort/State/
+  OwningProcess; -ProcessReader is scriptblock param($Pid)->array of process
+  objects with ProcessId/Name/CommandLine. Never throws, never kills.
+#>
+function Get-TcpListenerOwner {
+  param([int]$Port = 0, [scriptblock]$ConnectionReader = $null, [scriptblock]$ProcessReader = $null)
+  try {
+    if ($Port -le 0 -or $Port -gt 65535) { return @{ Listening = $false; Pid = 0; Name = ""; CommandLine = ""; Detail = "invalid port" } }
+    $conns = @()
+    if ($null -ne $ConnectionReader) { $conns = @(& $ConnectionReader $Port) }
+    else {
+      if ($env:OS -ne "Windows_NT") { return @{ Listening = $false; Pid = 0; Name = ""; CommandLine = ""; Detail = "non-Windows" } }
+      $conns = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction Stop)
+    }
+    $hit = $null
+    foreach ($c in $conns) {
+      $st = ""
+      try { $st = [string]$c.State } catch { }
+      if (($st -eq "") -or ($st -eq "Listen")) { $hit = $c; break }
+    }
+    if ($null -eq $hit) { return @{ Listening = $false; Pid = 0; Name = ""; CommandLine = ""; Detail = "free" } }
+    $ownerPid = 0
+    try { $ownerPid = [int]$hit.OwningProcess } catch { }
+    $name = ""
+    $cl = ""
+    if ($ownerPid -gt 0) {
+      $cands = @()
+      try {
+        if ($null -ne $ProcessReader) { $cands = @(& $ProcessReader $ownerPid) }
+        else { $cands = @(Get-CimInstance Win32_Process -ErrorAction Stop) }
+      } catch { $cands = @() }
+      foreach ($p in $cands) {
+        $pp = 0
+        try { $pp = [int]$p.ProcessId } catch { continue }
+        if ($pp -eq $ownerPid) {
+          try { $name = [string]$p.Name } catch { }
+          try { $cl = [string]$p.CommandLine } catch { }
+          break
+        }
+      }
+    }
+    return @{ Listening = $true; Pid = $ownerPid; Name = $name; CommandLine = $cl; Detail = ("pid " + $ownerPid) }
+  } catch { return @{ Listening = $false; Pid = 0; Name = ""; CommandLine = ""; Detail = ("probe failed: " + $_.Exception.Message) } }
+}
+
+<#
+.SYNOPSIS
+  Pure check: does a listener owner belong to our install? True when its
+  command line lives under the app root, names our launchers/daemons, or
+  carries our daemon markers. Never throws.
+#>
+function Test-PortOwnerIsOurs {
+  param($Owner, $Paths)
+  try {
+    if ($null -eq $Owner -or (-not $Owner.Listening)) { return $false }
+    if ($null -eq $Paths) { return $false }
+    $cl = [string]$Owner.CommandLine
+    if ($cl -eq "") { return $false }
+    try {
+      $root = [regex]::Escape([string]$Paths.App)
+      if (($root -ne "") -and ($cl -match $root)) { return $true }
+    } catch { }
+    if ($cl -match "pi-daemon\.mjs") { return $true }
+    if ($cl -match "pi-remote-server") { return $true }
+    foreach ($lf in @([string]$Paths.RunTask, [string]$Paths.RunRemote)) {
+      if (($lf -ne "") -and ($cl.Contains('"' + $lf + '"') -or $cl.Contains($lf))) { return $true }
+    }
+    return $false
+  } catch { return $false }
+}
+
+<#
+.SYNOPSIS
+  Pre-start port gate: free->ok; stale OWN listener->stop tree + recheck;
+  FOREIGN listener->fail with diagnostics, never killed.
+.DESCRIPTION
+  -OwnerReader injects scriptblock param($Port)->owner object (same shape as
+  Get-TcpListenerOwner output); -Stopper injects scriptblock param($ProcessId).
+  Returns @{ Ok; ActionTaken; Detail }. Never throws.
+#>
+function Clear-OwnPortListener {
+  param([int]$Port = 0, $Paths, [scriptblock]$OwnerReader = $null, [scriptblock]$Stopper = $null, [int]$TimeoutSec = 15)
+  try {
+    $own = $null
+    if ($null -ne $OwnerReader) { $own = & $OwnerReader $Port }
+    else { $own = Get-TcpListenerOwner -Port $Port }
+    if (($null -eq $own) -or (-not $own.Listening)) { return @{ Ok = $true; ActionTaken = "none"; Detail = ("port " + $Port + " free") } }
+    if (-not (Test-PortOwnerIsOurs -Owner $own -Paths $Paths)) {
+      return @{ Ok = $false; ActionTaken = "none"; Detail = ("port " + $Port + " owned by foreign process (pid " + $own.Pid + " " + $own.Name + "): " + $own.CommandLine) }
+    }
+    $ownerPid = 0
+    try { $ownerPid = [int]$own.Pid } catch { }
+    if ($ownerPid -le 0) { return @{ Ok = $false; ActionTaken = "none"; Detail = "own listener has no pid" } }
+    try {
+      if ($null -ne $Stopper) { & $Stopper $ownerPid }
+      else {
+        if ($env:OS -ne "Windows_NT") { return @{ Ok = $false; ActionTaken = "none"; Detail = "cannot tree-kill off Windows" } }
+        & taskkill /pid $ownerPid /T /F 2>&1 | Out-Null
+      }
+    } catch { return @{ Ok = $false; ActionTaken = "stop-failed"; Detail = ("stop pid " + $ownerPid + " fallito: " + $_.Exception.Message) } }
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    while ((Get-Date) -lt $deadline) {
+      Start-Sleep -Seconds 1
+      $re = $null
+      if ($null -ne $OwnerReader) { $re = & $OwnerReader $Port } else { $re = Get-TcpListenerOwner -Port $Port }
+      if (($null -eq $re) -or (-not $re.Listening)) { return @{ Ok = $true; ActionTaken = ("stopped-pid-" + $ownerPid); Detail = ("stale own listener rimosso (pid " + $ownerPid + ")") } }
+    }
+    return @{ Ok = $false; ActionTaken = "stop-ineffective"; Detail = ("port " + $Port + " ancora occupata dopo stop pid " + $ownerPid) }
+  } catch { return @{ Ok = $false; ActionTaken = "error"; Detail = ("port check interrotto: " + $_.Exception.Message) } }
+}
+
+<#
+.SYNOPSIS
+  Stop the live PiServer runtime before touching the app directory.
+.DESCRIPTION
+  Stops both scheduled tasks, then sweeps processes whose command line lives
+  under the app root or carries our daemon markers, killing each TREE
+  (taskkill /T). Never kills arbitrary processes, never kills self.
+  Verifies the remote port is no longer held by OUR processes (a FOREIGN
+  listener is reported, not killed). -TaskReader injects scriptblock
+  param($TaskName)->task object with .State; -ProcessProbe injects scriptblock
+  ->array of objects with ProcessId/CommandLine(/Name); -ConnectionReader and
+  -ProcessReader feed the port check like Get-TcpListenerOwner; -Stopper
+  injects scriptblock param($ProcessId) and records kills in tests.
+  Returns @{ Ok; WasPiRunning; WasRemoteRunning; RemainingProcesses;
+  Detail; PortBusy; PortOwner }. Never throws.
+#>
+function Stop-PiServerRuntime {
+  param($Paths, [int]$RemotePort = 0, [int]$TimeoutSec = 30,
+    [scriptblock]$TaskReader = $null, [scriptblock]$ProcessProbe = $null,
+    [scriptblock]$ConnectionReader = $null, [scriptblock]$ProcessReader = $null,
+    [scriptblock]$Stopper = $null)
+  try {
+    $selfPid = 0
+    try { $selfPid = [System.Diagnostics.Process]::GetCurrentProcess().Id } catch { }
+    $tMain = $null
+    $tRemote = $null
+    try {
+      if ($null -ne $TaskReader) { $tMain = & $TaskReader $Paths.TaskName; $tRemote = & $TaskReader $Paths.RemoteTaskName }
+      else {
+        $tMain = Get-ScheduledTask -TaskName $Paths.TaskName -ErrorAction SilentlyContinue
+        $tRemote = Get-ScheduledTask -TaskName $Paths.RemoteTaskName -ErrorAction SilentlyContinue
+      }
+    } catch { }
+    $wasPi = $false
+    $wasRemote = $false
+    try { if (($null -ne $tMain) -and ([string]$tMain.State -eq "Running")) { $wasPi = $true } } catch { }
+    try { if (($null -ne $tRemote) -and ([string]$tRemote.State -eq "Running")) { $wasRemote = $true } } catch { }
+    if ($null -eq $TaskReader) {
+      foreach ($tn in @($Paths.TaskName, $Paths.RemoteTaskName)) {
+        try { Stop-ScheduledTask -TaskName $tn -ErrorAction SilentlyContinue } catch { }
+      }
+    }
+    $rootRx = ""
+    try { $rootRx = [regex]::Escape([string]$Paths.App) } catch { }
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    $remaining = @()
+    while ($true) {
+      $procs = @()
+      try {
+        if ($null -ne $ProcessProbe) { $procs = @(& $ProcessProbe) }
+        else { $procs = @(Get-CimInstance Win32_Process -ErrorAction Stop) }
+      } catch { $procs = @() }
+      $mine = @()
+      foreach ($p in $procs) {
+        $ownerPid = 0
+        $cl = ""
+        try { $ownerPid = [int]$p.ProcessId } catch { continue }
+        try { $cl = [string]$p.CommandLine } catch { }
+        if (($ownerPid -le 0) -or ($ownerPid -eq $selfPid)) { continue }
+        $hit = $false
+        if (($rootRx -ne "") -and ($cl -match $rootRx)) { $hit = $true }
+        elseif ($cl -match "pi-daemon\.mjs") { $hit = $true }
+        elseif ($cl -match "pi-remote-server") { $hit = $true }
+        if ($hit) { $mine += $ownerPid }
+      }
+      if ($mine.Count -eq 0) { $remaining = @(); break }
+      foreach ($id in $mine) {
+        try {
+          if ($null -ne $Stopper) { & $Stopper $id }
+          else { & taskkill /pid $id /T /F 2>&1 | Out-Null }
+        } catch { }
+      }
+      if ((Get-Date) -ge $deadline) { $remaining = $mine; break }
+      Start-Sleep -Seconds 1
+    }
+    $portBusy = $false
+    $portOwner = ""
+    if ($RemotePort -gt 0) {
+      $own = Get-TcpListenerOwner -Port $RemotePort -ConnectionReader $ConnectionReader -ProcessReader $ProcessReader
+      if ($own.Listening) {
+        $portBusy = $true
+        $portOwner = ("pid " + $own.Pid + " " + $own.Name)
+        if (Test-PortOwnerIsOurs -Owner $own -Paths $Paths) {
+          return @{ Ok = $false; WasPiRunning = $wasPi; WasRemoteRunning = $wasRemote; RemainingProcesses = $remaining; Detail = ("port " + $RemotePort + " ancora occupata dal nostro processo (" + $portOwner + ")"); PortBusy = $true; PortOwner = $portOwner }
+        }
+      }
+    }
+    if ($remaining.Count -gt 0) {
+      return @{ Ok = $false; WasPiRunning = $wasPi; WasRemoteRunning = $wasRemote; RemainingProcesses = $remaining; Detail = ("processi residui sotto app root: pid " + ($remaining -join ", ")); PortBusy = $portBusy; PortOwner = $portOwner }
+    }
+    $ran = @()
+    if ($wasPi) { $ran += "PiHomeServer" }
+    if ($wasRemote) { $ran += "PiRemoteServer" }
+    $what = "niente in esecuzione"
+    if ($ran.Count -gt 0) { $what = ($ran -join " + ") + " fermati" }
+    $pb = ""
+    if ($portBusy) { $pb = ("; porta " + $RemotePort + " occupata da processo esterno (" + $portOwner + ")") }
+    return @{ Ok = $true; WasPiRunning = $wasPi; WasRemoteRunning = $wasRemote; RemainingProcesses = @(); Detail = ("runtime fermo (" + $what + ")" + $pb); PortBusy = $portBusy; PortOwner = $portOwner }
+  } catch { return @{ Ok = $false; WasPiRunning = $false; WasRemoteRunning = $false; RemainingProcesses = @(); Detail = ("stop interrotto: " + $_.Exception.Message); PortBusy = $false; PortOwner = "" } }
+}
+
+<#
+.SYNOPSIS
+  Transactional rollback to a previous app backup (health failure path).
+.DESCRIPTION
+  Stops the NEW runtime, removes the new app (retried), restores the backup,
+  restores extension/shared from it, restarts both tasks, rechecks health.
+  Every stage is fail-closed with an explicit Detail; partial states are
+  reported, never hidden. -RuntimeStopper injects scriptblock -> @{Ok;Detail};
+  -TaskStarter injects scriptblock param($TaskName) (throws on failure);
+  -HealthChecker injects scriptblock -> @{Ok; Failures}. Never throws.
+#>
+function Invoke-AppRollback {
+  param($Paths, [string]$BackupPath = "", [string]$PiBin = "", [int]$RemotePort = 0,
+    [scriptblock]$RuntimeStopper = $null, [scriptblock]$TaskStarter = $null, [scriptblock]$HealthChecker = $null)
+  try {
+    if ([string]::IsNullOrWhiteSpace($BackupPath) -or (-not (Test-Path -LiteralPath $BackupPath))) {
+      return @{ Ok = $false; Detail = "rollback impossibile: backup assente" }
+    }
+    try {
+      if ($null -ne $RuntimeStopper) { $rs = & $RuntimeStopper }
+      else { $rs = Stop-PiServerRuntime -Paths $Paths -RemotePort $RemotePort }
+      if (-not $rs.Ok) { return @{ Ok = $false; Detail = ("rollback abortito: runtime nuovo non fermabile: " + $rs.Detail) } }
+    } catch { return @{ Ok = $false; Detail = ("rollback abortito (stop): " + $_.Exception.Message) } }
+    $removed = $false
+    $rmErr = ""
+    for ($i = 0; $i -lt 3; $i++) {
+      try {
+        if (Test-Path -LiteralPath $Paths.App) { Remove-Item -LiteralPath $Paths.App -Recurse -Force -ErrorAction Stop }
+        $removed = $true
+        break
+      } catch { $rmErr = $_.Exception.Message; Start-Sleep -Seconds 2 }
+    }
+    if (-not $removed) { return @{ Ok = $false; Detail = ("rollback abortito: app nuova non rimovibile (lock?): " + $rmErr) } }
+    try { Move-Item -LiteralPath $BackupPath -Destination $Paths.App -Force -ErrorAction Stop }
+    catch { return @{ Ok = $false; Detail = ("rollback INCOMPLETO: backup non ripristinabile (manuale da: " + $BackupPath + "): " + $_.Exception.Message) } }
+    try {
+      $rbExt = Join-Path $Paths.ExtDir "pi-remote-config"
+      if (Test-Path -LiteralPath $rbExt) { Remove-Item -LiteralPath $rbExt -Recurse -Force -ErrorAction Stop }
+      Copy-Item -Path (Join-Path $Paths.App "server\pi-remote-config") -Destination $rbExt -Recurse -Force -ErrorAction Stop
+      if (Test-Path -LiteralPath $Paths.SharedDir) { Remove-Item -LiteralPath $Paths.SharedDir -Recurse -Force -ErrorAction Stop }
+      Copy-Item -Path (Join-Path $Paths.App "shared") -Destination $Paths.SharedDir -Recurse -Force -ErrorAction Stop
+    } catch { return @{ Ok = $false; Detail = ("rollback parziale: app ripristinata ma ext/shared no: " + $_.Exception.Message) } }
+    try {
+      if ($null -ne $TaskStarter) { & $TaskStarter $Paths.TaskName; & $TaskStarter $Paths.RemoteTaskName }
+      else { Start-ScheduledTask -TaskName $Paths.TaskName -ErrorAction Stop; Start-ScheduledTask -TaskName $Paths.RemoteTaskName -ErrorAction Stop }
+    } catch { return @{ Ok = $false; Detail = ("rollback: app ripristinata ma restart task fallito: " + $_.Exception.Message) } }
+    $hmsg = "non riverificata"
+    try {
+      if ($null -ne $HealthChecker) { $h = & $HealthChecker }
+      else { $h = Invoke-HealthCheck -Paths $Paths -PiBin $PiBin }
+      if ($h.Ok) { $hmsg = "OK" } else { $hmsg = ("FAIL: " + (($h.Failures) -join "; ")) }
+    } catch { $hmsg = ("errore: " + $_.Exception.Message) }
+    return @{ Ok = $true; Detail = ("rollback eseguito da " + $BackupPath + "; health rollback: " + $hmsg) }
+  } catch { return @{ Ok = $false; Detail = ("rollback interrotto: " + $_.Exception.Message) } }
 }
 
 <#

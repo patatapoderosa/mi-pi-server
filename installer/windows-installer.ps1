@@ -142,7 +142,7 @@ if (-not (Test-IsAdmin)) {
 }
 
 try {
-  Start-Transcript -Path $LogFile -Append | Out-Null
+  Start-Transcript -Path $Paths.InstallerTranscript -Append | Out-Null
 } catch {
   # Transcript is a bonus; Write-InstallLog still writes the file.
 }
@@ -222,17 +222,30 @@ if ($Force) {
   L "-Force: checkpoint ignorato, verifica/rieseguo tutto" "WARN"
 }
 if ($FromStep -lt 0 -or $FromStep -gt 11) { Write-Host "-FromStep ignorato (range 1-11)." -ForegroundColor Yellow; $FromStep = 0 }
+# Auto-update detection: the one-liner never passes -Update, so an existing
+# install with a different VERSION than the requested target must still use
+# backup-preserving semantics. -Update stays as explicit override.
+$installedVer = ""
+try { $installedVer = ((Get-Content -LiteralPath $Paths.VersionFile -Raw -ErrorAction Stop).Trim()) } catch { }
+if ((-not $Update) -and (Test-ShouldAutoUpdate -InstalledVersion $installedVer -TargetVersion $Version)) {
+  $Mode = "update"
+  L ("auto-update rilevato (installata=" + $installedVer + " target=" + $Version + "): backup preservato") "WARN"
+}
+$script:DeployWillRun = $false
 foreach ($s in $script:StepCatalog) {
   $run = $true
   if ($Force) { $run = $true }
   elseif ($FromStep -gt 0 -and $s.N -ge $FromStep) { $run = $true }
   elseif ($Mode -eq "update" -and $s.Name -eq "deploy") { $run = $true }
+  elseif (($Version -ne "latest") -and ($Version -ne "") -and ($s.Name -eq "deploy") -and ($script:InstallState.targetRelease -ne "") -and ($script:InstallState.targetRelease -ne $Version)) { $run = $true }
   elseif ($script:InstallState.completedSteps -contains $s.Name) {
     $ok = $false
     try { $ok = Test-StepRealState -Step $s.Name -Paths $Paths -ExpectedRelease $Version } catch { $ok = $false }
     if ($ok) { $run = $false }
   }
   $script:StepSkip[$s.Name] = (-not $run)
+  if ($s.Name -eq "deploy") { $script:DeployWillRun = (-not $script:StepSkip.deploy) }
+  if ((($s.Name -eq "tasks") -or ($s.Name -eq "health")) -and $script:DeployWillRun) { $script:StepSkip[$s.Name] = $false }
 }
 if ($stFile.Corrupt -or $Force -or ($script:InstallState.lastSuccessfulStep -ne "") -or ($script:InstallState.completedSteps.Count -gt 0)) {
   Write-Host ""
@@ -585,7 +598,20 @@ try {
   $ver = [string]$script:InstallState.targetRelease
   if ([string]::IsNullOrWhiteSpace($ver) -or ($ver -eq "latest")) { $ver = $Version }
   if ($ver -eq "latest") { $ver = "latest@$(Get-Date -Format 'yyyyMMdd')" }
-  $st = Invoke-AppStaging -PayloadDir $payload -AppPath $Paths.App -Mode $Mode -VersionLabel $ver
+  $haveVerNow = ""
+  try { $haveVerNow = ((Get-Content -LiteralPath $Paths.VersionFile -Raw -ErrorAction Stop).Trim()) } catch { }
+  $effMode = $Mode
+  if (Test-ShouldAutoUpdate -InstalledVersion $haveVerNow -TargetVersion $ver) { $effMode = "update" }
+  if (($effMode -eq "update") -and ($Mode -ne "update")) { L ("auto-update in step 6 (installata=" + $haveVerNow + " target=" + $ver + ")") "WARN" }
+  $remotePortNum = 0
+  try { if ($RemotePort -match "^\d+$") { $remotePortNum = [int]$RemotePort } } catch { }
+  $preSwap = {
+    $stop = Stop-PiServerRuntime -Paths $Paths -RemotePort $remotePortNum
+    L ("runtime stop pre-swap: " + $stop.Detail) "INFO"
+    if (-not $stop.Ok) { throw ("runtime ancora attivo, swap annullato: " + $stop.Detail) }
+    return $null
+  }
+  $st = Invoke-AppStaging -PayloadDir $payload -AppPath $Paths.App -Mode $effMode -VersionLabel $ver -PreSwapAction $preSwap
   if (-not $st.Ok) { throw (New-StepError "Fatal" ("Deploy staging fallito (app esistente intatta): " + $st.Error)) }
   $appBackup = $st.BackupPath
   if ($null -ne $appBackup) { L "backup app -> $appBackup" }
@@ -1006,6 +1032,11 @@ try {
   } catch {
     L "firewall: regola non creata ($($_.Exception.Message)); il bind resta tailnet-only" "WARN"
   }
+  $startPortNum = 0
+  try { if ($RemotePort -match "^\d+$") { $startPortNum = [int]$RemotePort } } catch { }
+  $portGate = Clear-OwnPortListener -Port $startPortNum -Paths $Paths
+  L ("porta " + $RemotePort + ": " + $portGate.Detail) "INFO"
+  if (-not $portGate.Ok) { throw (New-StepError "System" ("Porta remote non avviabile: " + $portGate.Detail)) }
   try {
     Start-ScheduledTask -TaskName $TaskName
     Start-ScheduledTask -TaskName $remoteTask
@@ -1068,21 +1099,15 @@ try {
   Start-Sleep -Seconds 10
   $hc = Invoke-HealthCheck -Paths $Paths -PiBin $piCmd
   if (-not $hc.Ok) {
-    if (($Mode -eq "update") -and ($null -ne $appBackup)) {
-      L ("health check fallito (" + ($hc.Failures -join "; ") + "): ROLLBACK a " + $appBackup) "FAIL"
-      if (Test-Path -LiteralPath $Paths.App) {
-        Remove-Item -LiteralPath $Paths.App -Recurse -Force
-      }
-      Move-Item -LiteralPath $appBackup -Destination $Paths.App -Force
-      # The extension copy in data/ already has NEW code: restore it from the old app too.
-      $rbExt = Join-Path $Paths.ExtDir "pi-remote-config"
-      if (Test-Path -LiteralPath $rbExt) { Remove-Item -LiteralPath $rbExt -Recurse -Force }
-      Copy-Item -Path (Join-Path $Paths.App "server\pi-remote-config") -Destination $rbExt -Recurse -Force
-      if (Test-Path -LiteralPath $Paths.SharedDir) { Remove-Item -LiteralPath $Paths.SharedDir -Recurse -Force }
-      Copy-Item -Path (Join-Path $Paths.App "shared") -Destination $Paths.SharedDir -Recurse -Force
-      try { Start-ScheduledTask -TaskName $TaskName } catch { }
-      try { Start-ScheduledTask -TaskName $Paths.RemoteTaskName } catch { }
-      throw (New-StepError "System" ("Update fallito, rollback eseguito. Errori: " + ($hc.Failures -join "; ")))
+    $canRb = (($null -ne $appBackup) -and (Test-Path -LiteralPath $appBackup))
+    if ($canRb) {
+      L ("health check fallito (" + ($hc.Failures -join "; ") + "): ROLLBACK transazionale da " + $appBackup) "FAIL"
+      $rbPortNum = 0
+      try { if ($RemotePort -match "^\d+$") { $rbPortNum = [int]$RemotePort } } catch { }
+      $rb = Invoke-AppRollback -Paths $Paths -BackupPath $appBackup -PiBin $piCmd -RemotePort $rbPortNum
+      if (-not $rb.Ok) { throw (New-StepError "System" ("Update fallito, ROLLBACK FALLITO: " + $rb.Detail + ". Errori health: " + ($hc.Failures -join "; "))) }
+      L ("rollback: " + $rb.Detail) "WARN"
+      throw (New-StepError "System" ("Update fallito, rollback eseguito. " + $rb.Detail + " Errori health: " + ($hc.Failures -join "; ")))
     }
     throw (New-StepError "System" ("Health check fallito: " + ($hc.Failures -join "; ")))
   }
@@ -1111,7 +1136,7 @@ try {
     Write-Host "Copia di sicurezza (ACL ristretta): $onceFile"
     Write-Host "ELIMINALO dopo aver configurato il Mac."
     Write-Host ""
-    try { Start-Transcript -Path $LogFile -Append | Out-Null } catch { }
+    try { Start-Transcript -Path $Paths.InstallerTranscript -Append | Out-Null } catch { }
     L "HMAC mostrato una volta a schermo + hmac-once.txt (da eliminare)" "WARN"
   }
 

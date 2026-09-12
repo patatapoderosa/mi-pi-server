@@ -879,6 +879,139 @@ try {
   Assert-True (-not (Test-TaskDefinition -TaskName "T" -ExpectedFile $oldRoot.RunTask -ExpectedWorkDir $oldWd -TaskReader $rOld)) "task v0.2.5 invalida il real-state"
   Remove-Variable -Name ttGood,ttStale,ttMulti,ttExe,ttWd,ttUser,ttDiag,ttOld -Scope Global -ErrorAction SilentlyContinue
 
+  Write-Host "== transactional upgrade (auto-update, stop, swap, rollback) =="
+  Assert-True (-not (Test-ShouldAutoUpdate -InstalledVersion "" -TargetVersion "v0.2.8")) "fresh install mai update"
+  Assert-True (-not (Test-ShouldAutoUpdate -InstalledVersion "v0.2.7" -TargetVersion "v0.2.7")) "stessa versione mai update"
+  Assert-True (Test-ShouldAutoUpdate -InstalledVersion "v0.2.6" -TargetVersion "v0.2.7") "versione diversa auto-update"
+  Assert-True (Test-ShouldAutoUpdate -InstalledVersion "v0.2.6" -TargetVersion "latest") "latest + installato auto-update"
+  Assert-True (Test-ShouldAutoUpdate -InstalledVersion "v0.2.6" -TargetVersion "") "target vuoto + installato auto-update (fail-safe)"
+  Assert-True (-not (Test-ShouldAutoUpdate -InstalledVersion "" -TargetVersion "latest")) "latest senza installato mai update"
+  $ppPaths = Get-PiServerPaths -Root (Join-Path $TmpRoot "psrv")
+  Assert-True (($ppPaths.InstallerTranscript -ne $ppPaths.InstallerLog)) "transcript separato da installer.log"
+  Assert-True ((Split-Path -Parent $ppPaths.InstallerTranscript) -eq (Split-Path -Parent $ppPaths.InstallerLog)) "transcript nella stessa logs dir"
+  Assert-True ($ppPaths.InstallerTranscript -like "*installer-transcript.log") "nome transcript"
+  $connFree = { param($p) return @() }
+  $oFree = Get-TcpListenerOwner -Port 43128 -ConnectionReader $connFree
+  Assert-True ((-not $oFree.Listening) -and ($oFree.Detail -eq "free")) "porta libera"
+  $connHit = { param($p) return @([PSCustomObject]@{ LocalPort = 43128; State = "Listen"; OwningProcess = 1234 }) }
+  $procHit = { param($x) return @([PSCustomObject]@{ ProcessId = 1234; Name = "node.exe"; CommandLine = "node C:\PiServer\app\server\pi-remote-server\index.ts" }) }
+  $oHit = Get-TcpListenerOwner -Port 43128 -ConnectionReader $connHit -ProcessReader $procHit
+  Assert-True (($oHit.Listening) -and ($oHit.Pid -eq 1234) -and ($oHit.Name -eq "node.exe")) "listener risolto con pid/nome"
+  $oBad = Get-TcpListenerOwner -Port 0 -ConnectionReader $connHit
+  Assert-True (-not $oBad.Listening) "porta invalida"
+  $ownForeign = @{ Listening = $true; Pid = 9999; Name = "other.exe"; CommandLine = "C:\Other\app.exe --serve"; Detail = "x" }
+  Assert-True (-not (Test-PortOwnerIsOurs -Owner $ownForeign -Paths $ppPaths)) "foreign non nostro"
+  $ownOurs = @{ Listening = $true; Pid = 4321; Name = "node.exe"; CommandLine = ("node " + $ppPaths.App + "\server\pi-remote-server\index.ts"); Detail = "x" }
+  Assert-True (Test-PortOwnerIsOurs -Owner $ownOurs -Paths $ppPaths) "approot nostro"
+  $ownMark = @{ Listening = $true; Pid = 4322; Name = "pwsh"; CommandLine = "pi-daemon.mjs --x"; Detail = "x" }
+  Assert-True (Test-PortOwnerIsOurs -Owner $ownMark -Paths $ppPaths) "marker nostro"
+  Assert-True (-not (Test-PortOwnerIsOurs -Owner $null -Paths $ppPaths)) "owner null = false"
+  Assert-True (-not (Test-PortOwnerIsOurs -Owner @{ Listening = $false } -Paths $ppPaths)) "non-listening = false"
+  $global:upKillLog = @()
+  $stopRec = { param($p) $global:upKillLog += $p }
+  $rFreeOwner = { param($x) return @{ Listening = $false; Pid = 0; Name = ""; CommandLine = ""; Detail = "free" } }
+  $cFree = Clear-OwnPortListener -Port 43128 -Paths $ppPaths -OwnerReader $rFreeOwner -Stopper $stopRec
+  Assert-True (($cFree.Ok) -and ($cFree.ActionTaken -eq "none")) "porta libera: nessun kill"
+  Assert-True ($global:upKillLog.Count -eq 0) "nessun kill su porta libera"
+  $global:upForeign = @{ Listening = $true; Pid = 9999; Name = "other.exe"; CommandLine = "C:\Other\app.exe --serve"; Detail = "x" }
+  $rForeign = { param($x) return $global:upForeign }
+  $cFor = Clear-OwnPortListener -Port 43128 -Paths $ppPaths -OwnerReader $rForeign -Stopper $stopRec
+  Assert-True ((-not $cFor.Ok) -and ($cFor.ActionTaken -eq "none") -and ($cFor.Detail -match "9999")) "foreign: fail senza kill"
+  Assert-True ($global:upKillLog.Count -eq 0) "foreign mai killato"
+  $global:upFlapGone = $false
+  $global:upOwn = @{ Listening = $true; Pid = 4321; Name = "node.exe"; CommandLine = ("node " + $ppPaths.App + "\server\x.js"); Detail = "x" }
+  $rFlap = { param($x) if ($global:upFlapGone) { return @{ Listening = $false; Pid = 0; Name = ""; CommandLine = ""; Detail = "free" } } else { return $global:upOwn } }
+  $stopFlap = { param($p) $global:upKillLog += $p; $global:upFlapGone = $true }
+  $cOwn = Clear-OwnPortListener -Port 43128 -Paths $ppPaths -OwnerReader $rFlap -Stopper $stopFlap -TimeoutSec 10
+  Assert-True (($cOwn.Ok) -and ($cOwn.ActionTaken -eq "stopped-pid-4321")) "stale own killato e porta libera"
+  $cPers = Clear-OwnPortListener -Port 43128 -Paths $ppPaths -OwnerReader $rForeign -Stopper $stopRec -TimeoutSec 1
+  Assert-True ((-not $cPers.Ok) -and ($cPers.ActionTaken -eq "none")) "foreign persistente: fail senza retry di kill"
+  $global:upPersOwn = @{ Listening = $true; Pid = 4322; Name = "node.exe"; CommandLine = ("node " + $ppPaths.App + "\server\y.js"); Detail = "x" }
+  $rPersOwn = { param($x) return $global:upPersOwn }
+  $cPersOwn = Clear-OwnPortListener -Port 43128 -Paths $ppPaths -OwnerReader $rPersOwn -Stopper $stopRec -TimeoutSec 1
+  Assert-True ((-not $cPersOwn.Ok) -and ($cPersOwn.ActionTaken -eq "stop-ineffective")) "stale persistente: fail"
+  $rNoTasks = { param($n) return $null }
+  $probeIdle = { return @() }
+  $sIdle = Stop-PiServerRuntime -Paths $ppPaths -RemotePort 43128 -TaskReader $rNoTasks -ProcessProbe $probeIdle -ConnectionReader $connFree
+  Assert-True (($sIdle.Ok) -and (-not $sIdle.WasPiRunning) -and (-not $sIdle.WasRemoteRunning)) "niente task/processi: Ok immediato"
+  $rRun = { param($n) return [PSCustomObject]@{ State = "Running" } }
+  $global:upProcs = @([PSCustomObject]@{ ProcessId = 555; Name = "powershell.exe"; CommandLine = ($ppPaths.App + "\run-task.ps1") })
+  $global:upKilled = $false
+  $global:upKills = @()
+  $probeFlap = { if ($global:upKilled) { return @() } else { return $global:upProcs } }
+  $stopFlap2 = { param($p) $global:upKills += $p; $global:upKilled = $true }
+  $sStop = Stop-PiServerRuntime -Paths $ppPaths -RemotePort 43128 -TaskReader $rRun -ProcessProbe $probeFlap -ConnectionReader $connFree -Stopper $stopFlap2
+  Assert-True (($sStop.Ok) -and $sStop.WasPiRunning -and $sStop.WasRemoteRunning) "task running fermati"
+  Assert-True (($global:upKills.Count -eq 1) -and ($global:upKills[0] -eq 555)) "kill sul pid giusto"
+  $sPers = Stop-PiServerRuntime -Paths $ppPaths -RemotePort 0 -TimeoutSec 1 -TaskReader $rNoTasks -ProcessProbe { return @([PSCustomObject]@{ ProcessId = 556; Name = "node.exe"; CommandLine = ($ppPaths.App + "\server\pi-daemon.mjs") }) } -Stopper { param($p) }
+  Assert-True ((-not $sPers.Ok) -and ($sPers.RemainingProcesses -contains 556)) "processi residui: fail con elenco"
+  $selfPid = 0
+  try { $selfPid = [System.Diagnostics.Process]::GetCurrentProcess().Id } catch { }
+  $global:upSelfHit = $false
+  $sSelf = Stop-PiServerRuntime -Paths $ppPaths -RemotePort 0 -TaskReader $rNoTasks -ProcessProbe { return @([PSCustomObject]@{ ProcessId = $selfPid; Name = "pwsh"; CommandLine = ($ppPaths.App + "\x.ps1") }) } -Stopper { param($p) $global:upSelfHit = $true }
+  Assert-True ($sSelf.Ok -and (-not $global:upSelfHit)) "self mai killato"
+  $rbRoot = Join-Path $TmpRoot "rollback"
+  $rbPaths = Get-PiServerPaths -Root (Join-Path $rbRoot "psrv")
+  $rbApp = $rbPaths.App
+  New-Item -ItemType Directory -Path $rbApp -Force | Out-Null
+  New-Item -ItemType Directory -Path $rbPaths.ExtDir -Force | Out-Null
+  "NEWAPP" | Out-File -LiteralPath (Join-Path $rbApp "VERSION") -Encoding ascii -NoNewline
+  $rbBackup = Join-Path $rbRoot "app.backup-test"
+  New-Item -ItemType Directory -Path (Join-Path $rbBackup "server\pi-remote-config") -Force | Out-Null
+  New-Item -ItemType Directory -Path (Join-Path $rbBackup "shared") -Force | Out-Null
+  "OLDAPP" | Out-File -LiteralPath (Join-Path $rbBackup "VERSION") -Encoding ascii -NoNewline
+  "ext" | Out-File -LiteralPath (Join-Path $rbBackup "server\pi-remote-config\index.ts") -Encoding ascii -NoNewline
+  "sh" | Out-File -LiteralPath (Join-Path $rbBackup "shared\store.ts") -Encoding ascii -NoNewline
+  $global:upStarted = @()
+  $starterOk = { param($n) $global:upStarted += $n }
+  $healthOk = { return @{ Ok = $true; Failures = @() } }
+  $stopOk = { return @{ Ok = $true; Detail = "fermo (fake)" } }
+  $rb = Invoke-AppRollback -Paths $rbPaths -BackupPath $rbBackup -PiBin "" -RemotePort 0 -RuntimeStopper $stopOk -TaskStarter $starterOk -HealthChecker $healthOk
+  Assert-True $rb.Ok "rollback happy path"
+  Assert-Equal (Get-Content -LiteralPath (Join-Path $rbApp "VERSION") -Raw) "OLDAPP" "backup ripristinato"
+  Assert-True ((($global:upStarted -contains $rbPaths.TaskName) -and ($global:upStarted -contains $rbPaths.RemoteTaskName))) "entrambi i task riavviati"
+  Assert-True ($rb.Detail -match "health rollback: OK") "report cita health"
+  Assert-True (-not (Invoke-AppRollback -Paths $rbPaths -BackupPath (Join-Path $rbRoot "assente") -RuntimeStopper $stopOk -TaskStarter $starterOk -HealthChecker $healthOk).Ok) "backup assente: fail"
+  "NEW2" | Out-File -LiteralPath (Join-Path $rbApp "VERSION") -Encoding ascii -NoNewline
+  $stopKo = { return @{ Ok = $false; Detail = "stop rotto (fake)" } }
+  $rbNoStop = Invoke-AppRollback -Paths $rbPaths -BackupPath $rbBackup -RuntimeStopper $stopKo -TaskStarter $starterOk -HealthChecker $healthOk
+  Assert-True ((-not $rbNoStop.Ok) -and ((Get-Content -LiteralPath (Join-Path $rbApp "VERSION") -Raw) -eq "NEW2")) "stop fallito: app intatta"
+  New-Item -ItemType Directory -Path (Join-Path $rbBackup "server\pi-remote-config") -Force | Out-Null
+  New-Item -ItemType Directory -Path (Join-Path $rbBackup "shared") -Force | Out-Null
+  "OLDAPP" | Out-File -LiteralPath (Join-Path $rbBackup "VERSION") -Encoding ascii -NoNewline
+  "ext" | Out-File -LiteralPath (Join-Path $rbBackup "server\pi-remote-config\index.ts") -Encoding ascii -NoNewline
+  "sh" | Out-File -LiteralPath (Join-Path $rbBackup "shared\store.ts") -Encoding ascii -NoNewline
+  $starterKo = { param($n) throw "avvio rotto (fake)" }
+  $rbNoStart = Invoke-AppRollback -Paths $rbPaths -BackupPath $rbBackup -RuntimeStopper $stopOk -TaskStarter $starterKo -HealthChecker $healthOk
+  Assert-True ((-not $rbNoStart.Ok) -and ((Get-Content -LiteralPath (Join-Path $rbApp "VERSION") -Raw) -eq "OLDAPP")) "start fallito: app ripristinata"
+  $hookRoot = Join-Path $TmpRoot "hook"
+  New-Item -ItemType Directory -Path $hookRoot -Force | Out-Null
+  $payH = Join-Path $hookRoot "pay"
+  New-MiniPayload $payH
+  $appH = Join-Path $hookRoot "app"
+  $global:upHookCalls = 0
+  $hookOk = { $global:upHookCalls++; return $null }
+  $stHook = Invoke-AppStaging -PayloadDir $payH -AppPath $appH -Mode "fresh" -VersionLabel "v9.9.9-hook" -PreSwapAction $hookOk
+  Assert-True ($stHook.Ok -and ($global:upHookCalls -eq 1)) "hook eseguito pre-swap"
+  $hookBoom = { return "boom-di-prova" }
+  "SENTINELLA-HOOK" | Out-File -LiteralPath (Join-Path $appH "server\pi-daemon.mjs") -Encoding ascii -NoNewline
+  $stHookBoom = Invoke-AppStaging -PayloadDir $payH -AppPath $appH -Mode "update" -VersionLabel "v9.9.9-boom" -PreSwapAction $hookBoom
+  Assert-True ((-not $stHookBoom.Ok) -and ($stHookBoom.Error -match "boom-di-prova")) "hook con errore blocca swap"
+  Assert-Equal (Get-Content -LiteralPath (Join-Path $appH "server\pi-daemon.mjs") -Raw) "SENTINELLA-HOOK" "live intatta dopo hook fallito"
+  $hookThrow = { throw "eccezione-hook" }
+  $stHookThrow = Invoke-AppStaging -PayloadDir $payH -AppPath $appH -Mode "update" -VersionLabel "v9.9.9-throw" -PreSwapAction $hookThrow
+  Assert-True (-not $stHookThrow.Ok) "hook che lancia blocca swap"
+  $wiUp = Get-Content -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) "windows-installer.ps1") -Raw
+  Assert-True ($wiUp -match "Stop-PiServerRuntime -Paths") "step 6 ferma il runtime pre-swap"
+  Assert-True ($wiUp -match "-PreSwapAction") "staging riceve hook pre-swap"
+  Assert-True ($wiUp -match "Clear-OwnPortListener") "step 9 cancella listener stale"
+  Assert-True ($wiUp -match "Invoke-AppRollback") "step 11 rollback transazionale"
+  Assert-True ($wiUp -match '\$Paths\.InstallerTranscript') "transcript separato"
+  Assert-True ($wiUp -notmatch 'Start-Transcript -Path \$LogFile') "niente transcript su installer.log"
+  Assert-True ($wiUp -match "DeployWillRun") "dipendenze deploy->tasks/health"
+  Assert-True ($wiUp -match "Test-ShouldAutoUpdate") "auto-update detection"
+  Remove-Variable -Name upKillLog,upForeign,upFlapGone,upOwn,upPersOwn,upProcs,upKilled,upKills,upSelfHit,upStarted,upHookCalls -Scope Global -ErrorAction SilentlyContinue
+
   Write-Host "== runtime syntax gate (daemon try/catch v0.2.6) =="
   $nodeCmd = Get-Command node -ErrorAction SilentlyContinue
   if ($null -eq $nodeCmd) {
