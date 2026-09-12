@@ -18,11 +18,7 @@
  */
 import { join } from "node:path";
 import { existsSync } from "node:fs";
-import {
-  atomicWriteJson,
-  backupFile,
-  readJsonFile,
-} from "./store.ts";
+import { atomicWriteJson, backupFile, readJsonFile } from "./store.ts";
 
 /** Thinking levels supported by Pi 0.85.1 (core/defaults.js). */
 export const THINKING_LEVELS = [
@@ -39,8 +35,7 @@ export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 
 export function isValidThinkingLevel(v: unknown): v is ThinkingLevel {
   return (
-    typeof v === "string" &&
-    (THINKING_LEVELS as readonly string[]).includes(v)
+    typeof v === "string" && (THINKING_LEVELS as readonly string[]).includes(v)
   );
 }
 
@@ -87,17 +82,26 @@ function splitColumns(line: string): string[] {
  * must be exactly [provider, model, context, max-out, thinking, images];
  * yes/no columns must be yes/no. Anything else -> error (never guess).
  */
-export function parseListModelsTable(stdout: string): {
-  ok: true;
-  models: PiModelInfo[];
-} | { ok: false; error: string } {
+export function parseListModelsTable(stdout: string):
+  | {
+      ok: true;
+      models: PiModelInfo[];
+    }
+  | { ok: false; error: string } {
   const lines = stdout
     .split(/\r?\n/)
     .map((l) => l.replace(/\s+$/, ""))
     .filter((l) => l.trim().length > 0);
   if (lines.length === 0) return { ok: true, models: [] };
   const header = splitColumns(lines[0]);
-  const want = ["provider", "model", "context", "max-out", "thinking", "images"];
+  const want = [
+    "provider",
+    "model",
+    "context",
+    "max-out",
+    "thinking",
+    "images",
+  ];
   if (
     header.length !== want.length ||
     !want.every((h, i) => header[i]?.toLowerCase() === h)
@@ -117,10 +121,7 @@ export function parseListModelsTable(stdout: string): {
       string,
     ];
     if (!provider || !id) return { ok: false, error: "table_row_mismatch" };
-    if (
-      thinking.toLowerCase() !== "yes" &&
-      thinking.toLowerCase() !== "no"
-    ) {
+    if (thinking.toLowerCase() !== "yes" && thinking.toLowerCase() !== "no") {
       return { ok: false, error: "table_row_mismatch" };
     }
     if (images.toLowerCase() !== "yes" && images.toLowerCase() !== "no") {
@@ -170,9 +171,7 @@ export function normalizeSelection(
     ? (providerMap.get(rawProvider.toLowerCase()) ?? null)
     : null;
   if (rawProvider && !provider) {
-    const known = [...providerMap.values()].sort((a, b) =>
-      a.localeCompare(b),
-    );
+    const known = [...providerMap.values()].sort((a, b) => a.localeCompare(b));
     return {
       ok: false,
       error: `unknown_provider:${rawProvider} (available: ${known.join(", ") || "none"})`,
@@ -194,8 +193,7 @@ export function normalizeSelection(
       if (canonical) {
         provider = canonical;
         pattern = rawModel.substring(slash + 1).trim();
-        if (pattern.length === 0)
-          return { ok: false, error: "model_required" };
+        if (pattern.length === 0) return { ok: false, error: "model_required" };
       }
     }
   }

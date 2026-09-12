@@ -24,7 +24,12 @@
  * supplied paths/processes. Module file names come only from the registered
  * ModuleDefinition; service names only from remote-server.json allowlists.
  */
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import {
+  createServer,
+  type IncomingMessage,
+  type Server,
+  type ServerResponse,
+} from "node:http";
 import { execFile } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -110,7 +115,10 @@ export function loadRemoteServerConfig(agentDir: string): RemoteServerConfig {
       : undefined;
   const skew =
     typeof raw["maxSkewSeconds"] === "number"
-      ? Math.min(3600, Math.max(30, Math.floor(raw["maxSkewSeconds"] as number)))
+      ? Math.min(
+          3600,
+          Math.max(30, Math.floor(raw["maxSkewSeconds"] as number)),
+        )
       : 300;
   const allowed = Array.isArray(raw["allowedServices"])
     ? (raw["allowedServices"] as unknown[]).filter(
@@ -152,7 +160,9 @@ function unauthorized(
   sendJson(res, 401, { ok: false, error, message });
 }
 
-async function readBody(req: IncomingMessage): Promise<
+async function readBody(
+  req: IncomingMessage,
+): Promise<
   | { ok: true; raw: string }
   | { ok: false; error: "body_too_large" | "body_unreadable" }
 > {
@@ -257,10 +267,7 @@ export interface RemoteHttpStatus {
   lastError: unknown;
 }
 
-function moduleView(
-  configDir: string,
-  def: ModuleDefinition,
-): ModuleView {
+function moduleView(configDir: string, def: ModuleDefinition): ModuleView {
   const config = readModuleConfigFile(configDir, def);
   return {
     name: def.name,
@@ -290,9 +297,7 @@ async function collectHttpStatus(ctx: Ctx): Promise<RemoteHttpStatus> {
     memory: {
       totalMb,
       freeMb,
-      usedPct: Math.round(
-        ((totalMb - freeMb) / Math.max(1, totalMb)) * 100,
-      ),
+      usedPct: Math.round(((totalMb - freeMb) / Math.max(1, totalMb)) * 100),
     },
     load: loadavg().map((n) => Math.round(n * 100) / 100),
     modules: BUILTIN_MODULES.map((def) => moduleView(configDir, def)),
@@ -301,7 +306,9 @@ async function collectHttpStatus(ctx: Ctx): Promise<RemoteHttpStatus> {
   };
 }
 
-function coreGates(configDir: string): { ok: true } | { ok: false; error: string; message: string } {
+function coreGates(
+  configDir: string,
+): { ok: true } | { ok: false; error: string; message: string } {
   const core = BUILTIN_MODULES.find((d) => d.name === "core");
   const cfg = core
     ? readModuleConfigFile(configDir, core)
@@ -339,7 +346,9 @@ async function authenticate(
   rawBody: string,
   getHeader: (name: string) => string | string[] | undefined,
   opLabel: string,
-): Promise<{ ok: true; auth: Authed } | { ok: false; error: string; message: string }> {
+): Promise<
+  { ok: true; auth: Authed } | { ok: false; error: string; message: string }
+> {
   const now = Math.floor(Date.now() / 1000);
   const fail = (error: string, message: string) => {
     try {
@@ -352,7 +361,8 @@ async function authenticate(
   const parsed = parseAuthHeaders(getHeader);
   if (!parsed.ok) {
     const messages: Record<string, string> = {
-      missing_auth: "Missing X-Pi-Timestamp / X-Pi-Nonce / X-Pi-Signature headers.",
+      missing_auth:
+        "Missing X-Pi-Timestamp / X-Pi-Nonce / X-Pi-Signature headers.",
       bad_ts: "X-Pi-Timestamp must be unix seconds.",
       bad_nonce: "X-Pi-Nonce malformed.",
       bad_signature_shape: "X-Pi-Signature must be 64 hex chars.",
@@ -373,7 +383,9 @@ async function authenticate(
   if (fresh !== "ok") {
     return fail(
       fresh,
-      fresh === "ts_future" ? "Timestamp too far in the future." : "Timestamp expired.",
+      fresh === "ts_future"
+        ? "Timestamp too far in the future."
+        : "Timestamp expired.",
     );
   }
   if (ctx.store.has(nonce, now)) {
@@ -457,11 +469,29 @@ async function runPi(
     };
     const out = typeof e.stdout === "string" ? e.stdout : "";
     if (e?.killed)
-      return { ok: false, stdout: out, exitCode: null, timedOut: true, spawnFailed: false };
+      return {
+        ok: false,
+        stdout: out,
+        exitCode: null,
+        timedOut: true,
+        spawnFailed: false,
+      };
     if (e?.code === "ENOENT")
-      return { ok: false, stdout: out, exitCode: null, timedOut: false, spawnFailed: true };
+      return {
+        ok: false,
+        stdout: out,
+        exitCode: null,
+        timedOut: false,
+        spawnFailed: true,
+      };
     const code = typeof e?.code === "number" ? (e.code as number) : null;
-    return { ok: false, stdout: out, exitCode: code, timedOut: false, spawnFailed: false };
+    return {
+      ok: false,
+      stdout: out,
+      exitCode: code,
+      timedOut: false,
+      spawnFailed: false,
+    };
   }
 }
 
@@ -489,14 +519,30 @@ async function fetchModelCatalog(
 > {
   const r = await runPi(agentDir, ["--list-models"], LIST_MODELS_TIMEOUT_MS);
   if (r.spawnFailed)
-    return { ok: false, error: "pi_unavailable", message: "pi binary could not be started." };
+    return {
+      ok: false,
+      error: "pi_unavailable",
+      message: "pi binary could not be started.",
+    };
   if (r.timedOut)
-    return { ok: false, error: "pi_timeout", message: "pi --list-models timed out." };
+    return {
+      ok: false,
+      error: "pi_timeout",
+      message: "pi --list-models timed out.",
+    };
   if (!r.ok)
-    return { ok: false, error: "pi_list_failed", message: "pi --list-models exited unsuccessfully." };
+    return {
+      ok: false,
+      error: "pi_list_failed",
+      message: "pi --list-models exited unsuccessfully.",
+    };
   const parsed = parseListModelsTable(r.stdout);
   if (!parsed.ok)
-    return { ok: false, error: "pi_output_unparseable", message: "Could not parse pi --list-models output." };
+    return {
+      ok: false,
+      error: "pi_output_unparseable",
+      message: "Could not parse pi --list-models output.",
+    };
   return { ok: true, models: parsed.models };
 }
 
@@ -505,7 +551,8 @@ async function checkProviderReady(
   provider: string,
 ): Promise<{ ready: boolean; authType: string | null }> {
   // Allowlist shape: provider comes from Pi's own catalog; regex is defense in depth.
-  if (!/^[A-Za-z0-9_.-]+$/.test(provider)) return { ready: false, authType: null };
+  if (!/^[A-Za-z0-9_.-]+$/.test(provider))
+    return { ready: false, authType: null };
   const r = await runPi(
     agentDir,
     ["auth", "check", "--provider", provider, "--json", "--no-refresh"],
@@ -530,9 +577,9 @@ interface SetBody {
   applyNow?: boolean;
 }
 
-function parseSetBody(v: unknown):
-  | { ok: true; value: SetBody }
-  | { ok: false; error: string } {
+function parseSetBody(
+  v: unknown,
+): { ok: true; value: SetBody } | { ok: false; error: string } {
   if (typeof v !== "object" || v === null || Array.isArray(v)) {
     return { ok: false, error: "body_must_be_object" };
   }
@@ -543,7 +590,10 @@ function parseSetBody(v: unknown):
   }
   const out: SetBody = {};
   if (rec["provider"] !== undefined) {
-    if (typeof rec["provider"] !== "string" || (rec["provider"] as string).trim() === "") {
+    if (
+      typeof rec["provider"] !== "string" ||
+      (rec["provider"] as string).trim() === ""
+    ) {
       return { ok: false, error: "provider_must_be_string" };
     }
     out.provider = (rec["provider"] as string).trim();
@@ -551,7 +601,10 @@ function parseSetBody(v: unknown):
   if (rec["model"] === undefined) {
     return { ok: false, error: "model_required" };
   } else {
-    if (typeof rec["model"] !== "string" || (rec["model"] as string).trim() === "") {
+    if (
+      typeof rec["model"] !== "string" ||
+      (rec["model"] as string).trim() === ""
+    ) {
       return { ok: false, error: "model_must_be_string" };
     }
     out.model = (rec["model"] as string).trim();
@@ -595,11 +648,14 @@ async function resolveSelectionLive(
     MAX_PROVIDERS_PROBED,
   );
   const checks = await Promise.all(
-    providers.map(async (p) => [p, await checkProviderReady(agentDir, p)] as const),
+    providers.map(
+      async (p) => [p, await checkProviderReady(agentDir, p)] as const,
+    ),
   );
   const authed = checks.filter(([, a]) => a.ready).map(([p]) => p);
   const norm = normalizeSelection(input, cat.models, authed);
-  if (!norm.ok) return { ok: false, error: norm.error.split(":")[0], message: norm.error };
+  if (!norm.ok)
+    return { ok: false, error: norm.error.split(":")[0], message: norm.error };
   if (!authed.includes(norm.provider)) {
     return {
       ok: false,
@@ -735,7 +791,10 @@ async function handle(
       record(false, message);
       sendJson(res, 500, {
         ok: false,
-        error: message === "settings_corrupt" ? "settings_corrupt" : "settings_unreadable",
+        error:
+          message === "settings_corrupt"
+            ? "settings_corrupt"
+            : "settings_unreadable",
         message,
       });
     }
@@ -754,7 +813,10 @@ async function handle(
       MAX_PROVIDERS_PROBED,
     );
     const checks = await Promise.all(
-      providers.map(async (p) => [p, await checkProviderReady(ctx.opts.agentDir, p)] as const),
+      providers.map(
+        async (p) =>
+          [p, await checkProviderReady(ctx.opts.agentDir, p)] as const,
+      ),
     );
     const authMap = new Map(checks.map(([p, a]) => [p, a]));
     const rows = cat.models.slice(0, MAX_MODELS_RETURNED).map((m) => {
@@ -786,19 +848,28 @@ async function handle(
 
   if (method === "POST" && pathname === "/v1/model/validate") {
     const parsed = parseJsonBody(body.raw);
-    if (!parsed.ok || typeof parsed.value !== "object" || parsed.value === null) {
+    if (
+      !parsed.ok ||
+      typeof parsed.value !== "object" ||
+      parsed.value === null
+    ) {
       record(false, parsed.ok ? "body_must_be_object" : parsed.error);
       sendJson(res, 400, {
         ok: false,
         error: parsed.ok ? "body_must_be_object" : parsed.error,
-        message: "Body must be a JSON object: { provider?, model, thinkingLevel?, applyNow? }.",
+        message:
+          "Body must be a JSON object: { provider?, model, thinkingLevel?, applyNow? }.",
       });
       return;
     }
     const shaped = parseSetBody(parsed.value);
     if (!shaped.ok) {
       record(false, shaped.error);
-      sendJson(res, 400, { ok: false, error: shaped.error, message: shaped.error });
+      sendJson(res, 400, {
+        ok: false,
+        error: shaped.error,
+        message: shaped.error,
+      });
       return;
     }
     const r = await resolveSelectionLive(ctx.opts.agentDir, shaped.value);
@@ -817,7 +888,8 @@ async function handle(
         model: r.model,
         thinkingLevel: shaped.value.thinkingLevel ?? null,
         authenticated: true,
-        message: "Selection is available and authenticated (dry run, nothing written).",
+        message:
+          "Selection is available and authenticated (dry run, nothing written).",
       },
     });
     return;
@@ -827,23 +899,36 @@ async function handle(
     const gate = coreGates(configDir);
     if (!gate.ok) {
       record(false, gate.error);
-      sendJson(res, 403, { ok: false, error: gate.error, message: gate.message });
+      sendJson(res, 403, {
+        ok: false,
+        error: gate.error,
+        message: gate.message,
+      });
       return;
     }
     const parsed = parseJsonBody(body.raw);
-    if (!parsed.ok || typeof parsed.value !== "object" || parsed.value === null) {
+    if (
+      !parsed.ok ||
+      typeof parsed.value !== "object" ||
+      parsed.value === null
+    ) {
       record(false, parsed.ok ? "body_must_be_object" : parsed.error);
       sendJson(res, 400, {
         ok: false,
         error: parsed.ok ? "body_must_be_object" : parsed.error,
-        message: "Body must be a JSON object: { provider?, model, thinkingLevel?, applyNow? }.",
+        message:
+          "Body must be a JSON object: { provider?, model, thinkingLevel?, applyNow? }.",
       });
       return;
     }
     const shaped = parseSetBody(parsed.value);
     if (!shaped.ok) {
       record(false, shaped.error);
-      sendJson(res, 400, { ok: false, error: shaped.error, message: shaped.error });
+      sendJson(res, 400, {
+        ok: false,
+        error: shaped.error,
+        message: shaped.error,
+      });
       return;
     }
     const r = await resolveSelectionLive(ctx.opts.agentDir, shaped.value);
@@ -854,11 +939,14 @@ async function handle(
       return;
     }
     try {
-      const { backup, settingsPath } = writeConfiguredDefault(ctx.opts.agentDir, {
-        provider: r.provider,
-        model: r.model,
-        thinkingLevel: shaped.value.thinkingLevel ?? null,
-      });
+      const { backup, settingsPath } = writeConfiguredDefault(
+        ctx.opts.agentDir,
+        {
+          provider: r.provider,
+          model: r.model,
+          thinkingLevel: shaped.value.thinkingLevel ?? null,
+        },
+      );
       const after = readConfiguredDefault(ctx.opts.agentDir);
       const applyNow = shaped.value.applyNow === true;
       record(true);
@@ -882,7 +970,10 @@ async function handle(
       record(false, message);
       sendJson(res, 500, {
         ok: false,
-        error: message === "settings_corrupt" ? "settings_corrupt" : "settings_write_failed",
+        error:
+          message === "settings_corrupt"
+            ? "settings_corrupt"
+            : "settings_write_failed",
         message,
       });
     }
@@ -916,18 +1007,26 @@ async function handle(
     const gate = coreGates(configDir);
     if (!gate.ok) {
       record(false, gate.error);
-      sendJson(res, 403, { ok: false, error: gate.error, message: gate.message });
+      sendJson(res, 403, {
+        ok: false,
+        error: gate.error,
+        message: gate.message,
+      });
       return;
     }
 
     if (method === "PATCH" && tail === "config") {
       const parsed = parseJsonBody(body.raw);
-      if (!parsed.ok || typeof parsed.value !== "object" || parsed.value === null) {
+      if (
+        !parsed.ok ||
+        typeof parsed.value !== "object" ||
+        parsed.value === null
+      ) {
         record(false, parsed.ok ? "patch_must_be_object" : parsed.error);
         sendJson(res, 400, {
           ok: false,
           error: parsed.ok ? "patch_must_be_object" : parsed.error,
-          message: "Body must be a JSON object: { \"patch\": { ... } }.",
+          message: 'Body must be a JSON object: { "patch": { ... } }.',
         });
         return;
       }
@@ -954,10 +1053,7 @@ async function handle(
       return;
     }
 
-    if (
-      method === "POST" &&
-      (tail === "enable" || tail === "disable")
-    ) {
+    if (method === "POST" && (tail === "enable" || tail === "disable")) {
       const want = tail === "enable";
       try {
         const { config } = applyModulePatchFile(configDir, def, {
@@ -1000,7 +1096,9 @@ export function readAppVersion(appRoot: string | null): string {
       }
       const pkg = join(appRoot, "package.json");
       if (existsSync(pkg)) {
-        const raw = JSON.parse(readFileSync(pkg, "utf8")) as { version?: string };
+        const raw = JSON.parse(readFileSync(pkg, "utf8")) as {
+          version?: string;
+        };
         if (typeof raw.version === "string" && raw.version.length > 0) {
           return raw.version.slice(0, 32);
         }
@@ -1017,7 +1115,9 @@ export interface RemoteServerHandles {
 }
 
 /** Build (but do not listen on) the remote HTTP server. Tests bind it to 127.0.0.1:0. */
-export function createRemoteServer(opts: RemoteServerOptions): RemoteServerHandles {
+export function createRemoteServer(
+  opts: RemoteServerOptions,
+): RemoteServerHandles {
   const agentDir = opts.agentDir;
   ensureDir(agentDir, 0o700);
   const store = new ReplayStore(

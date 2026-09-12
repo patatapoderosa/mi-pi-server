@@ -78,12 +78,8 @@ describe("parseListModelsTable", () => {
   });
 
   it("rejects malformed rows and bad yes/no", () => {
-    const head =
-      "provider  model  context  max-out  thinking  images\n";
-    assert.equal(
-      parseListModelsTable(head + "a  b  c  d  yes\n").ok,
-      false,
-    );
+    const head = "provider  model  context  max-out  thinking  images\n";
+    assert.equal(parseListModelsTable(head + "a  b  c  d  yes\n").ok, false);
     const bad = parseListModelsTable(head + "a  b  c  d  maybe  no\n");
     assert.equal(bad.ok, false);
     if (!bad.ok) assert.equal(bad.error, "table_row_mismatch");
@@ -159,10 +155,7 @@ describe("normalizeSelection", () => {
   });
 
   it("rejects ambiguous bare id, prefers sole authed like Pi", () => {
-    const dup = [
-      ...CATALOG,
-      mkModel("openrouter", "gpt-5.5"),
-    ];
+    const dup = [...CATALOG, mkModel("openrouter", "gpt-5.5")];
     const amb = normalizeSelection({ model: "gpt-5.5" }, dup);
     assert.equal(amb.ok, false);
     if (!amb.ok) assert.match(amb.error, /^model_ambiguous/);
@@ -190,15 +183,10 @@ describe("normalizeSelection", () => {
 
 describe("thinking levels (Pi 0.85.1 core/defaults.js)", () => {
   it("matches the real enum incl. default medium", () => {
-    assert.deepEqual([...THINKING_LEVELS], [
-      "off",
-      "minimal",
-      "low",
-      "medium",
-      "high",
-      "xhigh",
-      "max",
-    ]);
+    assert.deepEqual(
+      [...THINKING_LEVELS],
+      ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+    );
     assert.equal(isValidThinkingLevel("medium"), true);
     assert.equal(isValidThinkingLevel("ultra"), false);
     assert.equal(isValidThinkingLevel(""), false);
@@ -238,19 +226,17 @@ describe("settings.json read/write (server agentDir only)", () => {
         thinkingLevel: "high",
       });
       assert.ok(w.backup !== null);
-      const raw = JSON.parse(readFileSync(join(dir, "settings.json"), "utf8")) as Record<
-        string,
-        unknown
-      >;
+      const raw = JSON.parse(
+        readFileSync(join(dir, "settings.json"), "utf8"),
+      ) as Record<string, unknown>;
       assert.equal(raw["defaultProvider"], "anthropic");
       assert.equal(raw["defaultModel"], "claude-opus-4-8");
       assert.equal(raw["defaultThinkingLevel"], "high");
       assert.equal(raw["theme"], "dark");
       assert.deepEqual(raw["retry"], { maxRetries: 3 });
-      const back = JSON.parse(readFileSync(w.backup as string, "utf8")) as Record<
-        string,
-        unknown
-      >;
+      const back = JSON.parse(
+        readFileSync(w.backup as string, "utf8"),
+      ) as Record<string, unknown>;
       assert.equal(back["defaultModel"], "old");
       const got = readConfiguredDefault(dir);
       assert.equal(got.provider, "anthropic");
@@ -270,10 +256,9 @@ describe("settings.json read/write (server agentDir only)", () => {
         JSON.stringify({ defaultThinkingLevel: "low" }),
       );
       writeConfiguredDefault(dir, { provider: "p", model: "m" });
-      const raw = JSON.parse(readFileSync(join(dir, "settings.json"), "utf8")) as Record<
-        string,
-        unknown
-      >;
+      const raw = JSON.parse(
+        readFileSync(join(dir, "settings.json"), "utf8"),
+      ) as Record<string, unknown>;
       assert.equal(raw["defaultThinkingLevel"], "low");
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -308,7 +293,10 @@ describe("resolvePiBin", () => {
       assert.equal(resolvePiBin(dir), null);
       const fake = join(dir, "pi.exe");
       writeFileSync(fake, "x");
-      writeFileSync(join(dir, "runtime-env.json"), JSON.stringify({ PiBin: fake }));
+      writeFileSync(
+        join(dir, "runtime-env.json"),
+        JSON.stringify({ PiBin: fake }),
+      );
       assert.equal(resolvePiBin(dir), fake);
     } finally {
       rmSync(dir, { recursive: true, force: true });

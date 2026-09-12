@@ -7,14 +7,16 @@ import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import {
+  mkdtempSync,
+  rmSync,
+  readFileSync,
+  writeFileSync,
+  mkdirSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import {
-  createNonce,
-  sha256Hex,
-  signRequest,
-} from "../shared/protocol.ts";
+import { createNonce, sha256Hex, signRequest } from "../shared/protocol.ts";
 import {
   createRemoteServer,
   loadRemoteServerConfig,
@@ -49,8 +51,7 @@ interface Started {
 
 async function boot(agentDir?: string): Promise<Started> {
   const owned = agentDir === undefined;
-  const dir =
-    agentDir ?? mkdtempSync(join(tmpdir(), "pi-remote-test-"));
+  const dir = agentDir ?? mkdtempSync(join(tmpdir(), "pi-remote-test-"));
   mkdirSync(join(dir, "secrets"), { recursive: true });
   writeFileSync(join(dir, "secrets", "remote-hmac"), SECRET);
   const { server } = createRemoteServer({
@@ -200,7 +201,9 @@ describe("authenticated happy paths", () => {
     assert.ok(typeof body["hostname"] === "string");
     assert.ok(typeof body["node"] === "string");
     assert.ok(Array.isArray(body["modules"]));
-    const names = (body["modules"] as Array<{ name: string }>).map((m) => m.name);
+    const names = (body["modules"] as Array<{ name: string }>).map(
+      (m) => m.name,
+    );
     assert.ok(names.includes("core"));
     assert.ok(names.includes("example-monitor"));
     const dumped = JSON.stringify(body);
@@ -210,7 +213,11 @@ describe("authenticated happy paths", () => {
   it("GET /v1/modules lists modules with configs", async () => {
     const r = await signed(s.port, "/v1/modules", {});
     assert.equal(r.status, 200);
-    const mods = (r.json["body"] as { modules: Array<{ name: string; enabled: boolean | null }> }).modules;
+    const mods = (
+      r.json["body"] as {
+        modules: Array<{ name: string; enabled: boolean | null }>;
+      }
+    ).modules;
     assert.equal(mods.length, 2);
     const mon = mods.find((m) => m.name === "example-monitor");
     assert.equal(mon?.enabled, true);
@@ -223,12 +230,17 @@ describe("authenticated happy paths", () => {
     });
     assert.equal(r.status, 200);
     const onDisk = JSON.parse(
-      readFileSync(join(s.agentDir, "server-config", "example-monitor.json"), "utf8"),
+      readFileSync(
+        join(s.agentDir, "server-config", "example-monitor.json"),
+        "utf8",
+      ),
     ) as Record<string, unknown>;
     assert.equal(onDisk["intervalMinutes"], 45);
     const st = await signed(s.port, "/v1/modules/example-monitor/status", {});
     assert.equal(
-      (st.json["body"] as { config: Record<string, unknown> }).config["intervalMinutes"],
+      (st.json["body"] as { config: Record<string, unknown> }).config[
+        "intervalMinutes"
+      ],
       45,
     );
   });
@@ -300,7 +312,10 @@ describe("auth failures", () => {
       },
     );
     assert.equal(res.status, 401);
-    assert.equal(((await res.json()) as Record<string, unknown>)["error"], "bad_signature");
+    assert.equal(
+      ((await res.json()) as Record<string, unknown>)["error"],
+      "bad_signature",
+    );
   });
 
   it("expired and future timestamps are rejected", async () => {
@@ -353,14 +368,22 @@ describe("auth failures", () => {
   });
 
   it("invalid patch is 400 with details, file untouched", async () => {
-    const before = await signed(s.port, "/v1/modules/example-monitor/status", {});
+    const before = await signed(
+      s.port,
+      "/v1/modules/example-monitor/status",
+      {},
+    );
     const bad = await signed(s.port, "/v1/modules/example-monitor/config", {
       method: "PATCH",
       body: JSON.stringify({ patch: { intervalMinutes: 99999, evil: 1 } }),
     });
     assert.equal(bad.status, 400);
     assert.equal(bad.json["error"], "invalid_patch");
-    const after = await signed(s.port, "/v1/modules/example-monitor/status", {});
+    const after = await signed(
+      s.port,
+      "/v1/modules/example-monitor/status",
+      {},
+    );
     assert.deepEqual(after.json["body"], before.json["body"]);
   });
 
@@ -432,7 +455,11 @@ describe("config loading", () => {
       assert.equal(d.bindHost, undefined);
       writeFileSync(
         join(dir, "remote-server.json"),
-        JSON.stringify({ port: 99999, maxSkewSeconds: 5, allowedServices: "x" }),
+        JSON.stringify({
+          port: 99999,
+          maxSkewSeconds: 5,
+          allowedServices: "x",
+        }),
       );
       const d2 = loadRemoteServerConfig(dir);
       assert.equal(d2.port, 43128);
@@ -447,7 +474,10 @@ describe("config loading", () => {
     const dir = mkdtempSync(join(tmpdir(), "pi-remote-ver-"));
     try {
       assert.equal(readAppVersion(dir), "dev");
-      writeFileSync(join(dir, "package.json"), JSON.stringify({ version: "9.9.9" }));
+      writeFileSync(
+        join(dir, "package.json"),
+        JSON.stringify({ version: "9.9.9" }),
+      );
       assert.equal(readAppVersion(dir), "9.9.9");
       writeFileSync(join(dir, "VERSION"), "vX");
       assert.equal(readAppVersion(dir), "vX");
@@ -478,7 +508,9 @@ describe("migration", () => {
       assert.ok(r.backupPath);
       const kept = readFileSync(join(dir, "secrets", "remote-hmac"), "utf8");
       assert.equal(kept, "keep-me");
-      const cfg = JSON.parse(readFileSync(join(dir, "remote-server.json"), "utf8")) as Record<string, unknown>;
+      const cfg = JSON.parse(
+        readFileSync(join(dir, "remote-server.json"), "utf8"),
+      ) as Record<string, unknown>;
       assert.equal(cfg["port"], 43128);
       assert.equal(cfg["maxSkewSeconds"], 600);
       assert.ok(!("allowedControlBotId" in cfg));
@@ -504,11 +536,17 @@ describe("migration", () => {
       );
       writeFileSync(
         join(dir, "remote-server.json"),
-        JSON.stringify({ port: 1234, maxSkewSeconds: 300, allowedServices: [] }),
+        JSON.stringify({
+          port: 1234,
+          maxSkewSeconds: 300,
+          allowedServices: [],
+        }),
       );
       const r = migrateLegacyConfig(dir);
       assert.equal(r.migrated, true);
-      const cfg = JSON.parse(readFileSync(join(dir, "remote-server.json"), "utf8")) as Record<string, unknown>;
+      const cfg = JSON.parse(
+        readFileSync(join(dir, "remote-server.json"), "utf8"),
+      ) as Record<string, unknown>;
       assert.equal(cfg["port"], 1234);
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -552,7 +590,10 @@ describe("tailscale bind resolution", () => {
   it("reads the first valid line from tailscale output", () => {
     const ip = getTailscaleIpv4(() => "100.99.8.7\nfd7a:115c::123\n");
     assert.equal(ip, "100.99.8.7");
-    assert.equal(getTailscaleIpv4(() => "nope"), null);
+    assert.equal(
+      getTailscaleIpv4(() => "nope"),
+      null,
+    );
     assert.equal(
       getTailscaleIpv4(() => {
         throw new Error("missing binary");
@@ -580,7 +621,9 @@ describe("client transport failures", () => {
     const hanging = createServer(() => {
       // never respond
     });
-    await new Promise<void>((resolve) => hanging.listen(0, "127.0.0.1", resolve));
+    await new Promise<void>((resolve) =>
+      hanging.listen(0, "127.0.0.1", resolve),
+    );
     const port = (hanging.address() as AddressInfo).port;
     try {
       await fetch(`http://127.0.0.1:${port}/v1/ping`, {
@@ -787,7 +830,10 @@ describe("server_model routes (fake pi on PATH)", () => {
   it("POST /v1/model rejects bad thinking level and unknown fields", async () => {
     const bad = await signed(s.port, "/v1/model", {
       method: "POST",
-      body: JSON.stringify({ model: "claude-opus-4-8", thinkingLevel: "ultra" }),
+      body: JSON.stringify({
+        model: "claude-opus-4-8",
+        thinkingLevel: "ultra",
+      }),
     });
     assert.equal(bad.status, 400);
     assert.match(String(bad.json["error"]), /invalid_thinking_level/);

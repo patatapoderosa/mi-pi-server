@@ -20,11 +20,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import {
-  createNonce,
-  sha256Hex,
-  signRequest,
-} from "../../shared/protocol.ts";
+import { createNonce, sha256Hex, signRequest } from "../../shared/protocol.ts";
 import { readJsonFile } from "../../shared/store.ts";
 
 const execFileAsync = promisify(execFile);
@@ -118,8 +114,7 @@ async function remoteCall(
     nonce,
     bodyHash: sha256Hex(rawBody),
   });
-  const timeoutMs =
-    (timeoutOverrideSec ?? cfg.timeoutSeconds ?? 30) * 1000;
+  const timeoutMs = (timeoutOverrideSec ?? cfg.timeoutSeconds ?? 30) * 1000;
   let res: Response;
   try {
     res = await fetch(cfg.serverBaseUrl + path, {
@@ -196,8 +191,15 @@ function failResult(prefix: string, err: unknown): TextResult {
 }
 
 function summarizeModules(body: unknown): string {
-  const mods = (body as { modules?: Array<{ name: string; enabled: boolean | null; config: unknown }> })
-    ?.modules;
+  const mods = (
+    body as {
+      modules?: Array<{
+        name: string;
+        enabled: boolean | null;
+        config: unknown;
+      }>;
+    }
+  )?.modules;
   if (!Array.isArray(mods)) return "No module list in reply.";
   return mods
     .map((m) => {
@@ -223,7 +225,10 @@ export default function piRemoteExtension(pi: ExtensionAPI): void {
     try {
       const cfg = loadMacConfig();
       if (!cfg) {
-        ctx.ui.notify(`${LOG} not configured yet — run mac/setup-mac.sh`, "warning");
+        ctx.ui.notify(
+          `${LOG} not configured yet — run mac/setup-mac.sh`,
+          "warning",
+        );
         return;
       }
       ctx.ui.notify(`${LOG} ready (${cfg.serverBaseUrl})`, "info");
@@ -257,11 +262,21 @@ export default function piRemoteExtension(pi: ExtensionAPI): void {
           typeof params.timeoutSeconds === "number"
             ? Math.min(120, Math.max(5, params.timeoutSeconds))
             : undefined;
-        const resp = await remoteCall(cfg, hmac, "GET", "/v1/status", undefined, timeout);
+        const resp = await remoteCall(
+          cfg,
+          hmac,
+          "GET",
+          "/v1/status",
+          undefined,
+          timeout,
+        );
         if (!resp.ok) {
           return {
             content: [
-              { type: "text", text: `❌ Server refused: ${resp.error ?? "unknown"}` },
+              {
+                type: "text",
+                text: `❌ Server refused: ${resp.error ?? "unknown"}`,
+              },
             ],
             details: { ok: false, error: resp.error },
           };
@@ -395,7 +410,10 @@ export default function piRemoteExtension(pi: ExtensionAPI): void {
         details: { ok: true, body: resp.body },
       };
     } catch (err) {
-      return failResult(want ? "Remote enable failed" : "Remote disable failed", err);
+      return failResult(
+        want ? "Remote enable failed" : "Remote disable failed",
+        err,
+      );
     }
   }
 
@@ -412,7 +430,8 @@ export default function piRemoteExtension(pi: ExtensionAPI): void {
     description:
       "Enable a module on the 24/7 Pi server node (Windows, over Tailscale). " +
       "Use automatically for 'enable module X', 'attiva il modulo X', 'riattiva il monitor'.",
-    promptSnippet: "remote_module_enable flips a module's enabled flag on via signed HTTPS",
+    promptSnippet:
+      "remote_module_enable flips a module's enabled flag on via signed HTTPS",
     promptGuidelines: [
       "Prefer this over remote_server_config when the user says enable/activate/riattiva.",
     ],
@@ -460,7 +479,7 @@ export default function piRemoteExtension(pi: ExtensionAPI): void {
       "server_model_get reads the server startup model default via signed HTTPS",
     promptGuidelines: [
       "Whenever the user asks which model the server uses or has configured, call server_model_get — do not answer from memory.",
-      "Always report whether a restart is needed for a pending default to take effect."
+      "Always report whether a restart is needed for a pending default to take effect.",
     ],
     parameters: Type.Object({ timeoutSeconds: TimeoutSchema }),
     executionMode: "sequential",
@@ -471,18 +490,46 @@ export default function piRemoteExtension(pi: ExtensionAPI): void {
           typeof params.timeoutSeconds === "number"
             ? Math.min(120, Math.max(5, params.timeoutSeconds))
             : undefined;
-        const resp = await remoteCall(cfg, hmac, "GET", "/v1/model", undefined, timeout);
+        const resp = await remoteCall(
+          cfg,
+          hmac,
+          "GET",
+          "/v1/model",
+          undefined,
+          timeout,
+        );
         if (!resp.ok) {
           return {
-            content: [{ type: "text", text: `❌ Server refused (${resp.error ?? "unknown"}): ${resp.message ?? "no detail"}` }],
+            content: [
+              {
+                type: "text",
+                text: `❌ Server refused (${resp.error ?? "unknown"}): ${resp.message ?? "no detail"}`,
+              },
+            ],
             details: { ok: false, error: resp.error },
           };
         }
-        const b = resp.body as { provider?: unknown; model?: unknown; thinkingLevel?: unknown; source?: unknown; requiresRestart?: unknown; note?: unknown };
-        const lines =
-          b.provider
-            ? [`🤖 server startup default: ${b.provider}/${b.model}`, `thinking: ${b.thinkingLevel ?? "(Pi default)"}`, `source: ${b.source ?? "settings.json"}`, b.requiresRestart ? "takes effect at next Pi start (restart PiHomeServer to apply now)" : "active", `${b.note ?? ""}`]
-            : ["🤖 server has no default model configured (Pi falls back to first available at startup)." ];
+        const b = resp.body as {
+          provider?: unknown;
+          model?: unknown;
+          thinkingLevel?: unknown;
+          source?: unknown;
+          requiresRestart?: unknown;
+          note?: unknown;
+        };
+        const lines = b.provider
+          ? [
+              `🤖 server startup default: ${b.provider}/${b.model}`,
+              `thinking: ${b.thinkingLevel ?? "(Pi default)"}`,
+              `source: ${b.source ?? "settings.json"}`,
+              b.requiresRestart
+                ? "takes effect at next Pi start (restart PiHomeServer to apply now)"
+                : "active",
+              `${b.note ?? ""}`,
+            ]
+          : [
+              "🤖 server has no default model configured (Pi falls back to first available at startup).",
+            ];
         return {
           content: [{ type: "text", text: lines.join("\n") }],
           details: { ok: true, body: resp.body },
@@ -503,7 +550,7 @@ export default function piRemoteExtension(pi: ExtensionAPI): void {
       "server_model_list fetches the live server model catalog with auth status via signed HTTPS",
     promptGuidelines: [
       "Whenever the user asks which models are available on the server, call server_model_list — do not answer from memory.",
-      "Only models with ready auth (authenticated: true) can be set as default."
+      "Only models with ready auth (authenticated: true) can be set as default.",
     ],
     parameters: Type.Object({ timeoutSeconds: TimeoutSchema }),
     executionMode: "sequential",
@@ -514,23 +561,52 @@ export default function piRemoteExtension(pi: ExtensionAPI): void {
           typeof params.timeoutSeconds === "number"
             ? Math.min(120, Math.max(5, params.timeoutSeconds))
             : 60;
-        const resp = await remoteCall(cfg, hmac, "GET", "/v1/models", undefined, timeout);
+        const resp = await remoteCall(
+          cfg,
+          hmac,
+          "GET",
+          "/v1/models",
+          undefined,
+          timeout,
+        );
         if (!resp.ok) {
           return {
-            content: [{ type: "text", text: `❌ Server refused (${resp.error ?? "unknown"}): ${resp.message ?? "no detail"}` }],
+            content: [
+              {
+                type: "text",
+                text: `❌ Server refused (${resp.error ?? "unknown"}): ${resp.message ?? "no detail"}`,
+              },
+            ],
             details: { ok: false, error: resp.error },
           };
         }
-        const body = resp.body as { models?: Array<{ provider?: unknown; id?: unknown; thinking?: unknown; images?: unknown; context?: unknown; authenticated?: unknown }> ; truncated?: unknown };
+        const body = resp.body as {
+          models?: Array<{
+            provider?: unknown;
+            id?: unknown;
+            thinking?: unknown;
+            images?: unknown;
+            context?: unknown;
+            authenticated?: unknown;
+          }>;
+          truncated?: unknown;
+        };
         const models = Array.isArray(body.models) ? body.models : [];
         if (models.length === 0) {
           return {
-            content: [{ type: "text", text: "🤖 server reports no available models (no logins on the server?)." }],
+            content: [
+              {
+                type: "text",
+                text: "🤖 server reports no available models (no logins on the server?).",
+              },
+            ],
             details: { ok: true, body: resp.body },
           };
         }
         const lines = models.map((m) => {
-          const flags = [`${m.authenticated === true ? "✅" : "🔒"} ${m.provider}/${m.id}`];
+          const flags = [
+            `${m.authenticated === true ? "✅" : "🔒"} ${m.provider}/${m.id}`,
+          ];
           const caps: string[] = [];
           if (m.thinking === true) caps.push("thinking");
           if (m.images === true) caps.push("images");
@@ -561,45 +637,90 @@ export default function piRemoteExtension(pi: ExtensionAPI): void {
     promptGuidelines: [
       "Whenever the user wants to change the server default model, call server_model_set with provider + model.",
       "If unsure which model, call server_model_list first and pick an authenticated one.",
-      "After setting, always report whether a PiHomeServer restart is needed."
+      "After setting, always report whether a PiHomeServer restart is needed.",
     ],
     parameters: Type.Object({
-      provider: Type.Optional(Type.String({ description: "Provider id, e.g. openai (optional if model is provider/model)" })),
-      model: Type.String({ description: "Model id, e.g. gpt-5.5 (exact id as listed)" }),
-      thinkingLevel: Type.Optional(Type.Union([
-        Type.Literal("off"),
-        Type.Literal("minimal"),
-        Type.Literal("low"),
-        Type.Literal("medium"),
-        Type.Literal("high"),
-        Type.Literal("xhigh"),
-        Type.Literal("max"),
-      ], { description: "Startup thinking level (optional)" })),
-      applyNow: Type.Optional(Type.Boolean({ description: "Record intent to apply immediately (still requires a PiHomeServer restart)" })),
+      provider: Type.Optional(
+        Type.String({
+          description:
+            "Provider id, e.g. openai (optional if model is provider/model)",
+        }),
+      ),
+      model: Type.String({
+        description: "Model id, e.g. gpt-5.5 (exact id as listed)",
+      }),
+      thinkingLevel: Type.Optional(
+        Type.Union(
+          [
+            Type.Literal("off"),
+            Type.Literal("minimal"),
+            Type.Literal("low"),
+            Type.Literal("medium"),
+            Type.Literal("high"),
+            Type.Literal("xhigh"),
+            Type.Literal("max"),
+          ],
+          { description: "Startup thinking level (optional)" },
+        ),
+      ),
+      applyNow: Type.Optional(
+        Type.Boolean({
+          description:
+            "Record intent to apply immediately (still requires a PiHomeServer restart)",
+        }),
+      ),
       timeoutSeconds: TimeoutSchema,
     }),
     executionMode: "sequential",
     async execute(_toolCallId, params): Promise<TextResult> {
       try {
         const { cfg, hmac } = await setupCall();
-        const payload: Record<string, unknown> = { model: params.model as string };
-        if (typeof params.provider === "string") payload["provider"] = params.provider;
-        if (typeof params.thinkingLevel === "string") payload["thinkingLevel"] = params.thinkingLevel;
-        if (typeof params.applyNow === "boolean") payload["applyNow"] = params.applyNow;
+        const payload: Record<string, unknown> = {
+          model: params.model as string,
+        };
+        if (typeof params.provider === "string")
+          payload["provider"] = params.provider;
+        if (typeof params.thinkingLevel === "string")
+          payload["thinkingLevel"] = params.thinkingLevel;
+        if (typeof params.applyNow === "boolean")
+          payload["applyNow"] = params.applyNow;
         const timeout =
           typeof params.timeoutSeconds === "number"
             ? Math.min(120, Math.max(5, params.timeoutSeconds))
             : 60;
-        const resp = await remoteCall(cfg, hmac, "POST", "/v1/model", payload, timeout);
+        const resp = await remoteCall(
+          cfg,
+          hmac,
+          "POST",
+          "/v1/model",
+          payload,
+          timeout,
+        );
         if (!resp.ok) {
           return {
-            content: [{ type: "text", text: `❌ Server refused (${resp.error ?? "unknown"}): ${resp.message ?? "no detail"}` }],
+            content: [
+              {
+                type: "text",
+                text: `❌ Server refused (${resp.error ?? "unknown"}): ${resp.message ?? "no detail"}`,
+              },
+            ],
             details: { ok: false, error: resp.error },
           };
         }
-        const b = resp.body as { provider?: unknown; model?: unknown; thinkingLevel?: unknown; requiresRestart?: unknown; message?: unknown };
+        const b = resp.body as {
+          provider?: unknown;
+          model?: unknown;
+          thinkingLevel?: unknown;
+          requiresRestart?: unknown;
+          message?: unknown;
+        };
         return {
-          content: [{ type: "text", text: `✅ server default is now ${b.provider}/${b.model} (thinking: ${b.thinkingLevel ?? "(unchanged)"}). ${b.message ?? ""}` }],
+          content: [
+            {
+              type: "text",
+              text: `✅ server default is now ${b.provider}/${b.model} (thinking: ${b.thinkingLevel ?? "(unchanged)"}). ${b.message ?? ""}`,
+            },
+          ],
           details: { ok: true, body: resp.body },
         };
       } catch (err) {
