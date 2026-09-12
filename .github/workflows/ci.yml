@@ -56,3 +56,8 @@ jobs:
         run: |
           powershell.exe -NoProfile -NonInteractive `
             -File installer/tests/Invoke-SmokeTests.ps1
+      - name: Real .cmd spawn test (pi-daemon production path)
+        shell: pwsh
+        run: |
+          node --version
+          node --test tests/spawn-pi.test.ts
