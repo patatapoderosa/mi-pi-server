@@ -74,6 +74,8 @@ try {
   '@echo {"type":"e2e-stub-ready"}' | Out-File -LiteralPath $stub -Encoding ascii -NoNewline
   Add-Content -LiteralPath $stub -Value "" -Encoding ascii
   Add-Content -LiteralPath $stub -Value "ping -n 60 127.0.0.1 >nul" -Encoding ascii
+  # NOTE: NpmGlobalBin volutamente assente (chiave opzionale): prova che il
+  # launcher degrada con grazia invece di crashare sotto StrictMode.
   $envObj = @{
     NodeExe      = $nodeCmd.Source
     PiBin        = $stub
@@ -121,6 +123,16 @@ try {
   } catch { }
   if ($alive.Count -ge 1) { Ok "daemon vivo dopo 10s" }
   else { Fail "daemon morto entro 10s" }
+  if ($script:failed.Count -gt 0) {
+    foreach ($lf in @($logPath, (Join-Path (Split-Path -Parent $logPath) "pi-server-error.log"))) {
+      Write-Host ("--- " + $lf) 
+      try {
+        $lc = Get-Content -LiteralPath $lf -Raw -ErrorAction Stop
+        if ([string]::IsNullOrWhiteSpace($lc)) { Write-Host "(vuoto)" }
+        else { Write-Host ($lc.Substring(0, [Math]::Min(2000, $lc.Length))) }
+      } catch { Write-Host "(non leggibile)" }
+    }
+  }
 } catch {
   Fail ("eccezione: " + $_.Exception.Message)
 } finally {

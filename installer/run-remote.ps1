@@ -85,8 +85,10 @@ try {
       }
     }
     if ([string]::IsNullOrWhiteSpace($NodeExe)) { $NodeExe = [string]$env2.NodeExe }
-    if ($NodeArgs.Count -eq 0 -and $null -ne $env2.NodeArgs) {
-      $NodeArgs = @($env2.NodeArgs | ForEach-Object { [string]$_ })
+    $envNodeArgs = $null
+    try { $envNodeArgs = $env2.NodeArgs } catch { }
+    if ($NodeArgs.Count -eq 0 -and $null -ne $envNodeArgs) {
+      $NodeArgs = @($envNodeArgs | ForEach-Object { [string]$_ })
     }
     if ([string]::IsNullOrWhiteSpace($LogDir)) {
       $LogDir = Join-Path (Split-Path -Parent $AppDir) "logs"

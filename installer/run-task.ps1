@@ -87,9 +87,7 @@ try {
   $env:PI_BIN = $env2.PiBin
   $nodeDir = Split-Path -Parent $env2.NodeExe
   $npmBinDir = ""
-  if (-not [string]::IsNullOrWhiteSpace($env2.NpmGlobalBin)) {
-    $npmBinDir = $env2.NpmGlobalBin
-  }
+  try { if (-not [string]::IsNullOrWhiteSpace($env2.NpmGlobalBin)) { $npmBinDir = $env2.NpmGlobalBin } } catch { }
   $parts = @($nodeDir)
   if ($npmBinDir -ne "") { $parts += $npmBinDir }
   $parts += $env:PATH
