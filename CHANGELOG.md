@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.2.5 — 2026-09-12
+
+### Fixed
+
+- Fixed resume crash on Windows (`VariableIsUndefined` for `$piCmd` at step 8/11
+  under `Set-StrictMode`): shared runtime variables were assigned only inside
+  steps that resume can skip, so a fresh PowerShell session had nothing to
+  read. Added resume-safe hydration — new lib resolvers `Resolve-NodeRuntime`,
+  `Resolve-PiRuntime` (+`Get-PiCandidatePaths`: PATH, `npm prefix -g`,
+  `%APPDATA%\npm`, well-known locations, validated `runtime-env.json` hint)
+  and `Resolve-RemotePort` (all never-throw, no network) — plus an unconditional
+  hydration block before step 1 and strict per-step guards (`Resolve-PiOrThrow`
+  / `Resolve-NodeOrThrow`) in steps 4/6/8/11. Covers `$NodeExe`, `$piCmd`,
+  `$NpmGlobalBin`, `$RemotePort`, `$appBackup`, `$hmacShowOnce`; `$tsExe` stays
+  step-local by design.
+- Added 26 regression assertions: static wiring guards (inits, resolver counts,
+  strict-mode pinned on, hydration placed before step 1), port matrix, APPDATA
+  fallback, hint valid/stale, PATH discovery, node validation, absent-Pi null,
+  and a fresh-child-PowerShell hydration run.
+
+### Upgrade notes
+
+- No migration needed: rerun the one-liner (resolves `latest` → v0.2.5).
+- Resume from any checkpoint (including `-FromStep 6/8` in a new shell) now
+  re-resolves tools instead of crashing; genuinely missing tools report a clear
+  `System` error instead of `VariableIsUndefined`.
+
 ## v0.2.4 — 2026-09-12
 
 ### Fixed
