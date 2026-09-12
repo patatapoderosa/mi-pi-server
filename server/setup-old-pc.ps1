@@ -43,7 +43,7 @@ function Fatal([string]$m) { Write-Host "[setup] $m" -ForegroundColor Red; exit 
 
 function Backup-IfExists([string]$Path) {
   if (Test-Path $Path) {
-    $bak = "$Path.bak-$(Get-Date -Format 'yyyyMMddTHHmmssZ')"
+    $bak = "${Path}.bak-$(Get-Date -Format 'yyyyMMddTHHmmssZ')"
     Copy-Item $Path $bak -Force
     Info "backup: $Path -> $bak"
   }
@@ -135,7 +135,13 @@ Info "step 9: telegram.json"
 $tgJson = Join-Path $AgentDir "telegram.json"
 Backup-IfExists $tgJson
 $tg = @{}
-if (Test-Path $tgJson) { $tg = Get-Content $tgJson -Raw | ConvertFrom-Json -AsHashtable }
+if (Test-Path $tgJson) {
+  $old = Get-Content $tgJson -Raw | ConvertFrom-Json
+  if (($null -ne $old) -and ($old -is [PSCustomObject]) -and ($null -ne $old.profiles)) {
+    $tg.profiles = @{}
+    foreach ($pr in @($old.profiles.PSObject.Properties)) { $tg.profiles[$pr.Name] = $pr.Value }
+  }
+}
 if (-not $tg.profiles) { $tg.profiles = @{} }
 $tg.profiles["default"] = @{ botToken = $botToken; allowedUserId = [long]$ownerId }
 $tg | ConvertTo-Json -Depth 6 | Out-File -Encoding utf8 $tgJson
