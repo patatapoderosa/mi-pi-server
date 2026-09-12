@@ -87,7 +87,7 @@ $listed = (pi list 2>$null | Out-String)
 if ($listed -match "pi-telegram") { Info "pi-telegram already installed" }
 else {
   try { pi install "npm:@llblab/pi-telegram" }
-  catch { WarnM "automatic install failed — run manually: pi install npm:@llblab/pi-telegram" }
+  catch { WarnM "automatic install failed -- run manually: pi install npm:@llblab/pi-telegram" }
 }
 
 # --------------------------------------------------------------- dirs ---
@@ -117,7 +117,7 @@ if (-not $hmac) { $hmac = Read-Hidden "HMAC secret (ENTER to generate random)" }
 if (-not $hmac) {
   $hmac = ([BitConverter]::ToString(
     [Security.Cryptography.RandomNumberGenerator]::GetBytes(32))).Replace("-", "").ToLower()
-  Info "generated random HMAC — store the SAME value on the Mac Keychain via mac/setup-mac.sh"
+  Info "generated random HMAC -- store the SAME value on the Mac Keychain via mac/setup-mac.sh"
   Write-Host ""
   Write-Host "    HMAC (copy now, shown once): $hmac"
   Write-Host ""
@@ -315,7 +315,7 @@ Get-ScheduledTask -TaskName "PiServer" | Select-Object TaskName, State | Format-
 try {
   $me = Invoke-RestMethod -Uri "https://api.telegram.org/bot$botToken/getMe" -TimeoutSec 15
   Info "ServerBot getMe ok: @$(($me.result).username)"
-} catch { WarnM "getMe failed — check token + network" }
+} catch { WarnM "getMe failed -- check token + network" }
 
 Write-Host ""
 Write-Host "================ DONE ================" -ForegroundColor Green
