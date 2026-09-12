@@ -49,9 +49,13 @@ describe("buildPiSpawn routing", () => {
   });
 });
 
-function runAndCapture(target: string, timeoutMs = 10000): Promise<string> {
+function runAndCapture(
+  target: string,
+  timeoutMs = 10000,
+): Promise<{ out: string; err: string; code: number | null }> {
   return new Promise((resolve, reject) => {
     let out = "";
+    let err = "";
     let done = false;
     const child = spawnPi(target);
     const timer = setTimeout(() => {
@@ -62,24 +66,27 @@ function runAndCapture(target: string, timeoutMs = 10000): Promise<string> {
         } catch {
           /* already exited */
         }
-        reject(new Error("spawn timed out (no output)"));
+        reject(new Error("spawn timed out (no output). stdout=" + out + " stderr=" + err));
       }
     }, timeoutMs);
     child.stdout?.on("data", (d: unknown) => {
       out += String(d);
     });
-    child.on("error", (err: Error) => {
+    child.stderr?.on("data", (d: unknown) => {
+      err += String(d);
+    });
+    child.on("error", (e: Error) => {
       if (!done) {
         done = true;
         clearTimeout(timer);
-        reject(err);
+        reject(e);
       }
     });
-    child.on("close", () => {
+    child.on("close", (code: number | null) => {
       if (!done) {
         done = true;
         clearTimeout(timer);
-        resolve(out);
+        resolve({ out, err, code });
       }
     });
   });
@@ -102,8 +109,12 @@ describe("spawnPi real execution (production path)", () => {
           writeFileSync(target, `#!/bin/sh\necho ${marker}\n`);
           chmodSync(target, 0o755);
         }
-        const out = await runAndCapture(target);
-        assert.match(out, new RegExp(marker));
+        const got = await runAndCapture(target);
+        assert.match(
+          got.out,
+          new RegExp(marker),
+          "exit=" + got.code + " stderr=" + got.err,
+        );
       } finally {
         rmSync(dir, { recursive: true, force: true });
       }
