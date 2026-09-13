@@ -51,6 +51,7 @@ if ($probeBusy.Listening) {
 
 $FxRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("piserver-upg-" + [Guid]::NewGuid().ToString("N"))
 $stubPid = 0
+$orphanPid = 0
 try {
   New-Item -ItemType Directory -Path $FxRoot -Force | Out-Null
   $fxPaths = Get-PiServerPaths -Root (Join-Path $FxRoot "psrv")
@@ -79,6 +80,13 @@ try {
     -WorkingDirectory $app -PassThru
   $stubPid = $stubProc.Id
   Start-Sleep -Seconds 3
+  # Orfano stile pi-daemon: cwd DENTRO app (blocca il Move), ma commandline
+  # SENZA approot/marker -- solo "--mode rpc" (invisibile allo sweep pre-fix).
+  $orphanCmd = "\$x='--mode rpc'; Start-Sleep 120"
+  $orphanProc = Start-Process powershell.exe -ArgumentList @("-NoProfile", "-NonInteractive", "-Command", $orphanCmd) `
+    -WorkingDirectory $app -PassThru
+  $orphanPid = $orphanProc.Id
+  Start-Sleep -Seconds 2
 
   $ownLive = Get-TcpListenerOwner -Port $TestPort
   Assert-True ($ownLive.Listening -and ($ownLive.Pid -eq $stubPid)) "porta occupata dallo stub (pid reale)"
@@ -100,6 +108,9 @@ try {
   $gone = $false
   try { $p = Get-Process -Id $stubPid -ErrorAction Stop; $gone = $p.HasExited } catch { $gone = $true }
   Assert-True $gone "stub terminato dallo stop"
+  $orphanGone = $false
+  try { $op = Get-Process -Id $orphanPid -ErrorAction Stop; $orphanGone = $op.HasExited } catch { $orphanGone = $true }
+  Assert-True $orphanGone "orfano --mode rpc terminato dallo sweep"
   $freeAfter = Get-TcpListenerOwner -Port $TestPort
   Assert-True (-not $freeAfter.Listening) "porta libera dopo stop"
 
@@ -126,6 +137,14 @@ try {
       if (($null -ne $still) -and (-not $still.HasExited)) {
         try { & taskkill /pid $stubPid /T /F 2>&1 | Out-Null } catch { }
         try { Stop-Process -Id $stubPid -Force -ErrorAction SilentlyContinue } catch { }
+      }
+    }
+    if ($orphanPid -gt 0) {
+      $stillOp = $null
+      try { $stillOp = Get-Process -Id $orphanPid -ErrorAction Stop } catch { }
+      if (($null -ne $stillOp) -and (-not $stillOp.HasExited)) {
+        try { & taskkill /pid $orphanPid /T /F 2>&1 | Out-Null } catch { }
+        try { Stop-Process -Id $orphanPid -Force -ErrorAction SilentlyContinue } catch { }
       }
     }
   } catch { }

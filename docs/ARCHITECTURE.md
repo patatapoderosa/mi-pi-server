@@ -127,6 +127,15 @@ rotate logs and launch the processes in the foreground so the tasks stay
 Running. Secrets ACL: SYSTEM+Administrators.
 Pi provider credentials: the interactive `/login` runs as the installing user,
 then `auth.json` is copied into the data dir (idempotent, backed up).
+Upgrades stop the runtime pre-swap (`Stop-PiServerRuntime`: tasks first,
+then tree-kill of processes whose command line matches the app root,
+`pi-daemon.mjs`, `pi-remote-server`, or `--mode rpc`) and move `app\` aside
+with retry. The `--mode rpc` pattern exists because the daemon spawns
+`pi --mode rpc` via `cmd.exe` with cwd inside `app\`: those orphans match
+neither the app root nor the daemon markers, yet their cwd lock blocks the
+directory rename (`EACCES`). The port gate never kills foreign listeners;
+a failed swap leaves the live app untouched and reports redacted
+blocker candidates (command lines, secrets stripped) for diagnosis.
 
 ## Remote Model Management (`server_model`)
 

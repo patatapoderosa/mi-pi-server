@@ -360,6 +360,90 @@ function Get-ReleaseChecksum {
   Never throws: returns @{ Ok, Error, BackupPath }. On failure the stage is
   removed and the live app is untouched (swap never ran).
 #>
+<#
+.SYNOPSIS
+  Move-Item with retry for live Windows directories.
+.DESCRIPTION
+  Renaming a directory fails with EACCES while a dying process still holds
+  it as cwd or handles are draining (taskkill returns after the terminate
+  request, teardown is async; AV scanners add jitter). Retries a few times
+  before giving up. -Mover injects scriptblock param($Source,$Dest) for
+  tests. Returns @{ Ok; Attempts; Error }. Never throws.
+#>
+function Move-ItemWithRetry {
+  param([string]$Source = "", [string]$Destination = "", [int]$Attempts = 5, [int]$DelaySec = 3, [scriptblock]$Mover = $null)
+  $tries = 0
+  $lastErr = ""
+  try {
+    if ([string]::IsNullOrWhiteSpace($Source) -or [string]::IsNullOrWhiteSpace($Destination)) {
+      return @{ Ok = $false; Attempts = 0; Error = "source/destination vuoti" }
+    }
+    if ($Attempts -lt 1) { $Attempts = 1 }
+    if ($DelaySec -lt 0) { $DelaySec = 0 }
+    while ($tries -lt $Attempts) {
+      $tries++
+      try {
+        if ($null -ne $Mover) { & $Mover $Source $Destination }
+        else { Move-Item -LiteralPath $Source -Destination $Destination -Force -ErrorAction Stop }
+        return @{ Ok = $true; Attempts = $tries; Error = "" }
+      } catch {
+        $lastErr = $_.Exception.Message
+        if ($tries -ge $Attempts) { break }
+        Start-Sleep -Seconds $DelaySec
+      }
+    }
+    return @{ Ok = $false; Attempts = $tries; Error = $lastErr }
+  } catch { return @{ Ok = $false; Attempts = $tries; Error = $_.Exception.Message } }
+}
+<#
+.SYNOPSIS
+  List candidate processes blocking an app directory move (diagnostics only).
+.DESCRIPTION
+  Enumerates processes whose command line matches our runtime markers
+  (app root, daemon markers, --mode rpc) and returns redacted one-liners.
+  Secrets in command lines are redacted; output capped. Never throws,
+  never kills. Returns "" when nothing matches or off Windows.
+#>
+function Get-ProcessBlockerReport {
+  param([string]$Path = "", [int]$MaxEntries = 8, [scriptblock]$ProcessProbe = $null)
+  try {
+    if ([string]::IsNullOrWhiteSpace($Path)) { return "" }
+    if (($env:OS -ne "Windows_NT") -and ($null -eq $ProcessProbe)) { return "" }
+    if ($MaxEntries -lt 1) { $MaxEntries = 1 }
+    $rootRx = ""
+    try { $rootRx = [regex]::Escape($Path) } catch { return "" }
+    if ($rootRx -eq "") { return "" }
+    $all = @()
+    try { if ($null -ne $ProcessProbe) { $all = @(& $ProcessProbe) } else { $all = @(Get-CimInstance Win32_Process -ErrorAction Stop) } } catch { return "" }
+    $rows = @()
+    foreach ($p in $all) {
+      $ownerPid = 0
+      $cl = ""
+      $nm = ""
+      try { $ownerPid = [int]$p.ProcessId } catch { continue }
+      try { $cl = [string]$p.CommandLine } catch { }
+      try { $nm = [string]$p.Name } catch { }
+      if ($ownerPid -le 0) { continue }
+      $hit = $false
+      if ($cl -match $rootRx) { $hit = $true }
+      elseif ($cl -match "pi-daemon\.mjs") { $hit = $true }
+      elseif ($cl -match "pi-remote-server") { $hit = $true }
+      elseif ($cl -match "--mode rpc") { $hit = $true }
+      if (-not $hit) { continue }
+      $safe = $cl
+      try {
+        $safe = $safe -replace '(?i)(--api-key|api[_-]?key|token|secret|password|passwd|pwd)\s+(\S+)', '$1 <redacted>'
+        $safe = $safe -replace 'bot\d+:[A-Za-z0-9_-]{20,}', 'bot<redacted>'
+        $safe = $safe -replace '(?i)(hmac|signature|bearer|authorization|bot[_-]?token|api[_-]?key)\s*[:=]\s*\S+', '$1=<redacted>'
+        if ($safe.Length -gt 200) { $safe = $safe.Substring(0, 200) + "..." }
+      } catch { $safe = "(unreadable)" }
+      $rows += ("pid " + $ownerPid + " " + $nm + " :: " + $safe)
+      if ($rows.Count -ge $MaxEntries) { break }
+    }
+    if ($rows.Count -eq 0) { return "" }
+    return ("candidati lock (" + $rows.Count + "): " + ($rows -join " | "))
+  } catch { return "" }
+}
 function Invoke-AppStaging {
   param([string]$PayloadDir, [string]$AppPath, [string]$Mode = "fresh", [string]$VersionLabel = "", [scriptblock]$PreSwapAction = $null)
   $res = @{ Ok = $false; Error = ""; BackupPath = $null }
@@ -409,7 +493,8 @@ function Invoke-AppStaging {
     $backup = $null
     if ((Test-Path -LiteralPath $AppPath) -and ($Mode -eq "update")) {
       $backup = $AppPath + ".backup-" + (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssZ")
-      Move-Item -LiteralPath $AppPath -Destination $backup -Force -ErrorAction Stop
+      $mv = Move-ItemWithRetry -Source $AppPath -Destination $backup
+      if (-not $mv.Ok) { $blk = Get-ProcessBlockerReport -Path $AppPath; $extra = ""; if ($blk -ne "") { $extra = " " + $blk }; throw ("Backup app fallito dopo " + $mv.Attempts + " tentativi (processo/handle attivo su " + $AppPath + "?): " + $mv.Error + $extra) }
     } elseif (Test-Path -LiteralPath $AppPath) {
       Remove-Item -LiteralPath $AppPath -Recurse -Force -ErrorAction Stop
     }
@@ -463,6 +548,23 @@ function Test-ShouldAutoUpdate {
   OwningProcess; -ProcessReader is scriptblock param($Pid)->array of process
   objects with ProcessId/Name/CommandLine. Never throws, never kills.
 #>
+<#
+.SYNOPSIS
+  Pure verdict on a TCP probe result: found / free / probe-failed.
+.DESCRIPTION
+  A silent empty result means FREE (expected case, no transcript noise);
+  empty WITH a cmdlet error means the probe itself failed (fail closed).
+  Never throws.
+#>
+function Test-ConnectionProbeResult {
+  param($Connections, [bool]$HadError = $false)
+  try {
+    $list = @($Connections) | Where-Object { $null -ne $_ }
+    if (@($list).Count -gt 0) { return "found" }
+    if ($HadError) { return "probe-failed" }
+    return "free"
+  } catch { return "probe-failed" }
+}
 function Get-TcpListenerOwner {
   param([int]$Port = 0, [scriptblock]$ConnectionReader = $null, [scriptblock]$ProcessReader = $null)
   try {
@@ -471,7 +573,14 @@ function Get-TcpListenerOwner {
     if ($null -ne $ConnectionReader) { $conns = @(& $ConnectionReader $Port) }
     else {
       if ($env:OS -ne "Windows_NT") { return @{ Listening = $false; Pid = 0; Name = ""; CommandLine = ""; Detail = "non-Windows" } }
-      $conns = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction Stop)
+      $tcpErr = @()
+      $conns = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorVariable tcpErr -ErrorAction SilentlyContinue)
+      $probeVerdict = Test-ConnectionProbeResult -Connections $conns -HadError ((@($tcpErr).Count -gt 0))
+      if ($probeVerdict -eq "probe-failed") {
+        $firstErr = ""
+        try { $firstErr = [string]$tcpErr[0].Exception.Message } catch { }
+        return @{ Listening = $false; Pid = 0; Name = ""; CommandLine = ""; Detail = ("probe failed: " + $firstErr) }
+      }
     }
     $hit = $null
     foreach ($c in $conns) {
@@ -633,6 +742,7 @@ function Stop-PiServerRuntime {
         if (($rootRx -ne "") -and ($cl -match $rootRx)) { $hit = $true }
         elseif ($cl -match "pi-daemon\.mjs") { $hit = $true }
         elseif ($cl -match "pi-remote-server") { $hit = $true }
+        elseif ($cl -match "--mode rpc") { $hit = $true }
         if ($hit) { $mine += $ownerPid }
       }
       if ($mine.Count -eq 0) { $remaining = @(); break }
@@ -704,8 +814,8 @@ function Invoke-AppRollback {
       } catch { $rmErr = $_.Exception.Message; Start-Sleep -Seconds 2 }
     }
     if (-not $removed) { return @{ Ok = $false; Detail = ("rollback abortito: app nuova non rimovibile (lock?): " + $rmErr) } }
-    try { Move-Item -LiteralPath $BackupPath -Destination $Paths.App -Force -ErrorAction Stop }
-    catch { return @{ Ok = $false; Detail = ("rollback INCOMPLETO: backup non ripristinabile (manuale da: " + $BackupPath + "): " + $_.Exception.Message) } }
+    $mvRb = Move-ItemWithRetry -Source $BackupPath -Destination $Paths.App
+    if (-not $mvRb.Ok) { $blkRb = Get-ProcessBlockerReport -Path $Paths.App; $extraRb = ""; if ($blkRb -ne "") { $extraRb = " " + $blkRb }; return @{ Ok = $false; Detail = ("rollback INCOMPLETO: backup non ripristinabile dopo " + $mvRb.Attempts + " tentativi (manuale da: " + $BackupPath + "): " + $mvRb.Error + $extraRb) } }
     try {
       $rbExt = Join-Path $Paths.ExtDir "pi-remote-config"
       if (Test-Path -LiteralPath $rbExt) { Remove-Item -LiteralPath $rbExt -Recurse -Force -ErrorAction Stop }

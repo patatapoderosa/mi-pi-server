@@ -1012,6 +1012,58 @@ try {
   Assert-True ($wiUp -match "Test-ShouldAutoUpdate") "auto-update detection"
   Remove-Variable -Name upKillLog,upForeign,upFlapGone,upOwn,upPersOwn,upProcs,upKilled,upKills,upSelfHit,upStarted,upHookCalls -Scope Global -ErrorAction SilentlyContinue
 
+  Write-Host "== orphan pi sweep + move retry + probe verdict (v0.2.9) =="
+  $global:upOrphanKills = @()
+  $global:upOrphanGone = $false
+  $probeOrphan = {
+    if ($global:upOrphanGone) { return @() }
+    return @(
+      [PSCustomObject]@{ ProcessId = 777; Name = "node.exe"; CommandLine = "C:\Users\x\AppData\Roaming\npm\node_modules\picli\cli.js --mode rpc" },
+      [PSCustomObject]@{ ProcessId = 778; Name = "notepad.exe"; CommandLine = "C:\Windows\notepad.exe" }
+    )
+  }
+  $stopOrphan = { param($p) $global:upOrphanKills += $p; $global:upOrphanGone = $true }
+  $sOrphan = Stop-PiServerRuntime -Paths $ppPaths -RemotePort 0 -TimeoutSec 5 -TaskReader $rNoTasks -ProcessProbe $probeOrphan -Stopper $stopOrphan
+  Assert-True $sOrphan.Ok "orfano pi fermato"
+  Assert-True (($global:upOrphanKills.Count -eq 1) -and ($global:upOrphanKills[0] -eq 777)) "kill solo orfano, foreign intatto"
+  Assert-Equal (Test-ConnectionProbeResult -Connections @() -HadError $false) "free" "vuoto senza errori = free"
+  Assert-Equal (Test-ConnectionProbeResult -Connections $null -HadError $true) "probe-failed" "vuoto con errore = probe-failed"
+  Assert-Equal (Test-ConnectionProbeResult -Connections @(@{ x = 1 }) -HadError $true) "found" "dati presenti vince"
+  $mvRoot = Join-Path $TmpRoot "mvretry"
+  $mvSrc = Join-Path $mvRoot "src"
+  $mvDst = Join-Path $mvRoot "dst"
+  New-Item -ItemType Directory -Path $mvSrc -Force | Out-Null
+  "x" | Out-File -LiteralPath (Join-Path $mvSrc "f.txt") -Encoding ascii -NoNewline
+  $global:upMvCalls = 0
+  $moverFlaky = { param($s, $d) $global:upMvCalls++; if ($global:upMvCalls -lt 3) { throw "lock simulato" }; Move-Item -LiteralPath $s -Destination $d -Force -ErrorAction Stop }
+  $rFlaky = Move-ItemWithRetry -Source $mvSrc -Destination $mvDst -Attempts 5 -DelaySec 0 -Mover $moverFlaky
+  Assert-True (($rFlaky.Ok) -and ($rFlaky.Attempts -eq 3)) "retry riesce al terzo tentativo"
+  Assert-True (Test-Path -LiteralPath (Join-Path $mvDst "f.txt")) "contenuto spostato"
+  $moverDead = { param($s, $d) throw "sempre rotto" }
+  $rDead = Move-ItemWithRetry -Source (Join-Path $mvRoot "nope") -Destination (Join-Path $mvRoot "dst2") -Attempts 3 -DelaySec 0 -Mover $moverDead
+  Assert-True ((-not $rDead.Ok) -and ($rDead.Attempts -eq 3) -and ($rDead.Error -match "sempre rotto")) "sempre rotto: fail dopo N tentativi"
+  $rEmpty = Move-ItemWithRetry -Source "" -Destination "x"
+  Assert-True ((-not $rEmpty.Ok) -and ($rEmpty.Attempts -eq 0)) "sorgente vuota: fail immediato"
+  $repNone = Get-ProcessBlockerReport -Path "" -ProcessProbe { return @() }
+  Assert-True ($repNone -eq "") "path vuoto = stringa vuota"
+  $repClean = Get-ProcessBlockerReport -Path "C:\PiServer\app" -ProcessProbe { return @() }
+  Assert-True ($repClean -eq "") "nessun match = stringa vuota"
+  $repSec = Get-ProcessBlockerReport -Path "C:\PiServer\app" -ProcessProbe {
+    return @([PSCustomObject]@{ ProcessId = 888; Name = "node.exe"; CommandLine = "node app.js --mode rpc --api-key sk-super-segreta-123" })
+  }
+  Assert-True (($repSec -match "888") -and ($repSec -notmatch "sk-super-segreta") -and ($repSec -match "redacted")) "secret redatto nel report"
+  $repCap = Get-ProcessBlockerReport -Path "C:\PiServer\app" -MaxEntries 1 -ProcessProbe {
+    return @(
+      [PSCustomObject]@{ ProcessId = 1; Name = "a.exe"; CommandLine = "x --mode rpc" },
+      [PSCustomObject]@{ ProcessId = 2; Name = "b.exe"; CommandLine = "y --mode rpc" }
+    )
+  }
+  Assert-True (($repCap -match "pid 1") -and ($repCap -notmatch "pid 2")) "cap MaxEntries"
+  $libUp = Get-Content -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) "PiServerLib.ps1") -Raw
+  Assert-True ($libUp -match "Move-ItemWithRetry -Source") "swap usa move con retry"
+  Assert-True ($libUp -match '--mode rpc"\) \{ \$hit = \$true \}') "sweep copre pi orfani"
+  Remove-Variable -Name upOrphanKills,upOrphanGone,upMvCalls -Scope Global -ErrorAction SilentlyContinue
+
   Write-Host "== runtime syntax gate (daemon try/catch v0.2.6) =="
   $nodeCmd = Get-Command node -ErrorAction SilentlyContinue
   if ($null -eq $nodeCmd) {
