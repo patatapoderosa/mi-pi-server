@@ -82,7 +82,7 @@ try {
   Start-Sleep -Seconds 3
   # Orfano stile pi-daemon: cwd DENTRO app (blocca il Move), ma commandline
   # SENZA approot/marker -- solo "--mode rpc" (invisibile allo sweep pre-fix).
-  $orphanCmd = "\$x='--mode rpc'; Start-Sleep 120"
+  $orphanCmd = "Start-Sleep 120 # marcatore --mode rpc"
   $orphanProc = Start-Process powershell.exe -ArgumentList @("-NoProfile", "-NonInteractive", "-Command", $orphanCmd) `
     -WorkingDirectory $app -PassThru
   $orphanPid = $orphanProc.Id
