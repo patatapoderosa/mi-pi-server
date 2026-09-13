@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.2.10 — 2026-09-13
+
+### Fixed
+
+- Resume-from-deploy no longer dies at step 6/11 with
+  `Accesso al percorso 'C:\PiServer\app' negato`: daemon-spawned
+  `pi --mode rpc` orphans hold cwd inside `app\` but match neither
+  the app root nor the daemon markers, so the pre-swap sweep missed
+  them. The sweep now also matches `--mode rpc`, and both the staging
+  backup move and the rollback restore move retry (5 x 3 s) before
+  failing with redacted blocker-candidate diagnostics.
+- `Get-TcpListenerOwner` probe is quiet on the happy path
+  (silent-empty means free) and fails closed only when the cmdlet
+  itself errors.
+
+### Upgrade notes
+
+- Rerun the one-liner (resolves `latest` → v0.2.10). No checkpoint
+  deletion, no reinstall, no new `/login`, no `-Force`.
 ## v0.2.9 — 2026-09-12
 
 ### Added
