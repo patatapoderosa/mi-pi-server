@@ -73,6 +73,12 @@ try {
   if (-not (Test-Path -LiteralPath $envPath)) { $envPath = Join-Path $releaseDir "runtime-env.json" }
   if (-not (Test-Path -LiteralPath $envPath)) { Fail-Closed "runtime-env.json missing (data + release)" }
   $env2 = (Get-Content -LiteralPath $envPath -Raw) | ConvertFrom-Json
+  try {
+    $evSchema = $env2.schemaVersion
+    if (($null -ne $evSchema) -and ([int]$evSchema -ne 0) -and ([int]$evSchema -ne 1)) {
+      Fail-Closed ("runtime-env.json schemaVersion non supportato: " + [string]$evSchema)
+    }
+  } catch { }
   foreach ($field in @("NodeExe", "AgentDir")) {
     if ([string]::IsNullOrWhiteSpace([string]$env2.$field)) { Fail-Closed "runtime-env.json lacks field: $field" }
   }

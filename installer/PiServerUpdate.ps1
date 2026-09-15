@@ -188,8 +188,30 @@ function Resolve-ReleaseDir {
   v), and node --check on the daemon entries when -NodeExe is given
   (empty = syntax gate skipped, reported in Detail).
 #>
+<#
+.SYNOPSIS
+  True when a version is >= the given floor (maj.min). Never throws.
+  Prerelease suffixes ignored for the comparison.
+#>
+function Test-ReleaseAtLeast {
+  param([string]$Version = "", [int]$Major = 0, [int]$Minor = 0)
+  try {
+    if (-not (Test-ReleaseVersionFormat -Version $Version)) { return $false }
+    $v = $Version
+    if ($v.StartsWith("v")) { $v = $v.Substring(1) }
+    $pp = $v -split "\."
+    if ($pp.Count -lt 2) { return $false }
+    $maj = 0
+    $min = 0
+    try { $maj = [int]$pp[0]; $min = [int](($pp[1] -split "-")[0]) } catch { return $false }
+    if ($maj -gt $Major) { return $true }
+    if ($maj -lt $Major) { return $false }
+    return ($min -ge $Minor)
+  } catch { return $false }
+}
+
 function Test-ReleaseContent {
-  param([string]$PayloadDir = "", [string]$ExpectedVersion = "", [string]$NodeExe = "")
+  param([string]$PayloadDir = "", [string]$ExpectedVersion = "", [string]$NodeExe = "", [string[]]$ManifestOverride = @())
   try {
     if ([string]::IsNullOrWhiteSpace($PayloadDir)) {
       return @{ Ok = $false; Error = "payload dir vuota"; Detail = "" }
@@ -200,8 +222,10 @@ function Test-ReleaseContent {
     if (-not (Test-Path -LiteralPath $PayloadDir)) {
       return @{ Ok = $false; Error = "payload assente"; Detail = "" }
     }
+    $manifest = @($script:ReleaseManifestV3 | ForEach-Object { $_ })
+    if (@($ManifestOverride).Count -gt 0) { $manifest = @($ManifestOverride) }
     $missing = @()
-    foreach ($rel in $script:ReleaseManifestV3) {
+    foreach ($rel in $manifest) {
       if (-not (Test-Path -LiteralPath (Join-Path $PayloadDir $rel))) { $missing += $rel }
     }
     if ($missing.Count -gt 0) {
@@ -251,7 +275,7 @@ function Test-ReleaseContent {
   check on next run and are removed before failing).
 #>
 function Install-ReleaseCandidate {
-  param([string]$StagingDir = "", [string]$ReleasesRoot = "", [string]$Version = "")
+  param([string]$StagingDir = "", [string]$ReleasesRoot = "", [string]$Version = "", [string[]]$ManifestOverride = @())
   try {
     if ([string]::IsNullOrWhiteSpace($StagingDir) -or
         [string]::IsNullOrWhiteSpace($ReleasesRoot) -or
@@ -262,7 +286,10 @@ function Install-ReleaseCandidate {
     if (Test-Path -LiteralPath $dest) {
       $same = $true
       $diff = @()
-      $cmpFiles = @($script:ReleaseManifestV3 | ForEach-Object { $_ }) + @("VERSION")
+      $cmpBase = @($script:ReleaseManifestV3 | ForEach-Object { $_ })
+      if (@($ManifestOverride).Count -gt 0) { $cmpBase = @($ManifestOverride) }
+      elseif (-not (Test-ReleaseAtLeast -Version $Version -Major 0 -Minor 3)) { $cmpBase = @($script:ReleaseManifest | ForEach-Object { $_ }) }
+      $cmpFiles = $cmpBase + @("VERSION")
       foreach ($rel in $cmpFiles) {
         $a = Join-Path $StagingDir $rel
         $b = Join-Path $dest $rel
@@ -287,7 +314,12 @@ function Install-ReleaseCandidate {
       try { Remove-Item -LiteralPath $dest -Recurse -Force -ErrorAction SilentlyContinue } catch { }
       return @{ Ok = $false; Reused = $false; Dir = ""; Error = ("copia fallita: " + $_.Exception.Message) }
     }
-    $chk = Test-ReleaseContent -PayloadDir $dest -ExpectedVersion $Version
+    $mcList = @($ManifestOverride)
+    if ($mcList.Count -eq 0) {
+      if (Test-ReleaseAtLeast -Version $Version -Major 0 -Minor 3) { $mcList = @($script:ReleaseManifestV3 | ForEach-Object { $_ }) }
+      else { $mcList = @($script:ReleaseManifest | ForEach-Object { $_ }) }
+    }
+    $chk = Test-ReleaseContent -PayloadDir $dest -ExpectedVersion $Version -ManifestOverride $mcList
     if (-not $chk.Ok) {
       try { Remove-Item -LiteralPath $dest -Recurse -Force -ErrorAction SilentlyContinue } catch { }
       return @{ Ok = $false; Reused = $false; Dir = ""; Error = ("candidate corrotto dopo copia: " + $chk.Error) }
@@ -343,6 +375,7 @@ function Read-MachineEnv {
       NpmGlobalBin = ""
       NodeArgs = @()
       AgentDir = ""
+      Schema = 0
     }
     try { $env2.NodeExe = [string]$obj.NodeExe } catch { }
     try { $env2.PiBin = [string]$obj.PiBin } catch { }
@@ -351,6 +384,7 @@ function Read-MachineEnv {
     try {
       if ($null -ne $obj.NodeArgs) { $env2.NodeArgs = @($obj.NodeArgs | ForEach-Object { [string]$_ }) }
     } catch { }
+    try { $env2.Schema = [int]$obj.schemaVersion } catch { }
     if ([string]::IsNullOrWhiteSpace($env2.NodeExe)) {
       return @{ Ok = $false; Env = $null; Error = "NodeExe mancante" }
     }
@@ -383,6 +417,7 @@ function Write-MachineEnv {
       New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop | Out-Null
     }
     $doc = [ordered]@{
+      schemaVersion = 1
       NodeExe = [string]$Env["NodeExe"]
       PiBin = [string]$Env["PiBin"]
       NpmGlobalBin = [string]$Env["NpmGlobalBin"]
@@ -779,6 +814,32 @@ function Invoke-UpdateRollback {
   A release is HEALTHY only if tasks run, the port is owned, the API
   answers and the running code reports the expected version.
 #>
+function New-HealthCheck {
+  param([string]$Name = "", [bool]$Ok = $false, [string]$Expected = "", [string]$Actual = "", [string]$Detail = "")
+  return @{ Name = $Name; Ok = $Ok; Expected = $Expected; Actual = $Actual; Detail = $Detail }
+}
+
+<#
+.SYNOPSIS
+  Health gate for a release version, structured (injectable primitives). Never throws.
+.DESCRIPTION
+  Returns @{ Ok; Detail; Checks; Synthesis }. Checks is an ordered hashtable
+  with 12 entries (pointer, releaseDir, manifest, taskMain, taskRemote,
+  piProcess, remoteProcess, port, portOwner, api, version, env), each
+  @{ Ok; Expected; Actual; Detail }. Synthesis is one compact line
+  (taskMain=running taskRemote=ready port=listening:1234 api=pong ...).
+  .Ok/.Detail keep the legacy shape (pipe-joined failures) for callers.
+  Primitives (production wires real checks, tests wire fakes):
+    TaskChecker:  param($Paths) -> @{ PiRunning; RemoteRunning; Detail }
+    PortChecker:  param($Port) -> @{ Listening; Pid; CommandLine; Detail }
+    ApiChecker:   param($Paths) -> @{ Ok; Detail }
+    VersionReader:param($Paths) -> @{ Ok; Version }
+    TaskReader:   param($TaskName) -> @{ Exists; State; LastResult; Detail } (optional, per-task detail)
+    ProcessProbe: param() -> array of process objects (optional, process checks)
+  -HealthMode auto|legacy|v3: selects the manifest list (v0.2.x snapshots do
+  NOT have v3 files, so legacy versions validate against the legacy manifest;
+  a v3-only endpoint is never required from legacy). Auto derives from $Version.
+#>
 function Test-ReleaseHealth {
   param(
     [hashtable]$Paths = $null,
@@ -787,62 +848,507 @@ function Test-ReleaseHealth {
     [scriptblock]$TaskChecker = $null,
     [scriptblock]$PortChecker = $null,
     [scriptblock]$ApiChecker = $null,
-    [scriptblock]$VersionReader = $null
+    [scriptblock]$VersionReader = $null,
+    [scriptblock]$TaskReader = $null,
+    [scriptblock]$ProcessProbe = $null,
+    [string]$HealthMode = "auto"
   )
+  $emptyChecks = [ordered]@{}
   try {
     if (($null -eq $Paths) -or (-not (Test-ReleaseVersionFormat -Version $Version))) {
-      return @{ Ok = $false; Detail = "paths/versione non validi" }
+      return @{ Ok = $false; Detail = "paths/versione non validi"; Checks = $emptyChecks; Synthesis = "invalid-params" }
     }
-    $fails = @()
+    $mode = $HealthMode
+    if ($mode -ne "legacy" -and $mode -ne "v3") {
+      $mode = "legacy"
+      try { if (Test-ReleaseAtLeast -Version $Version -Major 0 -Minor 3) { $mode = "v3" } } catch { $mode = "legacy" }
+    }
+    $checks = [ordered]@{}
+    $fail = {
+      param($name, $ok, $expected, $actual, $detail)
+      $checks[$name] = (New-HealthCheck -Name $name -Ok $ok -Expected $expected -Actual $actual -Detail $detail)
+    }
+    $ptr = Read-ActiveRelease -PointerPath $Paths.ActivePointer
+    & $fail "pointer" $ptr.Ok "valid pointer" (& { if ($ptr.Ok) { $ptr.Version } else { $ptr.Error } }) $ptr.Error
+    $rd = Resolve-ReleaseDir -Root $Paths.Root -Version $Version
+    & $fail "releaseDir" $rd.Ok ("releases\" + $Version) (& { if ($rd.Ok) { $rd.Dir } else { $rd.Error } }) $rd.Error
+    if ($rd.Ok) {
+      $mcList = @($script:ReleaseManifestV3 | ForEach-Object { $_ })
+      if ($mode -eq "legacy") { $mcList = @($script:ReleaseManifest | ForEach-Object { $_ }) }
+      $mc = Test-ReleaseContent -PayloadDir $rd.Dir -ExpectedVersion $Version -NodeExe "" -ManifestOverride $mcList
+      & $fail "manifest" $mc.Ok ("manifest " + $mode + " + VERSION=" + $Version) (& { if ($mc.Ok) { "manifest+VERSION OK" } else { $mc.Error } }) $mc.Detail
+    } else {
+      & $fail "manifest" $false ("manifest " + $mode) "releaseDir unavailable" $rd.Error
+    }
+    $piRun = $false
+    $reRun = $false
+    $taskDetail = ""
     if ($null -ne $TaskChecker) {
       $t = & $TaskChecker $Paths
-      if ((-not $t.PiRunning) -or (-not $t.RemoteRunning)) {
-        $fails += ("tasks: " + (Get-HookDetail $t))
-      }
+      try { $piRun = [bool]$t.PiRunning } catch { $piRun = $false }
+      try { $reRun = [bool]$t.RemoteRunning } catch { $reRun = $false }
+      $taskDetail = Get-HookDetail $t
     }
+    $mainState = "unknown"
+    $remoteState = "unknown"
+    if ($null -ne $TaskReader) {
+      try {
+        $tm = & $TaskReader $Paths.TaskName
+        try { $mainState = [string]$tm.State } catch { }
+        if ([string]::IsNullOrWhiteSpace($mainState)) { $mainState = (& { if ($tm.Exists) { "exists" } else { "missing" } }) }
+      } catch { $mainState = "probe-failed" }
+      try {
+        $tr = & $TaskReader $Paths.RemoteTaskName
+        try { $remoteState = [string]$tr.State } catch { }
+        if ([string]::IsNullOrWhiteSpace($remoteState)) { $remoteState = (& { if ($tr.Exists) { "exists" } else { "missing" } }) }
+      } catch { $remoteState = "probe-failed" }
+    } else {
+      $mainState = (& { if ($piRun) { "running" } else { "not-running" } })
+      $remoteState = (& { if ($reRun) { "running" } else { "not-running" } })
+    }
+    $tasksProbed = (($null -ne $TaskChecker) -or ($null -ne $TaskReader))
+    & $fail "taskMain" ((-not $tasksProbed) -or $piRun) "Running" $mainState $taskDetail
+    & $fail "taskRemote" ((-not $tasksProbed) -or $reRun) "Running" $remoteState $taskDetail
+    $procs = $null
+    if ($null -ne $ProcessProbe) {
+      try { $procs = @(& $ProcessProbe) } catch { $procs = @() }
+    }
+    if ($null -eq $procs) {
+      & $fail "piProcess" $true "process alive (if probed)" "not probed" "ProcessProbe assente: check non eseguito"
+      & $fail "remoteProcess" $true "process alive (if probed)" "not probed" "ProcessProbe assente: check non eseguito"
+    } else {
+      $piPid = 0
+      $rePid = 0
+      foreach ($pr in $procs) {
+        $cl = ""
+        $pd = 0
+        try { $cl = [string]$pr.CommandLine } catch { }
+        try { $pd = [int]$pr.ProcessId } catch { }
+        if (($piPid -eq 0) -and ($cl -match "pi-daemon\.mjs")) { $piPid = $pd }
+        if (($rePid -eq 0) -and ($cl -match "pi-remote-server")) { $rePid = $pd }
+      }
+      & $fail "piProcess" ($piPid -gt 0) "pi-daemon.mjs alive" (& { if ($piPid -gt 0) { ("pid " + $piPid) } else { "absent" } }) ""
+      & $fail "remoteProcess" ($rePid -gt 0) "pi-remote-server alive" (& { if ($rePid -gt 0) { ("pid " + $rePid) } else { "absent" } }) ""
+    }
+    $listening = $false
+    $ownerOk = $false
+    $portActual = "not checked"
+    $ownerActual = "not checked"
+    $ownerDetail = ""
     if ($null -ne $PortChecker) {
       $po = & $PortChecker $Port
-      if (-not $po.Listening) {
-        $fails += ("porta " + $Port + " non in ascolto")
-      } elseif ([string]$po.CommandLine -notmatch "pi-remote-server") {
-        $fails += ("porta posseduta da estraneo (pid " + $po.Pid + ")")
+      try { $listening = [bool]$po.Listening } catch { $listening = $false }
+      if (-not $listening) {
+        $portActual = "free"
+        try { if ([string]$po.Detail -ne "") { $portActual = [string]$po.Detail } } catch { }
+        if ($portActual -eq "") { $portActual = "free" }
+        $ownerActual = "n/a"
+        $ownerDetail = "porta non in ascolto"
+      } else {
+        $portActual = "listening"
+        try { $portActual = ("listening pid " + [int]$po.Pid) } catch { }
+        $cl = ""
+        try { $cl = [string]$po.CommandLine } catch { }
+        if ($cl -match "pi-remote-server") {
+          $ownerOk = $true
+          $ownerActual = "owned"
+          try { $ownerActual = ("owned pid " + [int]$po.Pid) } catch { }
+        } else {
+          $ownerActual = "foreign"
+          try { $ownerActual = ("foreign pid " + [int]$po.Pid) } catch { }
+          $ownerDetail = "command line senza marker pi-remote-server"
+        }
       }
     }
+    & $fail "port" ($null -eq $PortChecker -or $listening) ("listening " + $Port) $portActual ""
+    & $fail "portOwner" ($null -eq $PortChecker -or $ownerOk) "owned by pi-remote-server" $ownerActual $ownerDetail
+    $apiOk = $false
+    $apiActual = "not checked"
+    $apiDetail = ""
     if ($null -ne $ApiChecker) {
       $a = & $ApiChecker $Paths
-      if (-not $a.Ok) { $fails += ("api: " + (Get-HookDetail $a)) }
+      try { $apiOk = [bool]$a.Ok } catch { $apiOk = $false }
+      $apiDetail = Get-HookDetail $a
+      $apiActual = (& { if ($apiOk) { "pong" } else { ("failed: " + $apiDetail) } })
     }
+    & $fail "api" ($null -eq $ApiChecker -or $apiOk) "pong /v1/ping" $apiActual $apiDetail
+    $verOk = $false
+    $verActual = "not checked"
     if ($null -ne $VersionReader) {
       $vr = & $VersionReader $Paths
-      if ((-not $vr.Ok) -or ([string]$vr.Version -ne $Version)) {
-        $fails += ("versione attiva=" + [string]$vr.Version + " attesa=" + $Version + " " + (Get-HookDetail $vr))
+      $rep = ""
+      try { $rep = [string]$vr.Version } catch { }
+      try { $verOk = ([bool]$vr.Ok) -and ($rep -eq $Version) } catch { $verOk = $false }
+      $verActual = (& { if ($rep -ne "") { $rep } else { "unknown" } })
+      if (-not $verOk) {
+        $vd = Get-HookDetail $vr
+        & $fail "version" $false $Version $verActual $vd
+      } else {
+        & $fail "version" $true $Version $verActual ""
       }
     } else {
-      $rd = Resolve-ReleaseDir -Root $Paths.Root -Version $Version
-      if (-not $rd.Ok) { $fails += ("release non risolvibile: " + $rd.Error) }
+      if (-not $rd.Ok) {
+        & $fail "version" $false $Version "unknown" ("release non risolvibile: " + $rd.Error)
+      } else {
+        & $fail "version" $true $Version "resolved" ""
+      }
     }
-    if ($fails.Count -gt 0) {
-      return @{ Ok = $false; Detail = ($fails -join " | ") }
+    $envOk = $true
+    $envActual = "not checked"
+    $envDetail = ""
+    $me = Read-MachineEnv -EnvPath $Paths.MachineEnv
+    if ($me.Ok) {
+      $schema = 0
+      try { $schema = [int]$me.Env.Schema } catch { $schema = 0 }
+      $envActual = ("machine facts OK (schema " + $schema + ")")
+    } else {
+      $legEnv = Join-Path $rd.Dir "runtime-env.json"
+      $meLeg = Read-MachineEnv -EnvPath $legEnv
+      if ($meLeg.Ok) {
+        $envActual = "machine facts OK (legacy snapshot env)"
+      } else {
+        $envOk = $false
+        $envActual = "unavailable"
+        $envDetail = $me.Error
+      }
     }
-    return @{ Ok = $true; Detail = ("healthy " + $Version) }
+    & $fail "env" $envOk "machine facts leggibili" $envActual $envDetail
+    $all = @()
+    foreach ($kvf in $checks.GetEnumerator()) {
+      if (-not $kvf.Value.Ok) { $all += ([string]$kvf.Key + ": " + [string]$kvf.Value.Detail) }
+    }
+    $syn = @()
+    foreach ($kv in $checks.GetEnumerator()) {
+      $short = [string]$kv.Value.Actual
+      if ($short.Length -gt 40) { $short = $short.Substring(0, 40) }
+      $syn += ([string]$kv.Key + "=" + $short)
+    }
+    $synthesis = ($syn -join " ")
+    if ($all.Count -gt 0) {
+      return @{ Ok = $false; Detail = ($all -join " | "); Checks = $checks; Synthesis = $synthesis }
+    }
+    return @{ Ok = $true; Detail = ("healthy " + $Version); Checks = $checks; Synthesis = $synthesis }
   } catch {
-    return @{ Ok = $false; Detail = $_.Exception.Message }
+    return @{ Ok = $false; Detail = $_.Exception.Message; Checks = $emptyChecks; Synthesis = "health-exception" }
   }
 }
 
 <#
 .SYNOPSIS
-  Full pointer-based update: candidate -> quiesce -> switch -> verify.
-  Never throws.
+  Tail of task error logs (redacted, best effort). Never throws.
 .DESCRIPTION
-  -StagingDir is a validated payload dir (download/extract/checksum stays
-  in the caller: installer or remote apply handler). Phases are recorded
-  in update-state.json; any health failure triggers automatic pointer
-  rollback. History is appended on every terminal outcome. Live releases
-  are never renamed, moved or overwritten: only the pointer file changes.
-  Injectable hooks (same shape as Invoke-UpdateRecovery plus TaskChecker,
-  PortChecker, ApiChecker, VersionReader for Test-ReleaseHealth).
+  Returns up to -Lines lines from pi-server-error.log + remote-server-error.log
+  with secret-like tokens redacted. Used for fatal-fast diagnostics.
 #>
+function Get-TaskErrorTail {
+  param($Paths, [int]$Lines = 15)
+  try {
+    if ($null -eq $Paths) { return "" }
+    if ($Lines -lt 1) { $Lines = 1 }
+    if ($Lines -gt 80) { $Lines = 80 }
+    $out = @()
+    foreach ($lf in @($Paths.ServerErrLog, $Paths.RemoteErrLog)) {
+      try {
+        if ([string]::IsNullOrWhiteSpace($lf)) { continue }
+        if (-not (Test-Path -LiteralPath $lf)) { continue }
+        $tail = Get-Content -LiteralPath $lf -Tail $Lines -ErrorAction Stop
+        foreach ($ln in @($tail)) {
+          $s = [string]$ln
+          $s = $s -replace '(?i)(--api-key|api[_-]?key|token|secret|password|passwd|pwd)\s+(\S+)', '$1 <redacted>'
+          $s = $s -replace 'bot\d+:[A-Za-z0-9_-]{20,}', 'bot<redacted>'
+          $s = $s -replace '(?i)(hmac|signature|bearer|authorization|bot[_-]?token|api[_-]?key)\s*[:=]\s*\S+', '$1=<redacted>'
+          if ($s.Length -gt 300) { $s = $s.Substring(0, 300) }
+          $out += $s
+        }
+      } catch { }
+    }
+    return ($out -join " | ")
+  } catch { return "" }
+}
+
+<#
+.SYNOPSIS
+  Poll full health with backoff until green or timeout. Never throws.
+.DESCRIPTION
+  Task State Running is NOT health: this polls Test-ReleaseHealth (tasks +
+  processes + port + owner + api + version) on schedule 1,2,2,3,5,5,5s...
+  Returns the last health result (with Checks/Synthesis). Fatal-fast: a task
+  that is missing (not merely non-Running) aborts immediately with the
+  error-log tail attached. -TimeoutSec caps the total wait.
+  -HealthMode selects the contract (auto|legacy|v3). Extra hooks pass
+  through to Test-ReleaseHealth (TaskReader/ProcessProbe supported).
+#>
+function Wait-ReleaseHealth {
+  param(
+    [hashtable]$Paths = $null,
+    [string]$Version = "",
+    [int]$Port = 43128,
+    [int]$TimeoutSec = 90,
+    [string]$HealthMode = "auto",
+    [scriptblock]$TaskChecker = $null,
+    [scriptblock]$PortChecker = $null,
+    [scriptblock]$ApiChecker = $null,
+    [scriptblock]$VersionReader = $null,
+    [scriptblock]$TaskReader = $null,
+    [scriptblock]$ProcessProbe = $null
+  )
+  $emptyChecks = [ordered]@{}
+  try {
+    if (($null -eq $Paths) -or (-not (Test-ReleaseVersionFormat -Version $Version))) {
+      return @{ Ok = $false; Detail = "paths/versione non validi"; Checks = $emptyChecks; Synthesis = "invalid-params" }
+    }
+    if ($TimeoutSec -lt 5) { $TimeoutSec = 5 }
+    if ($TimeoutSec -gt 600) { $TimeoutSec = 600 }
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSec)
+    $delays = @(1, 2, 2, 3, 5, 5, 5)
+    $di = 0
+    $last = $null
+    while ([DateTime]::UtcNow -lt $deadline) {
+      $last = Test-ReleaseHealth -Paths $Paths -Version $Version -Port $Port -HealthMode $HealthMode `
+        -TaskChecker $TaskChecker -PortChecker $PortChecker -ApiChecker $ApiChecker -VersionReader $VersionReader `
+        -TaskReader $TaskReader -ProcessProbe $ProcessProbe
+      if ($last.Ok) { return $last }
+      $fatal = ""
+      try {
+        if (($null -ne $last.Checks) -and ($null -ne $last.Checks["taskMain"])) {
+          $tm = [string]$last.Checks["taskMain"].Actual
+          $tr = [string]$last.Checks["taskRemote"].Actual
+          if (($tm -eq "missing") -or ($tr -eq "missing")) { $fatal = ("task missing: main=" + $tm + " remote=" + $tr) }
+        }
+      } catch { }
+      if ($fatal -ne "") {
+        $tail = Get-TaskErrorTail -Paths $Paths -Lines 15
+        $det = ($fatal + " | " + $last.Detail)
+        if ($tail -ne "") { $det += (" | errlog: " + $tail) }
+        return @{ Ok = $false; Detail = $det; Checks = $last.Checks; Synthesis = $last.Synthesis }
+      }
+      $sleep = $delays[$di]
+      if ($di -lt ($delays.Count - 1)) { $di++ }
+      $wait = $sleep
+      $left = ($deadline - [DateTime]::UtcNow).TotalSeconds
+      if ($wait -gt $left) { $wait = $left }
+      if ($wait -gt 0) { Start-Sleep -Seconds ([int][Math]::Ceiling($wait)) }
+      else { break }
+    }
+    if ($null -eq $last) {
+      return @{ Ok = $false; Detail = "health mai eseguito"; Checks = $emptyChecks; Synthesis = "no-attempt" }
+    }
+    return $last
+  } catch {
+    return @{ Ok = $false; Detail = $_.Exception.Message; Checks = $emptyChecks; Synthesis = "wait-exception" }
+  }
+}
+<#
+.SYNOPSIS
+  Redact secret-like tokens from a diagnostic string. Never throws.
+#>
+function Protect-DiagText {
+  param([string]$Text = "")
+  try {
+    $s = [string]$Text
+    $s = $s -replace '(?i)(--api-key|api[_-]?key|token|secret|password|passwd|pwd)\s+(\S+)', '$1 <redacted>'
+    $s = $s -replace 'bot\d+:[A-Za-z0-9_-]{20,}', 'bot<redacted>'
+    $s = $s -replace '(?i)(hmac|signature|bearer|authorization|bot[_-]?token|api[_-]?key)\s*[:=]\s*\S+', '$1=<redacted>'
+    return $s
+  } catch { return "(redact-failed)" }
+}
+
+<#
+.SYNOPSIS
+  Self-diagnosis bundle for a failed migration/update verify. Never throws.
+.DESCRIPTION
+  Collects pointer, resolved release, env field names + non-sensitive paths,
+  snapshot VERSION, task states + LastTaskResult, owned processes, rpc orphans,
+  listener + owner, 80-line tails of the 4 runtime logs, and the structured
+  health result. Writes logs\migration-diagnostic.json (machine) and
+  logs\migration-diagnostic.txt (human). All strings redacted. Nothing is
+  printed for the user to copy: the bundle serves self-diagnosis and report.
+  Optional hooks mirror the health primitives (TaskReader, ProcessProbe,
+  ConnectionReader); without them, best-effort real collectors run guarded.
+#>
+function Export-MigrationDiagnostics {
+  param(
+    [hashtable]$Paths = $null,
+    [string]$Stage = "",
+    [string]$Version = "",
+    [hashtable]$Health = $null,
+    [scriptblock]$TaskReader = $null,
+    [scriptblock]$ProcessProbe = $null,
+    [scriptblock]$ConnectionReader = $null
+  )
+  try {
+    if ($null -eq $Paths) { return @{ Ok = $false; JsonPath = ""; TxtPath = ""; Error = "paths nulli" } }
+    $ts = [DateTimeOffset]::UtcNow
+    $doc = [ordered]@{
+      schemaVersion = 1
+      timestamp = $ts.ToString("o")
+      stage = $Stage
+      version = $Version
+    }
+    $ptrRaw = ""
+    try { if (Test-Path -LiteralPath $Paths.ActivePointer) { $ptrRaw = (Get-Content -LiteralPath $Paths.ActivePointer -Raw -ErrorAction Stop | Out-String).Trim() } } catch { }
+    $doc["activePointer"] = (Protect-DiagText $ptrRaw)
+    $rdInfo = @{ ok = $false; dir = "" }
+    if (Test-ReleaseVersionFormat -Version $Version) { $rdInfo = Resolve-ReleaseDir -Root $Paths.Root -Version $Version }
+    $doc["releaseDir"] = [string]$rdInfo.Dir
+    $doc["releaseDirError"] = [string]$rdInfo.Error
+    $envInfo = [ordered]@{ path = [string]$Paths.MachineEnv; fields = @(); schema = 0 }
+    try {
+      if (Test-Path -LiteralPath $Paths.MachineEnv) {
+        $ej = (Get-Content -LiteralPath $Paths.MachineEnv -Raw -ErrorAction Stop) | ConvertFrom-Json -ErrorAction Stop
+        foreach ($pn in @($ej.PSObject.Properties.Name)) { $envInfo.fields += [string]$pn }
+        try { $envInfo.schema = [int]$ej.schemaVersion } catch { }
+        foreach ($k in @("NodeExe", "PiBin", "NpmGlobalBin", "AgentDir")) {
+          try { $v = [string]$ej.$k; if ($v -ne "") { $envInfo[$k] = (Protect-DiagText $v) } } catch { }
+        }
+        try { $na = @($ej.NodeArgs | ForEach-Object { [string]$_ }); $envInfo["NodeArgs"] = ($na -join " ") } catch { }
+      }
+    } catch { $envInfo["error"] = "env illeggibile" }
+    $doc["machineEnv"] = $envInfo
+    $snapVer = ""
+    try {
+      $rd2 = Resolve-ReleaseDir -Root $Paths.Root -Version $Version
+      if ($rd2.Ok) { $snapVer = ((Get-Content -LiteralPath (Join-Path $rd2.Dir "VERSION") -Raw -ErrorAction Stop | Out-String).Trim()) }
+    } catch { }
+    $doc["releaseVersionFile"] = (Protect-DiagText $snapVer)
+    $taskRows = @()
+    foreach ($tn in @($Paths.TaskName, $Paths.RemoteTaskName)) {
+      $row = [ordered]@{ name = [string]$tn; exists = $false; state = ""; lastResult = ""; action = "" }
+      try {
+        $t = $null
+        if ($null -ne $TaskReader) { $t = & $TaskReader $tn }
+        elseif ($env:OS -eq "Windows_NT") {
+          $st2 = Get-ScheduledTask -TaskName $tn -ErrorAction Stop
+          $info2 = $null
+          try { $info2 = $st2 | Get-ScheduledTaskInfo -ErrorAction Stop } catch { }
+          $act = ""
+          try {
+            $aa = @($st2.Actions)
+            if ($aa.Count -gt 0) { $act = ([string]$aa[0].Execute + " " + [string]$aa[0].Arguments) }
+          } catch { }
+          $lr = ""
+          try { if ($null -ne $info2) { $lr = [string]$info2.LastTaskResult } } catch { }
+          $t = @{ Exists = $true; State = [string]$st2.State; LastResult = $lr; Detail = ""; ActionText = $act }
+        }
+        if ($null -ne $t) {
+          try { $row.exists = [bool]$t.Exists } catch { $row.exists = $true }
+          try { $row.state = [string]$t.State } catch { }
+          try { $row.lastResult = [string]$t.LastTaskResult } catch { }
+          try { if ([string]$t.ActionText -ne "") { $row.action = (Protect-DiagText ([string]$t.ActionText)) } } catch { }
+          try {
+            if ($null -ne $TaskReader) {
+              $rt = Get-ScheduledTask -TaskName $tn -ErrorAction SilentlyContinue
+              if ($null -ne $rt) {
+                $aa2 = @($rt.Actions)
+                if ($aa2.Count -gt 0) { $row.action = (Protect-DiagText ([string]$aa2[0].Execute + " " + [string]$aa2[0].Arguments)) }
+              }
+            }
+          } catch { }
+        }
+      } catch { $row["error"] = "task illeggibile" }
+      $taskRows += $row
+    }
+    $doc["tasks"] = $taskRows
+    $owned = @()
+    $orphans = @()
+    try {
+      $plist = @()
+      if ($null -ne $ProcessProbe) { $plist = @(& $ProcessProbe) }
+      elseif ($env:OS -eq "Windows_NT") { $plist = @(Get-CimInstance Win32_Process -ErrorAction Stop) }
+      foreach ($pr in $plist) {
+        $cl = ""
+        $pd = 0
+        $nm = ""
+        try { $cl = [string]$pr.CommandLine } catch { }
+        try { $pd = [int]$pr.ProcessId } catch { }
+        try { $nm = [string]$pr.Name } catch { }
+        if ($pd -le 0) { continue }
+        $mine = $false
+        if (($Paths.App -ne "") -and ($cl -match [regex]::Escape($Paths.App))) { $mine = $true }
+        elseif (($Paths.Releases -ne "") -and ($cl -match [regex]::Escape($Paths.Releases))) { $mine = $true }
+        elseif ($cl -match "pi-daemon\.mjs") { $mine = $true }
+        elseif ($cl -match "pi-remote-server") { $mine = $true }
+        if ($mine) {
+          $cs = (Protect-DiagText $cl)
+          if ($cs.Length -gt 220) { $cs = $cs.Substring(0, 220) }
+          $owned += ([ordered]@{ pid = $pd; name = $nm; cmd = $cs })
+        }
+        if ($cl -match "--mode rpc") { $orphans += $pd }
+      }
+    } catch { }
+    $doc["ownedProcesses"] = $owned
+    $doc["modeRpcOrphans"] = @($orphans)
+    $lis = [ordered]@{ listening = $false; pid = 0; name = ""; detail = "" }
+    try {
+      $lo = $null
+      if ($null -ne $ConnectionReader) { $lo = & $ConnectionReader $Paths.RemotePortDefault }
+      else { $lo = Get-TcpListenerOwner -Port $Paths.RemotePortDefault }
+      if ($null -ne $lo) {
+        try { $lis.listening = [bool]$lo.Listening } catch { }
+        try { $lis.pid = [int]$lo.Pid } catch { }
+        try { $lis.name = [string]$lo.Name } catch { }
+        try { $lis.detail = (Protect-DiagText ([string]$lo.Detail)) } catch { }
+        try {
+          $lc = [string]$lo.CommandLine
+          if ($lc.Length -gt 220) { $lc = $lc.Substring(0, 220) }
+          $lis["commandLine"] = (Protect-DiagText $lc)
+        } catch { }
+      }
+    } catch { }
+    $doc["listener"] = $lis
+    $tails = [ordered]@{}
+    foreach ($lf in @(@{ N = "pi-server"; P = $Paths.ServerLog }, @{ N = "pi-server-error"; P = $Paths.ServerErrLog }, @{ N = "remote"; P = $Paths.RemoteLog }, @{ N = "remote-error"; P = $Paths.RemoteErrLog })) {
+      try {
+        if (([string]$lf.P -ne "") -and (Test-Path -LiteralPath $lf.P)) {
+          $lines = @(Get-Content -LiteralPath $lf.P -Tail 80 -ErrorAction Stop)
+          $clean = @()
+          foreach ($ln2 in $lines) {
+            $ss = (Protect-DiagText ([string]$ln2))
+            if ($ss.Length -gt 300) { $ss = $ss.Substring(0, 300) }
+            $clean += $ss
+          }
+          $tails[$lf.N] = $clean
+        } else { $tails[$lf.N] = @() }
+      } catch { $tails[$lf.N] = @() }
+    }
+    $doc["logTails80"] = $tails
+    if ($null -ne $Health) {
+      try { $doc["healthOk"] = [bool]$Health.Ok } catch { $doc["healthOk"] = $false }
+      try { $doc["healthDetail"] = (Protect-DiagText ([string]$Health.Detail)) } catch { }
+      try { $doc["healthSynthesis"] = (Protect-DiagText ([string]$Health.Synthesis)) } catch { }
+      try {
+        $hc = @()
+        if ($null -ne $Health.Checks) {
+          foreach ($kv in $Health.Checks.GetEnumerator()) {
+            $hc += ([ordered]@{ name = [string]$kv.Key; ok = [bool]$kv.Value.Ok; expected = [string]$kv.Value.Expected; actual = [string]$kv.Value.Actual })
+          }
+        }
+        $doc["healthChecks"] = $hc
+      } catch { }
+    }
+    $jsonPath = Join-Path $Paths.Logs "migration-diagnostic.json"
+    $txtPath = Join-Path $Paths.Logs "migration-diagnostic.txt"
+    $ld = Split-Path -Parent $jsonPath
+    if (-not (Test-Path -LiteralPath $ld)) { New-Item -ItemType Directory -Path $ld -Force -ErrorAction Stop | Out-Null }
+    ($doc | ConvertTo-Json -Depth 6) | Out-File -LiteralPath $jsonPath -Encoding utf8 -ErrorAction Stop
+    $txt = @()
+    $txt += ("migration diagnostics " + $ts.ToString("o") + " stage=" + $Stage + " version=" + $Version)
+    $txt += ("pointer: " + [string]$doc["activePointer"])
+    $txt += ("releaseDir: " + [string]$doc["releaseDir"] + " " + [string]$doc["releaseDirError"])
+    $txt += ("release VERSION file: " + [string]$doc["releaseVersionFile"])
+    $txt += ("machineEnv: " + (($envInfo.fields -join ",") + " schema=" + $envInfo.schema))
+    foreach ($tr2 in $taskRows) { $txt += ("task " + $tr2.name + ": exists=" + $tr2.exists + " state=" + $tr2.state + " lastResult=" + $tr2.lastResult + " action=" + $tr2.action) }
+    $txt += ("ownedProcesses: " + (($owned | ForEach-Object { [string]$_.pid }) -join ","))
+    $txt += ("modeRpcOrphans: " + (($orphans -join ",")))
+    $txt += ("listener: listening=" + $lis.listening + " pid=" + $lis.pid + " " + [string]$lis.detail)
+    if ($null -ne $Health) { $txt += ("health: " + [string]$doc["healthSynthesis"]) }
+    ($txt -join [Environment]::NewLine) | Out-File -LiteralPath $txtPath -Encoding utf8 -ErrorAction Stop
+    return @{ Ok = $true; JsonPath = $jsonPath; TxtPath = $txtPath; Error = "" }
+  } catch {
+    return @{ Ok = $false; JsonPath = ""; TxtPath = ""; Error = $_.Exception.Message }
+  }
+}
+
 function Invoke-ReleaseUpdate {
   param(
     [hashtable]$Paths = $null,
@@ -854,7 +1360,11 @@ function Invoke-ReleaseUpdate {
     [scriptblock]$TaskChecker = $null,
     [scriptblock]$PortChecker = $null,
     [scriptblock]$ApiChecker = $null,
-    [scriptblock]$VersionReader = $null
+    [scriptblock]$VersionReader = $null,
+    [scriptblock]$TaskReader = $null,
+    [scriptblock]$ProcessProbe = $null,
+    [int]$HealthTimeoutSec = 0,
+    [string]$HealthMode = "auto"
   )
   $t0 = [DateTimeOffset]::UtcNow
   $tx = "upd-" + $t0.ToUnixTimeSeconds() + "-" + [System.Diagnostics.Process]::GetCurrentProcess().Id
@@ -892,8 +1402,18 @@ function Invoke-ReleaseUpdate {
     $phase = { param($p) $st.phase = $p; Write-UpdateState -StatePath $Paths.UpdateState -State $st | Out-Null }
     $healthOf = {
       param($v)
-      return (Test-ReleaseHealth -Paths $Paths -Version $v -Port $Paths.RemotePortDefault `
-        -TaskChecker $TaskChecker -PortChecker $PortChecker -ApiChecker $ApiChecker -VersionReader $VersionReader)
+      return (Test-ReleaseHealth -Paths $Paths -Version $v -Port $Paths.RemotePortDefault -HealthMode $HealthMode `
+        -TaskChecker $TaskChecker -PortChecker $PortChecker -ApiChecker $ApiChecker -VersionReader $VersionReader `
+        -TaskReader $TaskReader -ProcessProbe $ProcessProbe)
+    }
+    $healthWait = {
+      param($v)
+      if ($HealthTimeoutSec -gt 0) {
+        return (Wait-ReleaseHealth -Paths $Paths -Version $v -Port $Paths.RemotePortDefault -TimeoutSec $HealthTimeoutSec -HealthMode $HealthMode `
+          -TaskChecker $TaskChecker -PortChecker $PortChecker -ApiChecker $ApiChecker -VersionReader $VersionReader `
+          -TaskReader $TaskReader -ProcessProbe $ProcessProbe)
+      }
+      return (& $healthOf $v)
     }
     $hb = & $healthOf $from
     $hist.healthBefore = (& { if ($hb.Ok) { "healthy" } else { "unhealthy: " + (Get-HookDetail $hb) } })
@@ -946,7 +1466,7 @@ function Invoke-ReleaseUpdate {
     & $phase "runtime_started"
     & $phase "health_verifying"
     $okStart = $str.Ok
-    $ha = & $healthOf $TargetVersion
+    $ha = & $healthWait $TargetVersion
     $hist.healthAfter = (& { if ($ha.Ok) { "healthy" } else { "unhealthy: " + (Get-HookDetail $ha) } })
     if ($okStart -and $ha.Ok) {
       $st.phase = "completed"
@@ -957,10 +1477,17 @@ function Invoke-ReleaseUpdate {
       Add-UpdateHistory -HistoryPath $Paths.UpdateHistory -Entry $hist | Out-Null
       return @{ Ok = $true; Action = "updated"; Detail = ($from + " -> " + $TargetVersion + " verificato") }
     }
+    $rbTimeout = $HealthTimeoutSec
     $rb = Invoke-UpdateRollback -Paths $Paths -State $st -StartRuntime $startFn -VerifyHealth {
       param($p, $v)
-      return (Test-ReleaseHealth -Paths $p -Version $v -Port $p.RemotePortDefault `
-        -TaskChecker $TaskChecker -PortChecker $PortChecker -ApiChecker $ApiChecker -VersionReader $VersionReader)
+      if ($rbTimeout -gt 0) {
+        return (Wait-ReleaseHealth -Paths $p -Version $v -Port $p.RemotePortDefault -TimeoutSec $rbTimeout -HealthMode $HealthMode `
+          -TaskChecker $TaskChecker -PortChecker $PortChecker -ApiChecker $ApiChecker -VersionReader $VersionReader `
+          -TaskReader $TaskReader -ProcessProbe $ProcessProbe)
+      }
+      return (Test-ReleaseHealth -Paths $p -Version $v -Port $p.RemotePortDefault -HealthMode $HealthMode `
+        -TaskChecker $TaskChecker -PortChecker $PortChecker -ApiChecker $ApiChecker -VersionReader $VersionReader `
+        -TaskReader $TaskReader -ProcessProbe $ProcessProbe)
     }
     $hist.rollback = $true
     $hist.durationMs = [long]([DateTimeOffset]::UtcNow - $t0).TotalMilliseconds
@@ -1027,6 +1554,175 @@ function Test-LegacyLayout {
   for manual recovery. Injectable hooks mirror Invoke-ReleaseUpdate plus:
     TaskActionUpdater: param($TaskName,$LauncherPath) -> @{ Ok; Detail }
 #>
+<#
+.SYNOPSIS
+  Snapshot original task definitions before migration touches them. Never throws.
+.DESCRIPTION
+  Captures Execute/Arguments/WorkingDirectory of both tasks into
+  data\migration\legacy-task-backup.json (atomic). If a backup already
+  exists it is REUSED (resume-safe: never overwrite a good backup with
+  repointed bin\ actions). Returns @{ Ok; Reused; Error }.
+#>
+<#
+.SYNOPSIS
+  Stop new launchers, restore original task actions, restart, verify legacy.
+  Never throws.
+.DESCRIPTION
+  Used when the new-launcher verification fails: the box goes back to running
+  the ORIGINAL v0.2.x code from C:\PiServer\app with its ORIGINAL task
+  definitions. Verification uses the legacy contract (tasks + processes +
+  port + owner + api + app VERSION; never a v3-only endpoint) with polling.
+  Returns @{ Ok; Detail }.
+#>
+function Restore-LegacyRuntime {
+  param(
+    [hashtable]$Paths = $null,
+    [scriptblock]$StopRuntime = $null,
+    [scriptblock]$StartRuntime = $null,
+    [scriptblock]$TaskChecker = $null,
+    [scriptblock]$PortChecker = $null,
+    [scriptblock]$ApiChecker = $null,
+    [string]$LegacyVersion = "",
+    [scriptblock]$TaskReader = $null,
+    [scriptblock]$ProcessProbe = $null,
+    [string]$HealthMode = "legacy",
+    [int]$HealthTimeoutSec = 90
+  )
+  try {
+    if (($null -eq $Paths) -or (-not (Test-ReleaseVersionFormat -Version $LegacyVersion))) {
+      return @{ Ok = $false; Detail = "paths/versione non validi" }
+    }
+    $stopFn = $StopRuntime
+    if ($null -eq $stopFn) { $stopFn = { param($p) return @{ Ok = $true; Detail = "stop skipped" } } }
+    $startFn = $StartRuntime
+    if ($null -eq $startFn) { $startFn = { param($p) return @{ Ok = $true; Detail = "start skipped" } } }
+    $sp = & $stopFn $Paths
+    if (-not $sp.Ok) {
+      return @{ Ok = $false; Detail = ("stop nuovi launcher fallito: " + (Get-HookDetail $sp)) }
+    }
+    $rs = Restore-LegacyTasks -Paths $Paths
+    if (-not $rs.Ok) {
+      return @{ Ok = $false; Detail = ("ripristino task definitions fallito: " + $rs.Error) }
+    }
+    $st2 = & $startFn $Paths
+    if (-not $st2.Ok) {
+      return @{ Ok = $false; Detail = ("avvio legacy fallito: " + (Get-HookDetail $st2)) }
+    }
+    $legVerFile = ""
+    try {
+      $legVerFile = ((Get-Content -LiteralPath (Join-Path $Paths.App "VERSION") -Raw -ErrorAction Stop | Out-String).Trim())
+      if (($legVerFile -ne "") -and (-not $legVerFile.StartsWith("v"))) { $legVerFile = "v" + $legVerFile }
+    } catch { $legVerFile = "" }
+    $vrLeg = {
+      param($p)
+      $rv = ""
+      try {
+        $rv = ((Get-Content -LiteralPath (Join-Path $p.App "VERSION") -Raw -ErrorAction Stop | Out-String).Trim())
+        if (($rv -ne "") -and (-not $rv.StartsWith("v"))) { $rv = "v" + $rv }
+      } catch { }
+      return @{ Ok = ($rv -ne ""); Version = $rv }
+    }
+    $h = Wait-ReleaseHealth -Paths $Paths -Version $LegacyVersion -Port $Paths.RemotePortDefault -TimeoutSec $HealthTimeoutSec -HealthMode "legacy" `
+      -TaskChecker $TaskChecker -PortChecker $PortChecker -ApiChecker $ApiChecker -VersionReader $vrLeg `
+      -TaskReader $TaskReader -ProcessProbe $ProcessProbe
+    if (-not $h.Ok) {
+      $syn = ""
+      try { $syn = [string]$h.Synthesis } catch { }
+      return @{ Ok = $false; Detail = ("legacy non verificato [" + $syn + "]: " + $h.Detail) }
+    }
+    return @{ Ok = $true; Detail = ("original v0.2.x online (" + $LegacyVersion + ")") }
+  } catch {
+    return @{ Ok = $false; Detail = $_.Exception.Message }
+  }
+}
+
+function Backup-LegacyTasks {
+  param([hashtable]$Paths = $null)
+  try {
+    if ($null -eq $Paths) { return @{ Ok = $false; Reused = $false; Error = "paths nulli" } }
+    $bp = [string]$Paths.TaskBackup
+    if ([string]::IsNullOrWhiteSpace($bp)) { return @{ Ok = $false; Reused = $false; Error = "backup path vuoto" } }
+    if (Test-Path -LiteralPath $bp) {
+      try {
+        $ex = (Get-Content -LiteralPath $bp -Raw -ErrorAction Stop) | ConvertFrom-Json -ErrorAction Stop
+        if (($null -ne $ex.tasks) -and (@($ex.tasks).Count -ge 1)) {
+          return @{ Ok = $true; Reused = $true; Error = "" }
+        }
+      } catch { }
+    }
+    if ($env:OS -ne "Windows_NT") { return @{ Ok = $false; Reused = $false; Error = "non-Windows" } }
+    $rows = @()
+    foreach ($tn in @($Paths.TaskName, $Paths.RemoteTaskName)) {
+      $t = $null
+      try { $t = Get-ScheduledTask -TaskName $tn -ErrorAction Stop } catch {
+        return @{ Ok = $false; Reused = $false; Error = ("task assente: " + $tn) }
+      }
+      $aa = @()
+      try { $aa = @($t.Actions) } catch { }
+      if ($aa.Count -ne 1) {
+        return @{ Ok = $false; Reused = $false; Error = ("task con azioni anomale: " + $tn) }
+      }
+      $rows += ([ordered]@{
+        name = [string]$tn
+        execute = [string]$aa[0].Execute
+        args = [string]$aa[0].Arguments
+        workDir = [string]$aa[0].WorkingDirectory
+      })
+    }
+    $doc = [ordered]@{ schemaVersion = 1; timestamp = ([DateTimeOffset]::UtcNow.ToString("o")); tasks = $rows }
+    $dir = Split-Path -Parent $bp
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop | Out-Null }
+    $tmp = $bp + ".tmp-" + [System.Diagnostics.Process]::GetCurrentProcess().Id
+    ($doc | ConvertTo-Json -Depth 4) | Out-File -LiteralPath $tmp -Encoding utf8 -ErrorAction Stop
+    if (Test-Path -LiteralPath $bp) {
+      $bak = $bp + ".bak"
+      [System.IO.File]::Replace($tmp, $bp, $bak) | Out-Null
+      try { Remove-Item -LiteralPath $bak -Force -ErrorAction SilentlyContinue } catch { }
+    } else {
+      Move-Item -LiteralPath $tmp -Destination $bp -Force -ErrorAction Stop
+    }
+    return @{ Ok = $true; Reused = $false; Error = "" }
+  } catch {
+    return @{ Ok = $false; Reused = $false; Error = $_.Exception.Message }
+  }
+}
+
+<#
+.SYNOPSIS
+  Restore original task actions from the migration backup. Never throws.
+.DESCRIPTION
+  Replaces the single action of both tasks with the backed-up
+  Execute/Arguments/WorkingDirectory (legacy app\ launchers). Used when
+  the new-launcher verification fails: the server goes back to running
+  the original v0.2.x code. Returns @{ Ok; Restored; Error }.
+#>
+function Restore-LegacyTasks {
+  param([hashtable]$Paths = $null)
+  try {
+    if ($null -eq $Paths) { return @{ Ok = $false; Restored = @(); Error = "paths nulli" } }
+    $bp = [string]$Paths.TaskBackup
+    if ([string]::IsNullOrWhiteSpace($bp) -or (-not (Test-Path -LiteralPath $bp))) {
+      return @{ Ok = $false; Restored = @(); Error = "backup assente" }
+    }
+    if ($env:OS -ne "Windows_NT") { return @{ Ok = $false; Restored = @(); Error = "non-Windows" } }
+    $doc = (Get-Content -LiteralPath $bp -Raw -ErrorAction Stop) | ConvertFrom-Json -ErrorAction Stop
+    if ([int]$doc.schemaVersion -ne 1) { return @{ Ok = $false; Restored = @(); Error = "backup schema non supportato" } }
+    $restored = @()
+    foreach ($bt in @($doc.tasks)) {
+      $nm = [string]$bt.name
+      $t = $null
+      try { $t = Get-ScheduledTask -TaskName $nm -ErrorAction Stop } catch {
+        return @{ Ok = $false; Restored = $restored; Error = ("task assente: " + $nm) }
+      }
+      $act = New-ScheduledTaskAction -Execute ([string]$bt.execute) -Argument ([string]$bt.args) -WorkingDirectory ([string]$bt.workDir) -ErrorAction Stop
+      Set-ScheduledTask -TaskName $nm -Action $act -ErrorAction Stop | Out-Null
+      $restored += $nm
+    }
+    return @{ Ok = $true; Restored = $restored; Error = "" }
+  } catch {
+    return @{ Ok = $false; Restored = @(); Error = $_.Exception.Message }
+  }
+}
 function Invoke-LegacyMigration {
   param(
     [hashtable]$Paths = $null,
@@ -1039,11 +1735,47 @@ function Invoke-LegacyMigration {
     [scriptblock]$PortChecker = $null,
     [scriptblock]$ApiChecker = $null,
     [scriptblock]$VersionReader = $null,
-    [scriptblock]$TaskActionUpdater = $null
+    [scriptblock]$TaskActionUpdater = $null,
+    [scriptblock]$TaskReader = $null,
+    [scriptblock]$ProcessProbe = $null,
+    [int]$HealthTimeoutSec = 90,
+    [string]$HealthMode = "auto"
   )
   try {
     if (($null -eq $Paths) -or (-not (Test-ReleaseVersionFormat -Version $TargetVersion))) {
       return @{ Ok = $false; Action = "rejected"; Detail = "paths/versione non validi" }
+    }
+    $stopFn0 = $StopRuntime
+    if ($null -eq $stopFn0) { $stopFn0 = { param($p) return @{ Ok = $true; Detail = "stop skipped" } } }
+    $startFn0 = $StartRuntime
+    if ($null -eq $startFn0) { $startFn0 = { param($p) return @{ Ok = $true; Detail = "start skipped" } } }
+    $recHealth0 = {
+      param($p, $v)
+      return (Test-ReleaseHealth -Paths $p -Version $v -Port $p.RemotePortDefault -HealthMode $HealthMode `
+        -TaskChecker $TaskChecker -PortChecker $PortChecker -ApiChecker $ApiChecker -VersionReader $VersionReader `
+        -TaskReader $TaskReader -ProcessProbe $ProcessProbe)
+    }
+    $ptr0 = Read-ActiveRelease -PointerPath $Paths.ActivePointer
+    if ($ptr0.Ok -and ($ptr0.Version -eq $TargetVersion)) {
+      $up0 = Invoke-ReleaseUpdate -Paths $Paths -TargetVersion $TargetVersion -StagingDir $StagingDir `
+        -NodeExe $NodeExe -StopRuntime $StopRuntime -StartRuntime $StartRuntime `
+        -TaskChecker $TaskChecker -PortChecker $PortChecker -ApiChecker $ApiChecker -VersionReader $VersionReader `
+        -TaskReader $TaskReader -ProcessProbe $ProcessProbe -HealthTimeoutSec $HealthTimeoutSec -HealthMode $HealthMode
+      if ($up0.Ok) { return @{ Ok = $true; Action = "migrated_resumed"; Detail = ("resume: target gia attivo, " + $up0.Detail) } }
+      return @{ Ok = $false; Action = $up0.Action; Detail = $up0.Detail }
+    }
+    $st0 = Read-UpdateState -StatePath $Paths.UpdateState
+    if ($st0.Found -and (-not $st0.Corrupt) -and ($st0.State.phase -ne "") -and -not (@("completed", "failed", "rollback_completed") -contains $st0.State.phase)) {
+      $rec0 = Invoke-UpdateRecovery -Paths $Paths -StopRuntime $stopFn0 -StartRuntime $startFn0 -VerifyHealth $recHealth0
+      if ($rec0.Ok -and (($rec0.Action -eq "switched_verified_completed") -or ($rec0.Action -eq "rolled_back_healthy"))) {
+        $ptrAfter = Read-ActiveRelease -PointerPath $Paths.ActivePointer
+        if ($ptrAfter.Ok -and ($ptrAfter.Version -eq $TargetVersion)) {
+          return @{ Ok = $true; Action = "migrated_resumed"; Detail = ("resume: recovery " + $rec0.Action) }
+        }
+        if ($ptrAfter.Ok -and ($ptrAfter.Version -ne $TargetVersion)) {
+          # recovery settled on legacy: continue the migration below (idempotent steps)
+        }
+      }
     }
     $leg = Test-LegacyLayout -Paths $Paths
     if (-not $leg.Found) {
@@ -1064,6 +1796,10 @@ function Invoke-LegacyMigration {
       }
     }
     $snapDest = Join-Path $Paths.Releases $legacyVer
+    $snapDaemon = Join-Path $snapDest "server\pi-daemon.mjs"
+    if ((Test-Path -LiteralPath $snapDest) -and (-not (Test-Path -LiteralPath $snapDaemon))) {
+      try { Remove-Item -LiteralPath $snapDest -Recurse -Force -ErrorAction SilentlyContinue } catch { }
+    }
     if (-not (Test-Path -LiteralPath $snapDest)) {
       try {
         Copy-Item -LiteralPath $Paths.App -Destination $snapDest -Recurse -Force -ErrorAction Stop
@@ -1094,6 +1830,12 @@ function Invoke-LegacyMigration {
     if (-not $binSync.Ok) {
       return @{ Ok = $false; Action = "rejected"; Detail = ("bin non installabili: " + $binSync.Error) }
     }
+    if ($env:OS -eq "Windows_NT") {
+      $bk = Backup-LegacyTasks -Paths $Paths
+      if (-not $bk.Ok) {
+        return @{ Ok = $false; Action = "rejected"; Detail = ("backup task fallito (nessuna modifica eseguita): " + $bk.Error) }
+      }
+    }
     $updFn = $TaskActionUpdater
     if ($null -eq $updFn) { $updFn = { param($n, $p) return @{ Ok = $true; Detail = "task updater skipped" } } }
     foreach ($t in @(@{ Name = $Paths.TaskName; Launcher = $Paths.BinRunPi }, @{ Name = $Paths.RemoteTaskName; Launcher = $Paths.BinRunRemote })) {
@@ -1108,21 +1850,48 @@ function Invoke-LegacyMigration {
     if ($null -eq $startFn) { $startFn = { param($p) return @{ Ok = $true; Detail = "start skipped" } } }
     $healthOf = {
       param($v)
-      return (Test-ReleaseHealth -Paths $Paths -Version $v -Port $Paths.RemotePortDefault `
-        -TaskChecker $TaskChecker -PortChecker $PortChecker -ApiChecker $ApiChecker -VersionReader $VersionReader)
+      return (Test-ReleaseHealth -Paths $Paths -Version $v -Port $Paths.RemotePortDefault -HealthMode $HealthMode `
+        -TaskChecker $TaskChecker -PortChecker $PortChecker -ApiChecker $ApiChecker -VersionReader $VersionReader `
+        -TaskReader $TaskReader -ProcessProbe $ProcessProbe)
+    }
+    $healthWait = {
+      param($v)
+      return (Wait-ReleaseHealth -Paths $Paths -Version $v -Port $Paths.RemotePortDefault -TimeoutSec $HealthTimeoutSec -HealthMode $HealthMode `
+        -TaskChecker $TaskChecker -PortChecker $PortChecker -ApiChecker $ApiChecker -VersionReader $VersionReader `
+        -TaskReader $TaskReader -ProcessProbe $ProcessProbe)
     }
     $stp = & $stopFn $Paths
     if (-not $stp.Ok) {
       return @{ Ok = $false; Action = "rejected"; Detail = ("stop pre-migrazione fallito: " + (Get-HookDetail $stp)) }
     }
     $str = & $startFn $Paths
-    $hLeg = & $healthOf $legacyVer
-    if ((-not $str.Ok) -or (-not $hLeg.Ok)) {
-      return @{ Ok = $false; Action = "rejected"; Detail = ("legacy via nuovo launcher non sano (server fermo su legacy): " + $hLeg.Detail) }
+    if (-not $str.Ok) {
+      $bundle0 = Export-MigrationDiagnostics -Paths $Paths -Stage "legacy-start" -Version $legacyVer -TaskReader $TaskReader -ProcessProbe $ProcessProbe -ConnectionReader $null
+      $bl0 = ""
+      try { $bl0 = (" bundle=" + $bundle0.JsonPath) } catch { }
+      return @{ Ok = $false; Action = "rejected"; Detail = ("avvio runtime fallito: " + (Get-HookDetail $str) + $bl0) }
+    }
+    $hLeg = & $healthWait $legacyVer
+    if (-not $hLeg.Ok) {
+      $bundle = Export-MigrationDiagnostics -Paths $Paths -Stage "legacy-verify" -Version $legacyVer -Health $hLeg `
+        -TaskReader $TaskReader -ProcessProbe $ProcessProbe -ConnectionReader $null
+      $bl = ""
+      try { $bl = (" bundle=" + $bundle.JsonPath) } catch { }
+      $syn = ""
+      try { $syn = [string]$hLeg.Synthesis } catch { }
+      if ($syn -eq "") { $syn = $hLeg.Detail }
+      $rb2 = Restore-LegacyRuntime -Paths $Paths -StopRuntime $stopFn -StartRuntime $startFn `
+        -TaskChecker $TaskChecker -PortChecker $PortChecker -ApiChecker $ApiChecker -LegacyVersion $legacyVer `
+        -TaskReader $TaskReader -ProcessProbe $ProcessProbe -HealthMode $HealthMode
+      if ($rb2.Ok) {
+        return @{ Ok = $false; Action = "migration_failed_legacy_restored_healthy"; Detail = ("legacy via nuovo launcher non sano [" + $syn + "]; original v0.2.x ripristinato e verificato" + $bl) }
+      }
+      return @{ Ok = $false; Action = "manual_intervention_required"; Detail = ("legacy via nuovo launcher non sano [" + $syn + "]; restore legacy fallito: " + $rb2.Detail + $bl) }
     }
     $up = Invoke-ReleaseUpdate -Paths $Paths -TargetVersion $TargetVersion -StagingDir $StagingDir `
       -NodeExe $NodeExe -StopRuntime $StopRuntime -StartRuntime $StartRuntime `
-      -TaskChecker $TaskChecker -PortChecker $PortChecker -ApiChecker $ApiChecker -VersionReader $VersionReader
+      -TaskChecker $TaskChecker -PortChecker $PortChecker -ApiChecker $ApiChecker -VersionReader $VersionReader `
+      -TaskReader $TaskReader -ProcessProbe $ProcessProbe -HealthTimeoutSec $HealthTimeoutSec -HealthMode $HealthMode
     if ($up.Ok) {
       return @{ Ok = $true; Action = "migrated"; Detail = ("legacy " + $legacyVer + " -> " + $TargetVersion + " (app intatta per recovery)") }
     }
@@ -1491,4 +2260,62 @@ function Test-V3Active {
     try { $major = [int]$parts[0]; $minor = [int]($parts[1] -split "-")[0] } catch { return $false }
     return (($major -gt 0) -or ($minor -ge 3))
   } catch { return $false }
+}
+
+<#
+.SYNOPSIS
+  Detect node layout: legacy | v3 | partial-migration | empty. Never throws.
+.DESCRIPTION
+  File-based (portable, no task inspection unless -TaskActionReader given):
+  - v3: valid pointer + resolvable release.
+  - legacy: no pointer + legacy app\ present.
+  - partial-migration: pointer dangles, or releases orphaned without pointer,
+    or pointer valid but a task action still points at legacy app\.
+  - empty: nothing installed yet.
+  Returns @{ Layout; Detail; PendingTx }.
+#>
+function Test-ServerLayout {
+  param(
+    [hashtable]$Paths = $null,
+    [scriptblock]$TaskActionReader = $null
+  )
+  try {
+    if ($null -eq $Paths) { return @{ Layout = "empty"; Detail = "paths nulli"; PendingTx = $false } }
+    $ptr = Read-ActiveRelease -PointerPath $Paths.ActivePointer
+    $leg = Test-LegacyLayout -Paths $Paths
+    $installed = Get-InstalledReleases -ReleasesRoot $Paths.Releases
+    $pending = $false
+    try {
+      $stU = Read-UpdateState -StatePath $Paths.UpdateState
+      $pending = ($stU.Found -and (-not $stU.Corrupt) -and (@("completed", "failed", "rollback_completed") -notcontains $stU.State.phase))
+    } catch { }
+    if ($ptr.Ok) {
+      $rd = Resolve-ReleaseDir -Root $Paths.Root -Version $ptr.Version
+      if (-not $rd.Ok) {
+        return @{ Layout = "partial-migration"; Detail = ("pointer valido ma release non risolvibile: " + $rd.Error); PendingTx = $pending }
+      }
+      if ($null -ne $TaskActionReader) {
+        foreach ($tn in @($Paths.TaskName, $Paths.RemoteTaskName)) {
+          $act = ""
+          try { $act = [string](& $TaskActionReader $tn) } catch { }
+          if (($act -ne "") -and ($act -match [regex]::Escape($Paths.App)) -and ($act -notmatch [regex]::Escape($Paths.Bin))) {
+            return @{ Layout = "partial-migration"; Detail = ("task ancora su legacy app: " + $tn); PendingTx = $pending }
+          }
+        }
+      }
+      return @{ Layout = "v3"; Detail = ("attivo " + $ptr.Version); PendingTx = $pending }
+    }
+    if ($leg.Found) {
+      if ($pending -or (@($installed).Count -gt 0)) {
+        return @{ Layout = "partial-migration"; Detail = ("legacy presente + stato v3 parziale (releases o transazione pendente)"); PendingTx = $pending }
+      }
+      return @{ Layout = "legacy"; Detail = ("v0.2.x intatto (" + $leg.Version + ")"); PendingTx = $false }
+    }
+    if (@($installed).Count -gt 0) {
+      return @{ Layout = "partial-migration"; Detail = "releases orfane senza pointer"; PendingTx = $pending }
+    }
+    return @{ Layout = "empty"; Detail = "niente installato"; PendingTx = $pending }
+  } catch {
+    return @{ Layout = "partial-migration"; Detail = ("rilevamento fallito: " + $_.Exception.Message); PendingTx = $false }
+  }
 }

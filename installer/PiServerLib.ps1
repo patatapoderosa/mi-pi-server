@@ -104,6 +104,8 @@ function Get-PiServerPaths {
     MachineEnv = Join-Path $data "runtime-env.json"
     UpdaterLog = Join-Path $logs "updater.log"
     DoctorLog = Join-Path $logs "doctor.log"
+    MigrationDir = Join-Path $data "migration"
+    TaskBackup = Join-Path (Join-Path $data "migration") "legacy-task-backup.json"
   }
 }
 

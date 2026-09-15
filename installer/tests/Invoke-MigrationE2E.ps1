@@ -61,7 +61,7 @@ if ($null -eq $nodeCmd) {
 }
 $NodeExe = $nodeCmd.Source
 
-$TestPorts = @(44998, 44997)
+$TestPorts = @(44998, 44997, 44996, 44995)
 foreach ($tp in $TestPorts) {
   $probeBusy = Get-TcpListenerOwner -Port $tp
   if ($probeBusy.Listening) {
@@ -98,6 +98,35 @@ function New-E2EReleaseFiles([string]$dir, [string]$ver) {
   }
   $ver | Out-File -LiteralPath (Join-Path $dir "VERSION") -Encoding ascii -NoNewline
 }
+
+function Export-TagTree([string]$tag, [string]$dest, [string[]]$files) {
+  try { & git rev-parse --verify ("refs/tags/" + $tag) 2>&1 | Out-Null } catch { }
+  if ($LASTEXITCODE -ne 0) { throw ("tag git assente (serve full clone): " + $tag) }
+  $tar = Join-Path ([System.IO.Path]::GetTempPath()) ("tagtree-" + [Guid]::NewGuid().ToString("N") + ".tar")
+  try {
+    $gf = @($files | ForEach-Object { $_ -replace "\\", "/" })
+    & git archive $tag $gf -o $tar 2>&1 | Out-Null
+    if (($LASTEXITCODE -ne 0) -or (-not (Test-Path -LiteralPath $tar))) { throw "git archive fallito" }
+    if (-not (Test-Path -LiteralPath $dest)) { New-Item -ItemType Directory -Path $dest -Force | Out-Null }
+    & tar -xf $tar -C $dest 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "tar extract fallito" }
+  } finally {
+    Remove-Item -LiteralPath $tar -Force -ErrorAction SilentlyContinue
+  }
+  foreach ($rel in $files) {
+    if (-not (Test-Path -LiteralPath (Join-Path $dest $rel))) { throw ("file tag mancante dopo extract: " + $rel) }
+  }
+}
+
+$script:LegacyTagFiles = @(
+  "server\pi-daemon.mjs", "server\spawn-pi.mjs",
+  "server\pi-remote-config\index.ts", "server\pi-remote-config\package.json",
+  "server\pi-remote-server\index.ts", "server\pi-remote-server\server.ts",
+  "server\pi-remote-server\migrate.ts", "server\pi-remote-server\tailscale.ts",
+  "shared\protocol.ts", "shared\modules.ts", "shared\store.ts", "shared\pi-model.ts",
+  "installer\PiServerLib.ps1", "installer\windows-installer.ps1",
+  "installer\run-task.ps1", "installer\run-remote.ps1"
+)
 
 function New-StubPi([string]$path) {
   '@echo {"type":"e2e-stub-ready"}' | Out-File -LiteralPath $path -Encoding ascii -NoNewline
@@ -169,9 +198,10 @@ function Build-Scenario([string]$name, [int]$port) {
   New-Item -ItemType Directory -Path (Join-Path $app "server") -Force | Out-Null
   New-Item -ItemType Directory -Path $paths.Data -Force | Out-Null
   New-Item -ItemType Directory -Path $paths.Logs -Force | Out-Null
-  New-E2EReleaseFiles $app "0.2.10"
+  Export-TagTree "v0.2.10" $app $script:LegacyTagFiles
   Copy-Item -LiteralPath (Join-Path $app "installer\run-task.ps1") -Destination (Join-Path $app "run-task.ps1") -Force
   Copy-Item -LiteralPath (Join-Path $app "installer\run-remote.ps1") -Destination (Join-Path $app "run-remote.ps1") -Force
+  "0.2.10" | Out-File -LiteralPath (Join-Path $app "VERSION") -Encoding ascii -NoNewline
   $stubPi = Join-Path $app "stub-pi.cmd"
   New-StubPi $stubPi
   $stripProbe = Join-Path $app "server\pi-remote-server\index.ts"
@@ -294,6 +324,15 @@ try {
   Assert-True ((Get-TaskState $p1.RemoteTaskName) -eq "Running") "remote task Running post-migration"
   $pingNew = Test-RemoteApiPing -Paths $p1 -Port $p1.RemotePortDefault -TimeoutSec 10
   Assert-True $pingNew.Ok "api pong sulla nuova release"
+  $envKeys1 = @((Get-Content -LiteralPath $p1.MachineEnv -Raw | ConvertFrom-Json).PSObject.Properties.Name)
+  Assert-True ((($envKeys1 -notcontains "DaemonScript") -and ($envKeys1 -notcontains "RemoteEntry"))) "data env solo machine facts (F)"
+  $cimHit1 = $false
+  try {
+    foreach ($pr in @(Get-CimInstance Win32_Process -ErrorAction Stop)) {
+      if ([string]$pr.CommandLine -match [regex]::Escape((Join-Path $p1.Releases "v0.3.0"))) { $cimHit1 = $true; break }
+    }
+  } catch { }
+  Assert-True $cimHit1 "daemon gira da releases\ (F, ignora DaemonScript legacy)"
   $goneAll = $true
   foreach ($id in $script:stubPids) {
     try { $pp = Get-Process -Id $id -ErrorAction Stop; if (-not $pp.HasExited) { $goneAll = $false } } catch { }
@@ -330,9 +369,87 @@ try {
   try { Stop-PiServerRuntime -Paths $p2 -RemotePort $p2.RemotePortDefault -TimeoutSec 30 | Out-Null } catch { }
   Stop-E2EStubs
   Unregister-E2ETasks
+
+  Write-Host "== migration E2E scenario 3: remote dies -> legacy restore, online =="
+  $s3 = Build-Scenario "s3" 44996
+  $p3 = $s3.Paths
+  Start-ScenarioRuntime $p3
+  Add-ScenarioLocks $s3.App $p3.RemotePortDefault
+  $script:s3Armed = $true
+  $h3base = New-E2EHooks $p3 $vrLive
+  $s3StartOrig = $h3base.Start
+  $h3base.Start = {
+    param($p)
+    $r = & $s3StartOrig $p
+    if ($script:s3Armed -and $r.Ok) {
+      try { Stop-ScheduledTask -TaskName $p.RemoteTaskName -ErrorAction Stop } catch { }
+      $script:s3Armed = $false
+    }
+    return $r
+  }.GetNewClosure()
+  $mig3 = Invoke-LegacyMigration -Paths $p3 -StagingDir $s3.Payload -TargetVersion "v0.3.0" -NodeExe $NodeExe -HealthTimeoutSec 45 `
+    -StopRuntime $h3base.Stop -StartRuntime $h3base.Start -TaskChecker $h3base.TaskCheck -PortChecker $h3base.PortCheck `
+    -ApiChecker $h3base.ApiCheck -VersionReader $h3base.VersionReader -TaskActionUpdater $h3base.TaskUpd
+  Write-Host ("  MIG detail s3: " + $mig3.Action + " " + $mig3.Detail)
+  Assert-True ((-not $mig3.Ok) -and ($mig3.Action -eq "migration_failed_legacy_restored_healthy")) "remote morto -> legacy restored (G+C)"
+  Assert-Equal (Read-ActiveRelease -PointerPath $p3.ActivePointer).Version "v0.2.10" "pointer mai spostato"
+  $tPi3 = Get-ScheduledTask -TaskName $p3.TaskName -ErrorAction SilentlyContinue
+  $tRe3 = Get-ScheduledTask -TaskName $p3.RemoteTaskName -ErrorAction SilentlyContinue
+  Assert-True (([string]$tPi3.Actions[0].Arguments).Contains((Join-Path $s3.App "run-task.ps1"))) "task Pi tornata su app\\ (G)"
+  Assert-True (([string]$tRe3.Actions[0].Arguments).Contains((Join-Path $s3.App "run-remote.ps1"))) "task Remote tornata su app\\ (G)"
+  Assert-True ((Get-TaskState $p3.TaskName) -eq "Running") "legacy ONLINE dopo restore"
+  Assert-True ((Get-TaskState $p3.RemoteTaskName) -eq "Running") "remote ONLINE dopo restore"
+  $pingRe = Test-RemoteApiPing -Paths $p3 -Port $p3.RemotePortDefault -TimeoutSec 10
+  Assert-True $pingRe.Ok "api pong su legacy ripristinato"
+  $diagJson = Join-Path $p3.Logs "migration-diagnostic.json"
+  Assert-True (Test-Path -LiteralPath $diagJson) "bundle diagnostico scritto"
+  $diagTxt = Get-Content -LiteralPath $diagJson -Raw
+  Assert-True (($diagTxt -match "taskRemote") -and ($diagTxt -notmatch "[Ss]ecret")) "bundle nomina taskRemote, redatto"
+  Remove-Variable -Name s3Armed -Scope Script -ErrorAction SilentlyContinue
+  try { Stop-PiServerRuntime -Paths $p3 -RemotePort $p3.RemotePortDefault -TimeoutSec 30 | Out-Null } catch { }
+  Stop-E2EStubs
+  Unregister-E2ETasks
+
+  Write-Host "== migration E2E scenario 4: partial rc1 attempt -> resume =="
+  $s4 = Build-Scenario "s4" 44995
+  $p4 = $s4.Paths
+  Copy-Item -LiteralPath $s4.App -Destination (Join-Path $p4.Releases "v0.2.10") -Recurse -Force
+  $legEnv4 = Read-MachineEnv -EnvPath (Join-Path $s4.App "runtime-env.json")
+  if (-not $legEnv4.Ok) { throw ("fixture env illeggibile: " + $legEnv4.Error) }
+  Write-MachineEnv -EnvPath $p4.MachineEnv -Env $legEnv4.Env | Out-Null
+  $inst4 = Install-ReleaseCandidate -StagingDir $s4.Payload -ReleasesRoot $p4.Releases -Version "v0.3.0"
+  if (-not $inst4.Ok) { throw ("fixture target fallito: " + $inst4.Error) }
+  Write-ActiveRelease -PointerPath $p4.ActivePointer -Version "v0.2.10" | Out-Null
+  $bin4 = Install-BinFiles -PayloadDir $s4.Payload -BinDir $p4.Bin
+  if (-not $bin4.Ok) { throw ("fixture bin fallito: " + $bin4.Error) }
+  Register-E2ETask $p4.TaskName (Join-Path $s4.App "run-task.ps1") (Join-Path $s4.App "server")
+  Register-E2ETask $p4.RemoteTaskName (Join-Path $s4.App "run-remote.ps1") (Join-Path $s4.App "server\pi-remote-server")
+  $bk4 = Backup-LegacyTasks -Paths $p4
+  if (-not $bk4.Ok) { throw ("fixture backup fallito: " + $bk4.Error) }
+  $rp4a = Update-PiServerTaskAction -TaskName $p4.TaskName -LauncherPath $p4.BinRunPi -WorkDir $p4.Bin
+  $rp4b = Update-PiServerTaskAction -TaskName $p4.RemoteTaskName -LauncherPath $p4.BinRunRemote -WorkDir $p4.Bin
+  if ((-not $rp4a.Ok) -or (-not $rp4b.Ok)) { throw "fixture repoint fallito" }
+  $st4 = @{ schemaVersion = 1; transactionId = "tx-e2e-partial"; fromVersion = "v0.2.10"; toVersion = "v0.3.0"; phase = "candidate_installed"; previousVersion = "v0.2.10"; startedAt = "t"; updatedAt = "" }
+  Write-UpdateState -StatePath $p4.UpdateState -State $st4 | Out-Null
+  Add-ScenarioLocks $s4.App $p4.RemotePortDefault
+  $h4 = New-E2EHooks $p4 $vrLive
+  $mig4 = Invoke-LegacyMigration -Paths $p4 -StagingDir $s4.Payload -TargetVersion "v0.3.0" -NodeExe $NodeExe `
+    -StopRuntime $h4.Stop -StartRuntime $h4.Start -TaskChecker $h4.TaskCheck -PortChecker $h4.PortCheck `
+    -ApiChecker $h4.ApiCheck -VersionReader $h4.VersionReader -TaskActionUpdater $h4.TaskUpd
+  Write-Host ("  MIG detail s4: " + $mig4.Action + " " + $mig4.Detail)
+  Assert-True $mig4.Ok "partial resume completa senza clean install (H)"
+  Assert-Equal (Read-ActiveRelease -PointerPath $p4.ActivePointer).Version "v0.3.0" "pointer v0.3.0 dopo resume"
+  $bk4After = (Get-Content -LiteralPath $p4.TaskBackup -Raw | ConvertFrom-Json)
+  Assert-True (([string]$bk4After.tasks[0].args).Contains((Join-Path $s4.App "run-task.ps1"))) "backup originale intatto (mai sovrascritto)"
+  Assert-True ((Get-TaskState $p4.TaskName) -eq "Running") "pi Running dopo resume"
+  Assert-True ((Get-TaskState $p4.RemoteTaskName) -eq "Running") "remote Running dopo resume"
+  Assert-Equal (Get-Content -LiteralPath (Join-Path $s4.App "VERSION") -Raw) "0.2.10" "legacy app intatta dopo resume"
+  try { Stop-PiServerRuntime -Paths $p4 -RemotePort $p4.RemotePortDefault -TimeoutSec 30 | Out-Null } catch { }
+  Stop-E2EStubs
+  Unregister-E2ETasks
 } catch {
   Write-Host ("  FAIL eccezione E2E: " + $_.Exception.Message) -ForegroundColor Red
-  foreach ($vn in @("p1", "p2")) {
+  foreach ($vn in @("p1", "p2", "p3", "p4")) {
     $vv = Get-Variable -Name $vn -ErrorAction SilentlyContinue
     if (($null -ne $vv) -and ($null -ne $vv.Value)) { Dump-E2ELogs $vv.Value }
   }

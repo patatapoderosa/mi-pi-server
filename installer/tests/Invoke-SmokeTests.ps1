@@ -1205,6 +1205,9 @@ try {
   Assert-True (-not $rdDot.Ok) "suffix .. passa formato ma traversal rifiutato"
   $upRoot = Join-Path $TmpRoot "v3upd"
   $ppUp = New-V3Root $upRoot
+  $upNode = Join-Path $upRoot "node-fake.exe"
+  "x" | Out-File -LiteralPath $upNode -Encoding ascii -NoNewline
+  Write-MachineEnv -EnvPath $ppUp.MachineEnv -Env @{ NodeExe = $upNode; PiBin = ""; NpmGlobalBin = ""; NodeArgs = @(); AgentDir = $ppUp.AgentDir } | Out-Null
   $pay30 = Join-Path $upRoot "pay30"
   $pay31 = Join-Path $upRoot "pay31"
   New-V3Payload $pay30 "v0.3.0"
@@ -1235,6 +1238,9 @@ try {
   Assert-True ((Get-Content -LiteralPath (Join-Path $ppUp.Releases "v0.3.2\VERSION") -Raw) -eq "v0.3.2") "candidate fallita resta installata ma inattiva"
   $recRoot = Join-Path $TmpRoot "v3rec"
   $ppRec = New-V3Root $recRoot
+  $recNode = Join-Path $recRoot "node-fake.exe"
+  "x" | Out-File -LiteralPath $recNode -Encoding ascii -NoNewline
+  Write-MachineEnv -EnvPath $ppRec.MachineEnv -Env @{ NodeExe = $recNode; PiBin = ""; NpmGlobalBin = ""; NodeArgs = @(); AgentDir = $ppRec.AgentDir } | Out-Null
   $payR0 = Join-Path $recRoot "payR0"
   $payR1 = Join-Path $recRoot "payR1"
   New-V3Payload $payR0 "v0.3.0"
@@ -1272,8 +1278,12 @@ try {
   Assert-True (($rc6.Ok) -and ($rc6.Action -eq "nothing_to_do")) "senza state: nothing to do"
   $migRoot = Join-Path $TmpRoot "v3mig"
   $legApp = Join-Path $migRoot "psrv\app"
-  New-Item -ItemType Directory -Path (Join-Path $legApp "server") -Force | Out-Null
-  "x" | Out-File -LiteralPath (Join-Path $legApp "server\pi-daemon.mjs") -Encoding ascii -NoNewline
+  foreach ($rel in $script:ReleaseManifest) {
+    $lfp = Join-Path $legApp $rel
+    $ldd = Split-Path -Parent $lfp
+    if (-not (Test-Path -LiteralPath $ldd)) { New-Item -ItemType Directory -Path $ldd -Force | Out-Null }
+    ("legapp:" + $rel) | Out-File -LiteralPath $lfp -Encoding ascii -NoNewline
+  }
   "0.2.10" | Out-File -LiteralPath (Join-Path $legApp "VERSION") -Encoding ascii -NoNewline
   $legPaths = Get-PiServerPaths -Root (Join-Path $migRoot "psrv")
   $fakeNode = Join-Path $migRoot "node-fake.exe"
@@ -1389,6 +1399,121 @@ try {
   Compress-Archive -Path (Join-Path $xpEmpty "*") -DestinationPath $xpZip3 -Force
   $xp3 = Expand-ReleasePayload -ZipPath $xpZip3 -DestDir (Join-Path $xpRoot "out4")
   Assert-True (-not $xp3.Ok) "zip senza VERSION rifiutato"
+  Write-Host "== structured health + polling + diagnostics (rc2) =="
+  $hRoot = Join-Path $TmpRoot "v3h"
+  $ppH = New-V3Root $hRoot
+  $hNode = Join-Path $hRoot "node-fake.exe"
+  "x" | Out-File -LiteralPath $hNode -Encoding ascii -NoNewline
+  Write-MachineEnv -EnvPath $ppH.MachineEnv -Env @{ NodeExe = $hNode; PiBin = ""; NpmGlobalBin = ""; NodeArgs = @(); AgentDir = $ppH.AgentDir } | Out-Null
+  $payH2 = Join-Path $hRoot "pay"
+  New-V3Payload $payH2 "v0.3.0"
+  Install-ReleaseCandidate -StagingDir $payH2 -ReleasesRoot $ppH.Releases -Version "v0.3.0" | Out-Null
+  Write-ActiveRelease -PointerPath $ppH.ActivePointer -Version "v0.3.0" | Out-Null
+  $hkT = { param($p) return @{ PiRunning = $true; RemoteRunning = $true; Detail = "ok" } }
+  $hkP = { param($pt) return @{ Listening = $true; Pid = 4444; Name = "node.exe"; CommandLine = "node releases\\v0.3.0\\server\\pi-remote-server\\index.ts"; Detail = "x" } }
+  $hkA = { param($p) return @{ Ok = $true; Detail = "pong" } }
+  $hkV = { param($p) return @{ Ok = $true; Version = "v0.3.0" } }
+  $hS = Test-ReleaseHealth -Paths $ppH -Version "v0.3.0" -Port 43128 -TaskChecker $hkT -PortChecker $hkP -ApiChecker $hkA -VersionReader $hkV
+  Assert-True $hS.Ok "health strutturato ok"
+  Assert-Equal $hS.Checks.Count 12 "12 check presenti"
+  Assert-True (($hS.Synthesis -match "taskMain=running") -and ($hS.Synthesis -match "port=listening") -and ($hS.Synthesis -match "api=pong") -and ($hS.Synthesis -match "version=v0.3.0")) "sintesi compatta"
+  Assert-True (($hS.Checks["pointer"].Ok) -and ($hS.Checks["manifest"].Ok) -and ($hS.Checks["env"].Ok)) "pointer+manifest+env ok"
+  $ppNoEnv = New-V3Root (Join-Path $TmpRoot "v3noenv")
+  Install-ReleaseCandidate -StagingDir $payH2 -ReleasesRoot $ppNoEnv.Releases -Version "v0.3.0" | Out-Null
+  Write-ActiveRelease -PointerPath $ppNoEnv.ActivePointer -Version "v0.3.0" | Out-Null
+  $hNoEnv = Test-ReleaseHealth -Paths $ppNoEnv -Version "v0.3.0" -TaskChecker $hkT -PortChecker $hkP -ApiChecker $hkA -VersionReader $hkV
+  Assert-True ((-not $hNoEnv.Ok) -and (-not $hNoEnv.Checks["env"].Ok)) "env assente rilevato e blocca"
+  $hkVBad = { param($p) return @{ Ok = $true; Version = "v9.9.9" } }
+  $hBad = Test-ReleaseHealth -Paths $ppH -Version "v0.3.0" -TaskChecker $hkT -PortChecker $hkP -ApiChecker $hkA -VersionReader $hkVBad
+  Assert-True ((-not $hBad.Ok) -and ($hBad.Checks["version"].Actual -eq "v9.9.9") -and ($hBad.Checks["version"].Expected -eq "v0.3.0")) "version mismatch strutturato"
+  $legHRoot = Join-Path $TmpRoot "v3hleg"
+  $ppLeg = New-V3Root $legHRoot
+  $payLeg = Join-Path $legHRoot "pay"
+  New-Item -ItemType Directory -Path $payLeg -Force | Out-Null
+  foreach ($rel in $script:ReleaseManifest) {
+    $fp = Join-Path $payLeg $rel
+    $dd = Split-Path -Parent $fp
+    if (-not (Test-Path -LiteralPath $dd)) { New-Item -ItemType Directory -Path $dd -Force | Out-Null }
+    ("leg:" + $rel) | Out-File -LiteralPath $fp -Encoding ascii -NoNewline
+  }
+  "0.2.10" | Out-File -LiteralPath (Join-Path $payLeg "VERSION") -Encoding ascii -NoNewline
+  Install-ReleaseCandidate -StagingDir $payLeg -ReleasesRoot $ppLeg.Releases -Version "v0.2.10" | Out-Null
+  Write-ActiveRelease -PointerPath $ppLeg.ActivePointer -Version "v0.2.10" | Out-Null
+  $legNode = Join-Path $legHRoot "node-fake.exe"
+  "x" | Out-File -LiteralPath $legNode -Encoding ascii -NoNewline
+  Write-MachineEnv -EnvPath $ppLeg.MachineEnv -Env @{ NodeExe = $legNode; PiBin = ""; NpmGlobalBin = ""; NodeArgs = @(); AgentDir = $ppLeg.AgentDir } | Out-Null
+  $hkVL = { param($p) return @{ Ok = $true; Version = "v0.2.10" } }
+  $hLeg2 = Test-ReleaseHealth -Paths $ppLeg -Version "v0.2.10" -TaskChecker $hkT -PortChecker $hkP -ApiChecker $hkA -VersionReader $hkVL
+  Assert-True ($hLeg2.Ok -and $hLeg2.Checks["manifest"].Ok) "legacy valida con manifest legacy (E: nessun endpoint v3 richiesto)"
+  $mcV3onLeg = Test-ReleaseContent -PayloadDir (Join-Path $ppLeg.Releases "v0.2.10") -ExpectedVersion "v0.2.10"
+  Assert-True (-not $mcV3onLeg.Ok) "manifest v3 su snapshot legacy fallisce (per questo serve il mode)"
+  $global:upFlakyN = 0
+  $vrFlaky = { param($p) $global:upFlakyN++; if ($global:upFlakyN -lt 3) { return @{ Ok = $true; Version = "sbagliata" } } return @{ Ok = $true; Version = "v0.3.0" } }
+  $wFlaky = Wait-ReleaseHealth -Paths $ppH -Version "v0.3.0" -TimeoutSec 20 -TaskChecker $hkT -PortChecker $hkP -ApiChecker $hkA -VersionReader $vrFlaky
+  Assert-True (($wFlaky.Ok) -and ($global:upFlakyN -ge 3)) "polling supera flakiness iniziale (B)"
+  $vrDead = { param($p) return @{ Ok = $true; Version = "mai" } }
+  $t0w = [DateTime]::UtcNow
+  $wDead = Wait-ReleaseHealth -Paths $ppH -Version "v0.3.0" -TimeoutSec 6 -TaskChecker $hkT -PortChecker $hkP -ApiChecker $hkA -VersionReader $vrDead
+  $dtw = ([DateTime]::UtcNow - $t0w).TotalSeconds
+  Assert-True ((-not $wDead.Ok) -and ($dtw -ge 4) -and ($dtw -lt 30)) "timeout polling bounded"
+  $trMissing = { param($n) return @{ Exists = $false; State = ""; LastResult = 0; Detail = "assente" } }
+"errlog-marker-xyz" | Out-File -LiteralPath $ppH.ServerErrLog -Encoding ascii -NoNewline
+  $hkTDown = { param($p) return @{ PiRunning = $false; RemoteRunning = $false; Detail = "giu" } }
+  $wMiss = Wait-ReleaseHealth -Paths $ppH -Version "v0.3.0" -TimeoutSec 30 -TaskChecker $hkTDown -PortChecker $hkP -ApiChecker $hkA -VersionReader $hkV -TaskReader $trMissing
+  Assert-True ((-not $wMiss.Ok) -and ($wMiss.Detail -match "missing") -and ($wMiss.Detail -match "errlog-marker-xyz")) "fatal-fast task missing + errlog (C)"
+  Remove-Variable -Name upFlakyN -Scope Global -ErrorAction SilentlyContinue
+"token abcdef123456" | Out-File -LiteralPath $ppH.RemoteErrLog -Encoding ascii -NoNewline
+  1..100 | ForEach-Object { ("logline " + $_) | Out-File -LiteralPath $ppH.ServerLog -Encoding ascii -Append -NoNewline }
+  $dg = Export-MigrationDiagnostics -Paths $ppH -Stage "unit-test" -Version "v0.3.0" -Health $hS -TaskReader { param($n) return @{ Exists = $true; State = "Running"; LastResult = 0 } } -ProcessProbe { return @([pscustomobject]@{ ProcessId = 4242; Name = "node.exe"; CommandLine = "node x --mode rpc --api-key SUPERSEGRETA" }) } -ConnectionReader { param($pt) return @{ Listening = $true; Pid = 4242; Name = "node.exe"; CommandLine = "node pi-remote-server"; Detail = "ok" } }
+  Assert-True ($dg.Ok -and (Test-Path -LiteralPath $dg.JsonPath) -and (Test-Path -LiteralPath $dg.TxtPath)) "bundle json+txt scritti"
+  $dgRaw = Get-Content -LiteralPath $dg.JsonPath -Raw
+  Assert-True (($dgRaw -notmatch "SUPERSEGRETA") -and ($dgRaw -notmatch "abcdef123456") -and ($dgRaw -match "redacted")) "bundle redatto"
+  $dgObj = $dgRaw | ConvertFrom-Json
+  Assert-True ((@($dgObj.logTails80."pi-server").Count -le 80) -and ($dgObj.tasks.Count -eq 2)) "cap 80 righe + 2 task"
+  Assert-True (($dgObj.modeRpcOrphans -contains 4242) -and ($dgObj.listener.listening -eq $true)) "orfani + listener nel bundle"
+  $wme1 = Write-MachineEnv -EnvPath (Join-Path $hRoot "env1.json") -Env @{ NodeExe = $hNode; PiBin = ""; NpmGlobalBin = ""; NodeArgs = @(); AgentDir = $ppH.AgentDir }
+  Assert-True $wme1.Ok "write env"
+  $envRaw1 = Get-Content -LiteralPath (Join-Path $hRoot "env1.json") -Raw
+  Assert-True (($envRaw1 -match "schemaVersion") -and ($envRaw1 -notmatch "DaemonScript") -and ($envRaw1 -notmatch "RemoteEntry")) "solo machine facts + schema (F)"
+  $me1 = Read-MachineEnv -EnvPath (Join-Path $hRoot "env1.json")
+  Assert-True (($me1.Ok) -and ($me1.Env.Schema -eq 1)) "schema letto = 1"
+  (@{ NodeExe = $hNode; AgentDir = $ppH.AgentDir } | ConvertTo-Json) | Out-File -LiteralPath (Join-Path $hRoot "envLeg.json") -Encoding ascii -NoNewline
+  $meLeg2 = Read-MachineEnv -EnvPath (Join-Path $hRoot "envLeg.json")
+  Assert-True (($meLeg2.Ok) -and ($meLeg2.Env.Schema -eq 0)) "legacy senza schema tollerato (Schema=0)"
+  $layLeg = Test-ServerLayout -Paths $ppLeg
+  Assert-Equal $layLeg.Layout "v3" "pointer+release = flusso v3 anche per 0.2.10"
+  $bareRoot = Join-Path $TmpRoot "v3bare"
+  $ppBare = Get-PiServerPaths -Root (Join-Path $bareRoot "psrv")
+  $bareApp = $ppBare.App
+  New-Item -ItemType Directory -Path (Join-Path $bareApp "server") -Force | Out-Null
+  "x" | Out-File -LiteralPath (Join-Path $bareApp "server\pi-daemon.mjs") -Encoding ascii -NoNewline
+  "0.2.10" | Out-File -LiteralPath (Join-Path $bareApp "VERSION") -Encoding ascii -NoNewline
+  $layBare = Test-ServerLayout -Paths $ppBare
+  Assert-Equal $layBare.Layout "legacy" "solo app senza pointer = legacy"
+  $layH = Test-ServerLayout -Paths $ppH
+  Assert-Equal $layH.Layout "v3" "layout v3"
+  Write-ActiveRelease -PointerPath (Join-Path $hRoot "ptrx") -Version "v0.3.0" | Out-Null
+  $ppPart = Get-PiServerPaths -Root (Join-Path $hRoot "part")
+  New-Item -ItemType Directory -Path $ppPart.Releases -Force | Out-Null
+  New-Item -ItemType Directory -Path $ppPart.Data -Force | Out-Null
+  Copy-Item -LiteralPath (Join-Path $hRoot "ptrx") -Destination $ppPart.ActivePointer -Force
+  $layPart = Test-ServerLayout -Paths $ppPart
+  Assert-Equal $layPart.Layout "partial-migration" "pointer senza release = partial (H)"
+  $bkPre = @{ schemaVersion = 1; timestamp = "t"; tasks = @(@{ name = $ppH.TaskName; execute = "powershell.exe"; args = "-File leg.ps1"; workDir = "C:\x" }, @{ name = $ppH.RemoteTaskName; execute = "powershell.exe"; args = "-File leg2.ps1"; workDir = "C:\x" }) }
+  New-Item -ItemType Directory -Path (Split-Path -Parent $ppH.TaskBackup) -Force | Out-Null
+  ($bkPre | ConvertTo-Json -Depth 4) | Out-File -LiteralPath $ppH.TaskBackup -Encoding ascii -NoNewline
+  $bkReuse = Backup-LegacyTasks -Paths $ppH
+  Assert-True (($bkReuse.Ok) -and $bkReuse.Reused) "backup esistente riusato, mai sovrascritto"
+  Assert-True (((Get-Content -LiteralPath $ppH.TaskBackup -Raw | ConvertFrom-Json).tasks[0].args) -eq "-File leg.ps1") "backup intatto"
+  Remove-Item -LiteralPath $ppH.TaskBackup -Force
+  $bkNoWin = Backup-LegacyTasks -Paths $ppH
+  Assert-True ((-not $bkNoWin.Ok)) "backup senza task reali fallisce pulito"
+  $rsMissing = Restore-LegacyTasks -Paths $ppH
+  Assert-True ((-not $rsMissing.Ok) -and ($rsMissing.Error -match "assente")) "restore senza backup fallisce"
+  $libBin = Get-Content -LiteralPath (Join-Path $v3LibDir "bin\run-pi.ps1") -Raw
+  Assert-True (($libBin -match "schemaVersion") -and ($libBin -notmatch 'DaemonScript')) "launcher: schema gate, nessun DaemonScript legacy"
+  $libRem = Get-Content -LiteralPath (Join-Path $v3LibDir "bin\run-remote.ps1") -Raw
+  Assert-True (($libRem -match "active-release") -and ($libRem -notmatch 'RemoteEntry.*env2')) "remote launcher deriva dal pointer"
 } finally {
   Remove-Item -LiteralPath $TmpRoot -Recurse -Force -ErrorAction SilentlyContinue
 }

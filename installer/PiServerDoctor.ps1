@@ -148,6 +148,16 @@ function Invoke-ServerDoctor {
     $leg = Test-LegacyLayout -Paths $Paths
     & $add (New-DoctorCheck -Name "legacy_layout" -Ok $true -Severity "info" `
       -Detail (& { if ($leg.Found) { ("presente (" + $leg.Version + "), intatto per recovery") } else { "assente (post-migrazione)" } }))
+    $layout = Test-ServerLayout -Paths $Paths
+    $layoutSev = "info"
+    if ($layout.Layout -eq "partial-migration") { $layoutSev = "warning" }
+    if ($layout.Layout -eq "empty") { $layoutSev = "warning" }
+    & $add (New-DoctorCheck -Name "server_layout" -Ok ($layout.Layout -ne "partial-migration") -Severity $layoutSev `
+      -Detail ([string]$layout.Layout + ": " + [string]$layout.Detail) -Recoverable ($layout.Layout -eq "partial-migration"))
+    $tbPresent = $false
+    try { $tbPresent = Test-Path -LiteralPath $Paths.TaskBackup } catch { }
+    & $add (New-DoctorCheck -Name "migration_task_backup" -Ok $true -Severity "info" `
+      -Detail (& { if ($tbPresent) { "presente (restore legacy possibile)" } else { "assente (nessuna migration con repoint eseguita)" } }))
     if ($ptr.Ok) {
       $rd = Resolve-ReleaseDir -Root $Paths.Root -Version $ptr.Version
       if ($rd.Ok) {
