@@ -79,7 +79,7 @@ function New-E2EReleaseFiles([string]$dir, [string]$ver) {
     "server\pi-daemon.mjs", "server\spawn-pi.mjs",
     "server\pi-remote-config\index.ts", "server\pi-remote-config\package.json",
     "server\pi-remote-server\index.ts", "server\pi-remote-server\server.ts",
-    "server\pi-remote-server\migrate.ts", "server\pi-remote-server\tailscale.ts",
+    "server\pi-remote-server\migrate.ts", "server\pi-remote-server\tailscale.ts", "server\pi-remote-server\update.ts",
     "shared\protocol.ts", "shared\modules.ts", "shared\store.ts", "shared\pi-model.ts",
     "installer\PiServerLib.ps1", "installer\PiServerUpdate.ps1", "installer\PiServerDoctor.ps1",
     "installer\windows-installer.ps1", "installer\run-task.ps1", "installer\run-remote.ps1",

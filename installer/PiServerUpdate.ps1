@@ -22,6 +22,8 @@ $ErrorActionPreference = "Stop"
 
 # v3 payload manifest: v0.2.x files plus the update engine + stable launchers.
 $script:ReleaseManifestV3 = @($script:ReleaseManifest | ForEach-Object { $_ }) + @(
+  "server\pi-remote-server\update.ts",
+  "installer\PiServerLib.ps1",
   "installer\PiServerUpdate.ps1",
   "installer\PiServerDoctor.ps1",
   "installer\bin\run-pi.ps1",
