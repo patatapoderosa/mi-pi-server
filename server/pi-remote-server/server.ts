@@ -30,13 +30,14 @@ import {
   type Server,
   type ServerResponse,
 } from "node:http";
-import { execFile } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { execFile, spawn } from "node:child_process";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { createRequire } from "node:module";
 import {
   freemem,
   hostname as osHostname,
   loadavg,
+  tmpdir,
   totalmem,
   uptime as osUptime,
 } from "node:os";
@@ -52,16 +53,13 @@ import {
   type PatchValue,
 } from "../../shared/modules.ts";
 import {
-  MAX_CLOCK_SKEW_SECONDS_DEFAULT,
   checkFreshness,
-  createNonce,
   parseAuthHeaders,
   sha256Hex,
   verifySignature,
 } from "../../shared/protocol.ts";
 import {
   ReplayStore,
-  atomicWriteJson,
   ensureDir,
   readJsonFile,
 } from "../../shared/store.ts";
@@ -77,8 +75,25 @@ import {
   writeConfiguredDefault,
   type PiModelInfo,
 } from "../../shared/pi-model.ts";
+import {
+  buildDoctorArgv,
+  buildUpdaterArgv,
+  checkLatestRelease,
+  downloadRelease,
+  isReleaseVersion,
+  isTerminalPhase,
+  isUpdateAction,
+  listInstalledReleases,
+  piServerRoot,
+  readActivePointer,
+  readDoctorReport,
+  readHistoryTail,
+  readUpdateState,
+  resolveReleaseDir,
+  v3Available,
+  type UpdateAction,
+} from "./update.ts";
 const execFileAsync = promisify(execFile);
-const LOG = "[pi-remote-server]";
 const MAX_BODY_BYTES = 262144;
 
 export interface RemoteServerConfig {
@@ -444,7 +459,8 @@ async function runPi(
   extraArgs: string[],
   timeoutMs: number,
 ): Promise<PiRunResult> {
-  const bin = resolvePiBin(daemonAppRoot()) ?? "pi";
+  const bin =
+    resolvePiBin(agentDir) ?? resolvePiBin(daemonAppRoot()) ?? "pi";
   const spec = buildPiSpawn(bin, process.platform, extraArgs);
   try {
     const { stdout } = await execFileAsync(spec.command, spec.args, {
@@ -976,6 +992,441 @@ async function handle(
             : "settings_write_failed",
         message,
       });
+    }
+    return;
+  }
+
+  // ---- server_doctor / server_update (v0.3.0 pointer releases) ----
+  // First-class capabilities over the same auth pipeline. Mutations honor
+  // coreGates. Spawns use fixed argv only (powershell -File on a bin\
+  // script with enum action + regex version): never remote-constructed
+  // commands, never shell. See server/pi-remote-server/update.ts.
+  const psRoot = piServerRoot(ctx.opts.agentDir);
+
+  if (method === "GET" && pathname === "/v1/doctor") {
+    if (!v3Available(psRoot)) {
+      record(false, "v3_unavailable");
+      sendJson(res, 501, {
+        ok: false,
+        error: "v3_unavailable",
+        message: "Pointer releases not installed on this node (pre-v0.3.0 layout).",
+      });
+      return;
+    }
+    const rep = readDoctorReport(psRoot);
+    if (!rep.ok) {
+      record(false, rep.error);
+      sendJson(res, 503, {
+        ok: false,
+        error: rep.error,
+        message: "No doctor report yet. POST /v1/doctor with {fresh:true} to generate one.",
+      });
+      return;
+    }
+    record(true);
+    sendJson(res, 200, {
+      ok: true,
+      body: { status: rep.status, timestamp: rep.timestamp, checks: rep.checks },
+    });
+    return;
+  }
+
+  if (method === "POST" && pathname === "/v1/doctor") {
+    const parsed = parseJsonBody(body.raw);
+    if (!parsed.ok || typeof parsed.value !== "object" || parsed.value === null) {
+      record(false, parsed.ok ? "body_must_be_object" : parsed.error);
+      sendJson(res, 400, {
+        ok: false,
+        error: parsed.ok ? "body_must_be_object" : parsed.error,
+        message: "Body must be a JSON object: { fresh?, repair?, only? }.",
+      });
+      return;
+    }
+    const bv = parsed.value as Record<string, unknown>;
+    const fresh = bv["fresh"] === undefined ? false : bv["fresh"] === true;
+    const repair = bv["repair"] === undefined ? false : bv["repair"] === true;
+    const only = bv["only"] === undefined ? null : bv["only"];
+    if (
+      ("fresh" in bv && typeof bv["fresh"] !== "boolean") ||
+      ("repair" in bv && typeof bv["repair"] !== "boolean")
+    ) {
+      record(false, "bad_doctor_body");
+      sendJson(res, 400, {
+        ok: false,
+        error: "bad_doctor_body",
+        message: "fresh/repair must be booleans; only must be an array of repair groups.",
+      });
+      return;
+    }
+    if (only !== null && !repair) {
+      record(false, "only_without_repair");
+      sendJson(res, 400, {
+        ok: false,
+        error: "only_without_repair",
+        message: "`only` is only meaningful with repair:true.",
+      });
+      return;
+    }
+    if (repair) {
+      const gate = coreGates(configDir);
+      if (!gate.ok) {
+        record(false, gate.error);
+        sendJson(res, 403, { ok: false, error: gate.error, message: gate.message });
+        return;
+      }
+    }
+    if (!v3Available(psRoot)) {
+      record(false, "v3_unavailable");
+      sendJson(res, 501, {
+        ok: false,
+        error: "v3_unavailable",
+        message: "Pointer releases not installed on this node (pre-v0.3.0 layout).",
+      });
+      return;
+    }
+    if (!fresh && !repair) {
+      const rep = readDoctorReport(psRoot);
+      if (!rep.ok) {
+        record(false, rep.error);
+        sendJson(res, 503, { ok: false, error: rep.error, message: "No cached report." });
+        return;
+      }
+      record(true);
+      sendJson(res, 200, {
+        ok: true,
+        body: { status: rep.status, timestamp: rep.timestamp, checks: rep.checks },
+      });
+      return;
+    }
+    const spec = buildDoctorArgv(psRoot, repair, only);
+    if (!spec.ok) {
+      record(false, spec.error);
+      sendJson(res, spec.error === "unsupported_platform" ? 501 : 500, {
+        ok: false,
+        error: spec.error,
+        message: spec.error,
+      });
+      return;
+    }
+    try {
+      const out = await execFileAsync(spec.command, spec.args, {
+        timeout: 120000,
+        windowsHide: true,
+        maxBuffer: 1024 * 1024,
+      });
+      const text = String(out.stdout ?? "");
+      let parsedOut: unknown = null;
+      try {
+        parsedOut = JSON.parse(text);
+      } catch {
+        parsedOut = null;
+      }
+      if (typeof parsedOut !== "object" || parsedOut === null) {
+        record(false, "doctor_bad_output");
+        sendJson(res, 502, { ok: false, error: "doctor_bad_output", message: "Doctor produced no JSON." });
+        return;
+      }
+      record(true);
+      sendJson(res, 200, { ok: true, body: parsedOut });
+    } catch (err) {
+      const e = err as { stdout?: unknown; message?: unknown };
+      const text = typeof e.stdout === "string" ? e.stdout : "";
+      try {
+        const partial = JSON.parse(text) as Record<string, unknown>;
+        record(true);
+        sendJson(res, 200, { ok: true, body: { ...partial, exitNote: "doctor exited non-zero (degraded/unhealthy), report attached" } });
+        return;
+      } catch {
+        // fall through to 502
+      }
+      const message = typeof e.message === "string" ? e.message : "doctor_failed";
+      record(false, message);
+      sendJson(res, 502, { ok: false, error: "doctor_failed", message });
+    }
+    return;
+  }
+
+  if (method === "GET" && pathname === "/v1/update") {
+    if (!v3Available(psRoot)) {
+      record(false, "v3_unavailable");
+      sendJson(res, 501, {
+        ok: false,
+        error: "v3_unavailable",
+        message: "Pointer releases not installed on this node (pre-v0.3.0 layout).",
+      });
+      return;
+    }
+    const ptr = readActivePointer(psRoot);
+    const st = readUpdateState(psRoot);
+    record(true);
+    sendJson(res, 200, {
+      ok: true,
+      body: {
+        active: ptr.ok ? ptr.version : null,
+        activeOk: ptr.ok,
+        activeError: ptr.ok ? null : ptr.error,
+        installed: listInstalledReleases(psRoot),
+        pendingTransaction: st.found && !st.corrupt && !isTerminalPhase(st.phase) ? st : null,
+        stateCorrupt: st.found && st.corrupt,
+        historyTail: readHistoryTail(psRoot, 5),
+      },
+    });
+    return;
+  }
+
+  if (method === "POST" && pathname === "/v1/update") {
+    const parsed = parseJsonBody(body.raw);
+    if (!parsed.ok || typeof parsed.value !== "object" || parsed.value === null) {
+      record(false, parsed.ok ? "body_must_be_object" : parsed.error);
+      sendJson(res, 400, {
+        ok: false,
+        error: parsed.ok ? "body_must_be_object" : parsed.error,
+        message: "Body must be a JSON object: { action, version? }.",
+      });
+      return;
+    }
+    const uv = parsed.value as Record<string, unknown>;
+    const action = uv["action"];
+    if (!isUpdateAction(action)) {
+      record(false, "bad_action");
+      sendJson(res, 400, {
+        ok: false,
+        error: "bad_action",
+        message: "action must be one of: check, plan, apply, status, rollback, recover.",
+      });
+      return;
+    }
+    const versionRaw = uv["version"];
+    if (!v3Available(psRoot)) {
+      record(false, "v3_unavailable");
+      sendJson(res, 501, {
+        ok: false,
+        error: "v3_unavailable",
+        message: "Pointer releases not installed on this node (pre-v0.3.0 layout).",
+      });
+      return;
+    }
+    const ptr = readActivePointer(psRoot);
+    const installed = listInstalledReleases(psRoot);
+    const st = readUpdateState(psRoot);
+    if (action === "status") {
+      record(true);
+      sendJson(res, 200, {
+        ok: true,
+        body: {
+          active: ptr.ok ? ptr.version : null,
+          activeOk: ptr.ok,
+          installed,
+          pendingTransaction: st.found && !st.corrupt && !isTerminalPhase(st.phase) ? st : null,
+          stateCorrupt: st.found && st.corrupt,
+          historyTail: readHistoryTail(psRoot, 5),
+        },
+      });
+      return;
+    }
+    if (action === "check") {
+      const latest = await checkLatestRelease();
+      const target = typeof versionRaw === "string" ? versionRaw : null;
+      if (target !== null && !isReleaseVersion(target)) {
+        record(false, "bad_version");
+        sendJson(res, 400, { ok: false, error: "bad_version", message: "version must match vX.Y.Z." });
+        return;
+      }
+      record(true);
+      sendJson(res, 200, {
+        ok: true,
+        body: {
+          active: ptr.ok ? ptr.version : null,
+          installed,
+          latest: latest.ok ? latest.tag : null,
+          latestError: latest.ok ? null : latest.error,
+          updateAvailable: latest.ok && ptr.ok ? latest.tag !== ptr.version : null,
+          targetInstalled: target === null ? null : installed.includes(target),
+        },
+      });
+      return;
+    }
+    if (action === "plan") {
+      if (!isReleaseVersion(versionRaw)) {
+        record(false, "bad_version");
+        sendJson(res, 400, { ok: false, error: "bad_version", message: "plan requires version (vX.Y.Z)." });
+        return;
+      }
+      const version = versionRaw;
+      const risks: string[] = [];
+      if (!ptr.ok) risks.push(`active pointer unreadable (${ptr.error})`);
+      if (st.found && !st.corrupt && !isTerminalPhase(st.phase)) {
+        risks.push(`pending transaction ${st.fromVersion} -> ${st.toVersion} @ ${st.phase}`);
+      }
+      if (st.found && st.corrupt) risks.push("update-state corrupt (recover first)");
+      const candidate = resolveReleaseDir(psRoot, version);
+      record(true);
+      sendJson(res, 200, {
+        ok: true,
+        body: {
+          target: version,
+          current: ptr.ok ? ptr.version : null,
+          installed,
+          candidatePresent: candidate.ok,
+          pendingTransaction: st.found && !st.corrupt && !isTerminalPhase(st.phase) ? st : null,
+          previousKnownGood:
+            st.found && !st.corrupt && st.previousVersion !== "" ? st.previousVersion : ptr.ok ? ptr.version : null,
+          noop: ptr.ok && ptr.version === version,
+          risks,
+        },
+      });
+      return;
+    }
+    if (versionRaw !== undefined && action !== "apply") {
+      record(false, "version_unexpected");
+      sendJson(res, 400, {
+        ok: false,
+        error: "version_unexpected",
+        message: "version is only accepted with action=apply.",
+      });
+      return;
+    }
+    const gate = coreGates(configDir);
+    if (!gate.ok) {
+      record(false, gate.error);
+      sendJson(res, 403, { ok: false, error: gate.error, message: gate.message });
+      return;
+    }
+    if (action === "rollback") {
+      const prev = st.found && !st.corrupt ? st.previousVersion : "";
+      if (!isReleaseVersion(prev) || resolveReleaseDir(psRoot, prev).ok === false) {
+        record(false, "no_rollback_target");
+        sendJson(res, 409, {
+          ok: false,
+          error: "no_rollback_target",
+          message: "No validated previous release to roll back to.",
+        });
+        return;
+      }
+      const spec = buildUpdaterArgv(psRoot, "rollback", "", {});
+      if (!spec.ok) {
+        record(false, spec.error);
+        sendJson(res, 502, { ok: false, error: spec.error, message: spec.error });
+        return;
+      }
+      try {
+        const child = spawn(spec.command, spec.args, {
+          detached: true,
+          stdio: "ignore",
+          windowsHide: true,
+        });
+        child.unref();
+        child.on("error", () => {
+          // fire-and-forget: updater.log carries the outcome
+        });
+        record(true);
+        sendJson(res, 202, {
+          ok: true,
+          body: { accepted: true, action: "rollback", target: prev, message: "Rollback started. Poll GET /v1/update for the outcome." },
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "spawn_failed";
+        record(false, message);
+        sendJson(res, 502, { ok: false, error: "spawn_failed", message });
+      }
+      return;
+    }
+    if (action === "recover") {
+      const spec = buildUpdaterArgv(psRoot, "recover", "", {});
+      if (!spec.ok) {
+        record(false, spec.error);
+        sendJson(res, 502, { ok: false, error: spec.error, message: spec.error });
+        return;
+      }
+      try {
+        const child = spawn(spec.command, spec.args, {
+          detached: true,
+          stdio: "ignore",
+          windowsHide: true,
+        });
+        child.unref();
+        child.on("error", () => {
+          // fire-and-forget: updater.log carries the outcome
+        });
+        record(true);
+        sendJson(res, 202, {
+          ok: true,
+          body: { accepted: true, action: "recover", message: "Recovery started. Poll GET /v1/update for the outcome." },
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "spawn_failed";
+        record(false, message);
+        sendJson(res, 502, { ok: false, error: "spawn_failed", message });
+      }
+      return;
+    }
+    // action === "apply"
+    if (!isReleaseVersion(versionRaw)) {
+      record(false, "bad_version");
+      sendJson(res, 400, { ok: false, error: "bad_version", message: "apply requires version (vX.Y.Z)." });
+      return;
+    }
+    if (st.found && !st.corrupt && !isTerminalPhase(st.phase)) {
+      record(false, "transaction_pending");
+      sendJson(res, 409, {
+        ok: false,
+        error: "transaction_pending",
+        message: `A transaction is already in flight (${st.fromVersion} -> ${st.toVersion} @ ${st.phase}). Recover or roll back first.`,
+      });
+      return;
+    }
+    const version: UpdateAction extends never ? never : string = versionRaw;
+    let staging = "";
+    try {
+      staging = mkdtempSync(join(tmpdir(), "pi-update-"));
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "staging_failed";
+      record(false, message);
+      sendJson(res, 500, { ok: false, error: "staging_failed", message });
+      return;
+    }
+    const zipPath = join(staging, "mi-pi-server-windows.zip");
+    const dl = await downloadRelease(version, zipPath);
+    if (!dl.ok) {
+      try {
+        rmSync(staging, { recursive: true, force: true });
+      } catch {
+        // ignore cleanup failure
+      }
+      record(false, dl.error);
+      sendJson(res, 502, { ok: false, error: dl.error, message: `Download/verify failed: ${dl.error}.` });
+      return;
+    }
+    const spec = buildUpdaterArgv(psRoot, "update", version, { zipPath });
+    if (!spec.ok) {
+      try {
+        rmSync(staging, { recursive: true, force: true });
+      } catch {
+        // ignore cleanup failure
+      }
+      record(false, spec.error);
+      sendJson(res, 502, { ok: false, error: spec.error, message: spec.error });
+      return;
+    }
+    try {
+      const child = spawn(spec.command, spec.args, {
+        detached: true,
+        stdio: "ignore",
+        windowsHide: true,
+      });
+      child.unref();
+      child.on("error", () => {
+        // fire-and-forget: updater.log carries the outcome
+      });
+      record(true);
+      sendJson(res, 202, {
+        ok: true,
+        body: { accepted: true, action: "apply", target: version, bytes: dl.bytes, message: "Update started. Poll GET /v1/update for the outcome." },
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "spawn_failed";
+      record(false, message);
+      sendJson(res, 502, { ok: false, error: "spawn_failed", message });
     }
     return;
   }

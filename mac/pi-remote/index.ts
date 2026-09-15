@@ -220,6 +220,68 @@ const TimeoutSchema = Type.Optional(
   Type.Number({ description: "Request timeout, 5-120s. Default 30." }),
 );
 
+function formatDoctor(body: unknown, repaired: boolean): string {
+  if (typeof body !== "object" || body === null) return "❌ unreadable doctor response";
+  const b = body as { status?: unknown; checks?: unknown; repaired?: unknown; detail?: unknown; exitNote?: unknown };
+  const lines: string[] = [];
+  if (Array.isArray(b["repaired"])) {
+    lines.push(`🔧 repaired: ${(b["repaired"] as unknown[]).join(", ") || "(nothing)"}`);
+  }
+  if (typeof b["detail"] === "string" && b["detail"] !== "") lines.push(b["detail"]);
+  const status = typeof b["status"] === "string" ? b["status"] : "unknown";
+  const icon = status === "healthy" ? "✅" : status === "degraded" ? "⚠️" : "❌";
+  lines.push(`${icon} server ${status}`);
+  if (Array.isArray(b["checks"])) {
+    for (const c of b["checks"] as Array<Record<string, unknown>>) {
+      if (typeof c !== "object" || c === null) continue;
+      const mark = c["ok"] === true ? "·" : "✖";
+      lines.push(`${mark} ${String(c["name"] ?? "?")} [${String(c["severity"] ?? "?")}] :: ${String(c["detail"] ?? "")}`);
+    }
+  }
+  if (typeof b["exitNote"] === "string") lines.push(b["exitNote"]);
+  if (!repaired && status !== "healthy") lines.push("Run server_doctor with repair:true to attempt safe self-heal.");
+  return lines.join("\n");
+}
+
+function formatUpdateStatus(body: unknown): string {
+  if (typeof body !== "object" || body === null) return "❌ unreadable update status";
+  const b = body as Record<string, unknown>;
+  const lines: string[] = [`📌 active: ${String(b["active"] ?? "(none)")}`];
+  if (Array.isArray(b["installed"])) lines.push(`📦 installed: ${(b["installed"] as unknown[]).join(", ") || "(none)"}`);
+  const pt = b["pendingTransaction"];
+  if (pt !== null && pt !== undefined && typeof pt === "object") {
+    const t = pt as Record<string, unknown>;
+    lines.push(`⏳ pending: ${String(t["fromVersion"])} -> ${String(t["toVersion"])} @ ${String(t["phase"])}`);
+  } else {
+    lines.push("⏳ no pending transaction");
+  }
+  if (b["stateCorrupt"] === true) lines.push("⚠️ update-state corrupt (recover first)");
+  const hist = b["historyTail"];
+  if (Array.isArray(hist) && hist.length > 0) {
+    const last = hist[hist.length - 1] as Record<string, unknown>;
+    lines.push(`🕘 last: ${String(last["fromVersion"])} -> ${String(last["toVersion"])} = ${String(last["result"])}`);
+  }
+  return lines.join("\n");
+}
+
+function formatUpdateResult(action: string, body: unknown): string {
+  if (typeof body !== "object" || body === null) return "❌ unreadable update response";
+  const b = body as Record<string, unknown>;
+  const lines: string[] = [`▶️ update ${action} accepted: ${b["accepted"] === true ? "yes" : "no"}`];
+  for (const k of ["target", "current", "latest", "message"]) {
+    if (b[k] !== undefined && b[k] !== null && b[k] !== "") lines.push(`${k}: ${String(b[k])}`);
+  }
+  if (b["updateAvailable"] !== undefined && b["updateAvailable"] !== null) {
+    lines.push(`updateAvailable: ${String(b["updateAvailable"])}`);
+  }
+  if (Array.isArray(b["risks"])) {
+    const risks = b["risks"] as unknown[];
+    lines.push(risks.length > 0 ? `risks: ${risks.join(" | ")}` : "risks: none");
+  }
+  if (b["noop"] === true) lines.push("noop: target already active");
+  return lines.join("\n");
+}
+
 export default function piRemoteExtension(pi: ExtensionAPI): void {
   pi.on("session_start", async (_event, ctx) => {
     try {
@@ -725,6 +787,134 @@ export default function piRemoteExtension(pi: ExtensionAPI): void {
         };
       } catch (err) {
         return failResult("Server model set failed", err);
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "server_doctor",
+    label: "Server Doctor",
+    description:
+      "Check the 24/7 Pi server node (Windows, over Tailscale): structured diagnostics " +
+      "(active release, tasks, processes, listener, Tailscale, update transaction) with " +
+      "healthy/degraded/unhealthy status. Use automatically when the user asks — in any " +
+      "language — to check the server: 'controlla il server', 'check the server', " +
+      "'server sano?', 'come sta il server?'. With repair:true it also applies safe " +
+      "allowlisted self-heal (restart tasks, sweep owned orphans, recover transactions) " +
+      "behind a circuit breaker: use when the user says 'aggiusta quello che puoi', " +
+      "'fix what you can', 'ripara il server'. Read-only by default; repair is MEDIUM risk.",
+    promptSnippet:
+      "server_doctor reads server diagnostics (and optionally repairs) via signed HTTPS",
+    promptGuidelines: [
+      "When the user asks to check the server, call server_doctor — do not answer from memory.",
+      "After repair, always report what was repaired and the verify status; if unhealthy remains, say manual intervention is needed.",
+    ],
+    parameters: Type.Object({
+      fresh: Type.Optional(Type.Boolean({ description: "Regenerate live (default cached report)" })),
+      repair: Type.Optional(Type.Boolean({ description: "Run allowlisted self-heal (MEDIUM risk)" })),
+      only: Type.Optional(Type.Array(Type.String(), { description: "Repair groups subset" })),
+      timeoutSeconds: TimeoutSchema,
+    }),
+    executionMode: "sequential",
+    async execute(_toolCallId, params): Promise<TextResult> {
+      try {
+        const { cfg, hmac } = await setupCall();
+        const timeout =
+          typeof params.timeoutSeconds === "number"
+            ? Math.min(300, Math.max(5, params.timeoutSeconds))
+            : undefined;
+        const repair = params.repair === true;
+        const fresh = params.fresh === true;
+        if (!repair && !fresh) {
+          const resp = await remoteCall(cfg, hmac, "GET", "/v1/doctor", undefined, timeout);
+          if (!resp.ok) {
+            return {
+              content: [{ type: "text", text: `❌ Doctor refused (${resp.error ?? "unknown"}): ${resp.message ?? "no detail"}` }],
+              details: { ok: false, error: resp.error },
+            };
+          }
+          return { content: [{ type: "text", text: formatDoctor(resp.body, false) }], details: { ok: true, body: resp.body } };
+        }
+        const body: Record<string, unknown> = { fresh, repair };
+        if (Array.isArray(params.only)) body["only"] = params.only;
+        const resp = await remoteCall(cfg, hmac, "POST", "/v1/doctor", body, timeout);
+        if (!resp.ok) {
+          return {
+            content: [{ type: "text", text: `❌ Doctor refused (${resp.error ?? "unknown"}): ${resp.message ?? "no detail"}` }],
+            details: { ok: false, error: resp.error },
+          };
+        }
+        return { content: [{ type: "text", text: formatDoctor(resp.body, repair) }], details: { ok: true, body: resp.body } };
+      } catch (err) {
+        return failResult("Server doctor failed", err);
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "server_update",
+    label: "Server Update",
+    description:
+      "Manage server releases on the 24/7 Pi node (Windows, over Tailscale): check " +
+      "(installed vs latest), plan (dry-run risks for a version), apply (download, " +
+      "pointer-switch, verify, auto-rollback), status (transaction + active release), " +
+      "rollback (previous validated release), recover (finish interrupted update). " +
+      "Use automatically: 'aggiorna il server' → apply, 'l'update ha funzionato?' → status, " +
+      "'torna alla versione precedente' → rollback, 'is an update available?' → check. " +
+      "apply/rollback are MEDIUM risk (pointer switch + task restart, automatic rollback " +
+      "on health failure). Never downloads from arbitrary URLs: fixed GitHub releases only.",
+    promptSnippet:
+      "server_update manages server releases (check/plan/apply/status/rollback/recover) via signed HTTPS",
+    promptGuidelines: [
+      "For apply, always run plan first and report risks; after apply, poll status until completed or rolled back.",
+      "After rollback or recover, verify with server_doctor before declaring success.",
+    ],
+    parameters: Type.Object({
+      action: Type.Union(
+        [
+          Type.Literal("check"),
+          Type.Literal("plan"),
+          Type.Literal("apply"),
+          Type.Literal("status"),
+          Type.Literal("rollback"),
+          Type.Literal("recover"),
+        ],
+        { description: "check availability, dry-run plan, apply, read status, roll back, or recover" },
+      ),
+      version: Type.Optional(Type.String({ description: "Target version vX.Y.Z (check/plan/apply)" })),
+      timeoutSeconds: TimeoutSchema,
+    }),
+    executionMode: "sequential",
+    async execute(_toolCallId, params): Promise<TextResult> {
+      try {
+        const { cfg, hmac } = await setupCall();
+        const timeout =
+          typeof params.timeoutSeconds === "number"
+            ? Math.min(300, Math.max(5, params.timeoutSeconds))
+            : undefined;
+        const action = params.action as string;
+        if (action === "status") {
+          const resp = await remoteCall(cfg, hmac, "GET", "/v1/update", undefined, timeout);
+          if (!resp.ok) {
+            return {
+              content: [{ type: "text", text: `❌ Update status refused (${resp.error ?? "unknown"}): ${resp.message ?? "no detail"}` }],
+              details: { ok: false, error: resp.error },
+            };
+          }
+          return { content: [{ type: "text", text: formatUpdateStatus(resp.body) }], details: { ok: true, body: resp.body } };
+        }
+        const body: Record<string, unknown> = { action };
+        if (typeof params.version === "string") body["version"] = params.version;
+        const resp = await remoteCall(cfg, hmac, "POST", "/v1/update", body, timeout);
+        if (!resp.ok) {
+          return {
+            content: [{ type: "text", text: `❌ Update refused (${resp.error ?? "unknown"}): ${resp.message ?? "no detail"}` }],
+            details: { ok: false, error: resp.error },
+          };
+        }
+        return { content: [{ type: "text", text: formatUpdateResult(action, resp.body) }], details: { ok: true, body: resp.body } };
+      } catch (err) {
+        return failResult("Server update failed", err);
       }
     },
   });

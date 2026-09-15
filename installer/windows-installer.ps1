@@ -66,6 +66,10 @@ $ErrorActionPreference = "Stop"
 
 $LibHere = Join-Path (Split-Path -Parent $PSCommandPath) "PiServerLib.ps1"
 . $LibHere
+$UpdateLibHere = Join-Path (Split-Path -Parent $PSCommandPath) "PiServerUpdate.ps1"
+if (Test-Path -LiteralPath $UpdateLibHere) { . $UpdateLibHere }
+$DoctorLibHere = Join-Path (Split-Path -Parent $PSCommandPath) "PiServerDoctor.ps1"
+if (Test-Path -LiteralPath $DoctorLibHere) { . $DoctorLibHere }
 
 $Paths = Get-PiServerPaths -Root $InstallRoot
 $LogFile = $Paths.InstallerLog
@@ -598,6 +602,93 @@ try {
   $ver = [string]$script:InstallState.targetRelease
   if ([string]::IsNullOrWhiteSpace($ver) -or ($ver -eq "latest")) { $ver = $Version }
   if ($ver -eq "latest") { $ver = "latest@$(Get-Date -Format 'yyyyMMdd')" }
+  if ((Get-Command Test-V3Payload -ErrorAction SilentlyContinue) -and (Test-V3Payload -PayloadDir $payload)) {
+    $payVerRaw = ((Get-Content -LiteralPath (Join-Path $payload "VERSION") -Raw -ErrorAction Stop) | Out-String).Trim()
+    $targetVer = $payVerRaw
+    if (-not $targetVer.StartsWith("v")) { $targetVer = "v" + $targetVer }
+    if ((($ver -ne "") -and ($ver -ne "latest") -and (-not $ver.StartsWith("latest@"))) -and ($ver -ne $targetVer) -and ($ver -ne $payVerRaw)) {
+      throw (New-StepError "Fatal" ("Payload VERSION mismatch (richiesto=" + $ver + " payload=" + $payVerRaw + ")"))
+    }
+    $remotePortNum3 = 0
+    try { if ($RemotePort -match "^\d+$") { $remotePortNum3 = [int]$RemotePort } } catch { }
+    $stripProbe3 = Join-Path $payload "server\pi-remote-server\index.ts"
+    $nodeStripArgs3 = @()
+    $stripped3 = $false
+    foreach ($candidate in @(@(), @("--experimental-strip-types"))) {
+      try {
+        & $NodeExe @candidate --check $stripProbe3 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) { $nodeStripArgs3 = $candidate; $stripped3 = $true; break }
+      } catch { }
+    }
+    if (-not $stripped3) { throw (New-StepError "System" "Node cannot type-check the remote daemon entry (node --check failed). Upgrade Node 22.") }
+    L ("node type-stripping v3: " + (& { if ($nodeStripArgs3.Count -eq 0) { "native" } else { ($nodeStripArgs3 -join " ") } })) "OK"
+    $facts3 = @{ NodeExe = $NodeExe; PiBin = $piCmd; NpmGlobalBin = $NpmGlobalBin; NodeArgs = $nodeStripArgs3; AgentDir = $Paths.AgentDir }
+    $stopHook3 = { param($p) return (Stop-PiServerRuntime -Paths $p -RemotePort $remotePortNum3 -TimeoutSec 60) }
+    $startHook3 = {
+      param($p)
+      foreach ($tn in @($p.TaskName, $p.RemoteTaskName)) { try { Start-ScheduledTask -TaskName $tn -ErrorAction Stop } catch { } }
+      $dl3 = [DateTime]::UtcNow.AddSeconds(45)
+      $seen3 = ""
+      while ([DateTime]::UtcNow -lt $dl3) {
+        $a3 = ""; $b3 = ""
+        try { $a3 = [string](Get-ScheduledTask -TaskName $p.TaskName -ErrorAction Stop).State } catch { }
+        try { $b3 = [string](Get-ScheduledTask -TaskName $p.RemoteTaskName -ErrorAction Stop).State } catch { }
+        $seen3 = ($a3 + "," + $b3)
+        if ($seen3 -eq "Running,Running") { break }
+        Start-Sleep -Seconds 3
+      }
+      if ($seen3 -ne "Running,Running") { return @{ Ok = $false; Detail = ("tasks non Running: " + $seen3) } }
+      return @{ Ok = $true; Detail = "tasks Running" }
+    }
+    $taskCheck3 = {
+      param($p)
+      $ta = $null; $tb = $null
+      try { $ta = Get-ScheduledTask -TaskName $p.TaskName -ErrorAction Stop } catch { }
+      try { $tb = Get-ScheduledTask -TaskName $p.RemoteTaskName -ErrorAction Stop } catch { }
+      $ar = (($null -ne $ta) -and ([string]$ta.State -eq "Running"))
+      $br = (($null -ne $tb) -and ([string]$tb.State -eq "Running"))
+      return @{ PiRunning = $ar; RemoteRunning = $br; Detail = "real task states" }
+    }
+    $portHook3 = { param($pt) return (Get-TcpListenerOwner -Port $pt) }
+    $apiHook3 = { param($p) return (Test-RemoteApiPing -Paths $p -Port $remotePortNum3 -TimeoutSec 10) }
+    $verHook3 = { param($p) $pv3 = Read-ActiveRelease -PointerPath $p.ActivePointer; return @{ Ok = $pv3.Ok; Version = $pv3.Version } }
+    $updHook3 = { param($n, $lp) return (Update-PiServerTaskAction -TaskName $n -LauncherPath $lp -WorkDir $Paths.Bin) }
+    $dep3 = Invoke-V3Deploy -Paths $Paths -PayloadDir $payload -TargetVersion $targetVer -MachineFacts $facts3 -NodeExe $NodeExe `
+      -StopRuntime $stopHook3 -StartRuntime $startHook3 -TaskChecker $taskCheck3 -PortChecker $portHook3 -ApiChecker $apiHook3 -VersionReader $verHook3 -TaskActionUpdater $updHook3
+    if (-not $dep3.Ok) { throw (New-StepError "Fatal" ("Deploy v3 fallito: " + $dep3.Detail)) }
+    $script:V3Mode = $true
+    $script:V3Version = $dep3.ActiveVersion
+    L ("deploy v3: " + $dep3.Action + " attivo=" + $dep3.ActiveVersion + " (rollback=pointer, live mai rinominato)") "OK"
+    $relDir3 = (Resolve-ReleaseDir -Root $Paths.Root -Version $dep3.ActiveVersion).Dir
+    $dstExt3 = Join-Path $Paths.ExtDir "pi-remote-config"
+    if (Test-Path -LiteralPath $dstExt3) { Remove-Item -LiteralPath $dstExt3 -Recurse -Force }
+    Copy-Item -Path (Join-Path $relDir3 "server\pi-remote-config") -Destination $dstExt3 -Recurse -Force
+    if (Test-Path -LiteralPath $Paths.SharedDir) { Remove-Item -LiteralPath $Paths.SharedDir -Recurse -Force }
+    Copy-Item -Path (Join-Path $relDir3 "shared") -Destination $Paths.SharedDir -Recurse -Force
+    $extPkg3 = Join-Path $dstExt3 "package.json"
+    if (Test-Path -LiteralPath $extPkg3) {
+      try {
+        $pkg3 = Get-Content -LiteralPath $extPkg3 -Raw | ConvertFrom-Json
+        if ($null -ne $pkg3.dependencies) {
+          L "npm install dipendenze extension"
+          $npmCli3 = Join-Path (Split-Path -Parent $NodeExe) "node_modules\npm\bin\npm-cli.js"
+          if (-not (Test-Path -LiteralPath $npmCli3)) { throw "npm-cli.js non trovato accanto a node.exe" }
+          & $NodeExe $npmCli3 install --omit=dev --no-audit --no-fund --prefix $dstExt3 2>&1 | Out-Null
+        }
+      } catch {
+        L "npm install extension fallito (continuo): $($_.Exception.Message)" "WARN"
+      }
+    }
+    L "extension deployata da release attiva in data\extensions + data\shared" "OK"
+    $rtSyn3 = Test-RuntimeSyntax -NodeExe $NodeExe -Files @((Join-Path $relDir3 "server\pi-daemon.mjs"), (Join-Path $relDir3 "server\spawn-pi.mjs"))
+    if (-not $rtSyn3.Ok) { throw (New-StepError "System" ("Runtime JS release attiva non valido: " + ($rtSyn3.Failures -join "; "))) }
+    L "runtime JS syntax OK (release attiva)" "OK"
+    if ($tmpPayload -ne "") {
+      Remove-Item -LiteralPath $tmpPayload -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    Complete-InstallStep -Name "deploy"
+    break
+  }
   $haveVerNow = ""
   try { $haveVerNow = ((Get-Content -LiteralPath $Paths.VersionFile -Raw -ErrorAction Stop).Trim()) } catch { }
   $effMode = $Mode
@@ -982,9 +1073,20 @@ try {
       $attempt++
       try {
   $RemotePort = Resolve-RemotePort -AgentDir $Paths.AgentDir
+  $launcherMain = $Paths.RunTask
+  $launcherRemote = $Paths.RunRemote
+  $wdMain = Split-Path -Parent $Paths.Daemon
+  $wdRemote = Split-Path -Parent $Paths.RemoteEntry
+  if ((Get-Command Test-V3Active -ErrorAction SilentlyContinue) -and (Test-V3Active -Paths $Paths)) {
+    $launcherMain = $Paths.BinRunPi
+    $launcherRemote = $Paths.BinRunRemote
+    $wdMain = $Paths.Bin
+    $wdRemote = $Paths.Bin
+    L "tasks v3: azioni su bin (launcher stabili)" "OK"
+  }
   $action = New-ScheduledTaskAction -Execute "powershell.exe" `
-    -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$($Paths.RunTask)`"" `
-    -WorkingDirectory (Split-Path -Parent $Paths.Daemon)
+    -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$($launcherMain)`"" `
+    -WorkingDirectory $wdMain
   $trigger = New-ScheduledTaskTrigger -AtStartup
   $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
   $settings = New-ScheduledTaskSettingsSet `
@@ -1003,8 +1105,8 @@ try {
   # Second task: the HTTP remote daemon. Separate process on purpose:
   # if Pi crashes, remote control (and its status answers) keeps working.
   $remoteAction = New-ScheduledTaskAction -Execute "powershell.exe" `
-    -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$($Paths.RunRemote)`"" `
-    -WorkingDirectory (Split-Path -Parent $Paths.RemoteEntry)
+    -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$($launcherRemote)`"" `
+    -WorkingDirectory $wdRemote
   $remoteTask = $Paths.RemoteTaskName
   $existingRemote = Get-ScheduledTask -TaskName $remoteTask -ErrorAction SilentlyContinue
   if ($null -ne $existingRemote) {
@@ -1044,10 +1146,10 @@ try {
   } catch {
     throw (New-StepError "System" "Registrati ma avvio fallito: $($_.Exception.Message)")
   }
-  $w1 = Wait-TaskStartup -TaskName $TaskName -LauncherPath $Paths.RunTask -ProcessMatch "pi-daemon\.mjs" -LogPath $Paths.ServerLog -TimeoutSec 20
+  $w1 = Wait-TaskStartup -TaskName $TaskName -LauncherPath $launcherMain -ProcessMatch "pi-daemon\.mjs" -LogPath $Paths.ServerLog -TimeoutSec 20
   if (-not $w1.Ok) { throw (New-StepError "System" $w1.Detail) }
   L $w1.Detail "OK"
-  $w2 = Wait-TaskStartup -TaskName $remoteTask -LauncherPath $Paths.RunRemote -ProcessMatch "pi-remote-server" -LogPath $Paths.RemoteLog -TimeoutSec 20
+  $w2 = Wait-TaskStartup -TaskName $remoteTask -LauncherPath $launcherRemote -ProcessMatch "pi-remote-server" -LogPath $Paths.RemoteLog -TimeoutSec 20
   if (-not $w2.Ok) { throw (New-StepError "System" $w2.Detail) }
   L $w2.Detail "OK"
 
@@ -1097,6 +1199,42 @@ try {
       try {
   $piCmd = Resolve-PiOrThrow "pi.cmd non risolvibile (step 3 saltato ma Pi assente). Riesegui senza resume o reinstalla Pi."
   Start-Sleep -Seconds 10
+  if ((Get-Command Test-V3Active -ErrorAction SilentlyContinue) -and (Test-V3Active -Paths $Paths)) {
+    $hv3 = Read-ActiveRelease -PointerPath $Paths.ActivePointer
+    $rbPortNum3 = 0
+    try { if ($RemotePort -match "^\d+$") { $rbPortNum3 = [int]$RemotePort } } catch { }
+    $tc3b = {
+      param($p)
+      $ta3 = $null; $tb3 = $null
+      try { $ta3 = Get-ScheduledTask -TaskName $p.TaskName -ErrorAction Stop } catch { }
+      try { $tb3 = Get-ScheduledTask -TaskName $p.RemoteTaskName -ErrorAction Stop } catch { }
+      return @{ PiRunning = (($null -ne $ta3) -and ([string]$ta3.State -eq "Running")); RemoteRunning = (($null -ne $tb3) -and ([string]$tb3.State -eq "Running")); Detail = "real task states" }
+    }
+    $pc3b = { param($pt) return (Get-TcpListenerOwner -Port $pt) }
+    $ac3b = { param($p) return (Test-RemoteApiPing -Paths $p -Port $rbPortNum3 -TimeoutSec 10) }
+    $vr3b = { param($p) $q3 = Read-ActiveRelease -PointerPath $p.ActivePointer; return @{ Ok = $q3.Ok; Version = $q3.Version } }
+    $vh3b = { param($p, $v) return (Test-ReleaseHealth -Paths $p -Version $v -Port $rbPortNum3 -TaskChecker $tc3b -PortChecker $pc3b -ApiChecker $ac3b -VersionReader $vr3b) }
+    $h3 = & $vh3b $Paths $hv3.Version
+    if (-not $h3.Ok) {
+      L ("health v3 fallito (" + $h3.Detail + "): recovery transazionale") "FAIL"
+      $startRb3 = {
+        param($p)
+        foreach ($tn in @($p.TaskName, $p.RemoteTaskName)) { try { Start-ScheduledTask -TaskName $tn -ErrorAction Stop } catch { } }
+        Start-Sleep -Seconds 5
+        return @{ Ok = $true; Detail = "tasks avviati" }
+      }
+      $rec3 = Invoke-UpdateRecovery -Paths $Paths -StartRuntime $startRb3 -VerifyHealth $vh3b
+      if (-not $rec3.Ok) { throw (New-StepError "System" ("Health v3 fallito, recovery fallita: " + $rec3.Detail + ". Dettaglio health: " + $h3.Detail)) }
+      L ("recovery: " + $rec3.Action) "WARN"
+      $h3b = & $vh3b $Paths $hv3.Version
+      $ptrNow = Read-ActiveRelease -PointerPath $Paths.ActivePointer
+      if ($ptrNow.Ok -and ($ptrNow.Version -ne $hv3.Version)) { $h3b = & $vh3b $Paths $ptrNow.Version }
+      if (-not $h3b.Ok) { throw (New-StepError "System" ("Health v3 fallito dopo recovery (" + $rec3.Action + "): " + $h3b.Detail)) }
+    }
+    L "health v3 OK" "OK"
+    Complete-InstallStep -Name "health"
+    break
+  }
   $hc = Invoke-HealthCheck -Paths $Paths -PiBin $piCmd
   if (-not $hc.Ok) {
     $canRb = (($null -ne $appBackup) -and (Test-Path -LiteralPath $appBackup))

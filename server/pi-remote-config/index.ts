@@ -15,12 +15,13 @@
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { createRequire } from "node:module";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { freemem, loadavg, totalmem, uptime as osUptime } from "node:os";
 import { hostname as osHostname } from "node:os";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { promisify } from "node:util";
 import {
   BUILTIN_MODULES,
@@ -40,6 +41,24 @@ import {
   resolveAgentDir,
 } from "../../shared/store.ts";
 import { readAppVersion } from "../pi-remote-server/server.ts";
+import {
+  buildDoctorArgv,
+  buildUpdaterArgv,
+  checkLatestRelease,
+  downloadRelease,
+  isReleaseVersion,
+  isRepairGroup,
+  isTerminalPhase,
+  isUpdateAction,
+  listInstalledReleases,
+  piServerRoot,
+  readActivePointer,
+  readDoctorReport,
+  readHistoryTail,
+  readUpdateState,
+  resolveReleaseDir,
+  v3Available,
+} from "../pi-remote-server/update.ts";
 import { buildPiSpawn } from "../spawn-pi.mjs";
 import {
   isValidThinkingLevel,
@@ -676,6 +695,283 @@ export default function remoteConfigExtension(pi: ExtensionAPI): void {
       }
     },
   });
+
+  pi.registerTool({
+    name: "server_doctor",
+    label: "Server Doctor",
+    description:
+      "Check THIS server node: structured diagnostics (active release, tasks, " +
+      "processes, listener, Tailscale, update transaction) with healthy/degraded/" +
+      "unhealthy status. Use when the user asks to check the server. With " +
+      "repair:true it also applies safe allowlisted self-heal behind a circuit " +
+      "breaker (MEDIUM risk). Read-only by default.",
+    promptSnippet:
+      "server_doctor reads node diagnostics (and optionally repairs)",
+    promptGuidelines: [
+      "Use server_doctor when the user asks to check the server; report the status and failing checks.",
+      "After repair, report what was repaired and the verify status.",
+    ],
+    parameters: Type.Object({
+      fresh: Type.Optional(Type.Boolean({ description: "Regenerate live (default cached report)" })),
+      repair: Type.Optional(Type.Boolean({ description: "Run allowlisted self-heal (MEDIUM risk)" })),
+      only: Type.Optional(Type.Array(Type.String(), { description: "Repair groups subset" })),
+    }),
+    async execute(_toolCallId, params): Promise<TextResult> {
+      const p = paths();
+      const root = piServerRoot(p.agentDir);
+      const fail = (text: string, error: unknown): TextResult => ({
+        content: [{ type: "text", text }],
+        details: { error },
+      });
+      if (!v3Available(root)) {
+        return fail("Refused: pointer releases not installed (pre-v0.3.0 layout).", "v3_unavailable");
+      }
+      const repair = params.repair === true;
+      const fresh = params.fresh === true;
+      if (!repair && !fresh) {
+        const rep = readDoctorReport(root);
+        if (!rep.ok) return fail(`Refused: ${rep.error}. Run with fresh:true first.`, rep.error);
+        return { content: [{ type: "text", text: formatDoctorText(rep.status, rep.checks, null) }], details: { status: rep.status, checks: rep.checks } };
+      }
+      const onlyRaw = params.only === undefined ? null : params.only;
+      if (onlyRaw !== null && !repair) {
+        return fail("Refused: `only` needs repair:true.", "only_without_repair");
+      }
+      if (onlyRaw !== null && !(Array.isArray(onlyRaw) && onlyRaw.every((g) => isRepairGroup(g)))) {
+        return fail("Refused: unknown repair group.", "bad_repair_group");
+      }
+      const spec = buildDoctorArgv(root, repair, onlyRaw);
+      if (!spec.ok) return fail(`Refused: ${spec.error}.`, spec.error);
+      const out = await runJsonCmd(spec.command, spec.args, 120000);
+      if (out === null) return fail("Doctor produced no JSON (spawn failed or timed out).", "doctor_failed");
+      const body = out as { status?: unknown; checks?: unknown; repaired?: unknown; detail?: unknown };
+      const checks = Array.isArray(body["checks"]) ? body["checks"] : [];
+      const repaired = Array.isArray(body["repaired"]) ? (body["repaired"] as unknown[]) : null;
+      const detail = typeof body["detail"] === "string" ? body["detail"] : null;
+      const status = typeof body["status"] === "string" ? body["status"] : "unknown";
+      const head = repaired === null ? `status: ${status}` : `repaired: ${(repaired as unknown[]).join(", ") || "(nothing)"}`;
+      const tail = detail ?? "";
+      return {
+        content: [{ type: "text", text: [head, formatDoctorChecks(checks), tail].filter((s) => s !== "").join("\n") }],
+        details: { status, checks, repaired },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "server_update",
+    label: "Server Update",
+    description:
+      "Manage releases on THIS server node: check (installed vs latest), plan " +
+      "(dry-run risks for a version), apply (download, pointer-switch, verify, " +
+      "auto-rollback), status (transaction + active release), rollback (previous " +
+      "validated release), recover (finish interrupted update). apply/rollback " +
+      "are MEDIUM risk. Versions come only from fixed GitHub releases.",
+    promptSnippet:
+      "server_update manages node releases (check/plan/apply/status/rollback/recover)",
+    promptGuidelines: [
+      "For apply, run plan first and report risks; after apply, poll status until completed or rolled back.",
+      "After rollback or recover, run server_doctor before declaring success.",
+    ],
+    parameters: Type.Object({
+      action: Type.Union(
+        [
+          Type.Literal("check"),
+          Type.Literal("plan"),
+          Type.Literal("apply"),
+          Type.Literal("status"),
+          Type.Literal("rollback"),
+          Type.Literal("recover"),
+        ],
+        { description: "check availability, dry-run plan, apply, read status, roll back, or recover" },
+      ),
+      version: Type.Optional(Type.String({ description: "Target version vX.Y.Z (check/plan/apply)" })),
+    }),
+    async execute(_toolCallId, params): Promise<TextResult> {
+      const p = paths();
+      const root = piServerRoot(p.agentDir);
+      const fail = (text: string, error: unknown): TextResult => ({
+        content: [{ type: "text", text }],
+        details: { error },
+      });
+      if (!v3Available(root)) {
+        return fail("Refused: pointer releases not installed (pre-v0.3.0 layout).", "v3_unavailable");
+      }
+      const action = params.action as string;
+      if (!isUpdateAction(action)) return fail("Refused: bad_action.", "bad_action");
+      const ptr = readActivePointer(root);
+      const installed = listInstalledReleases(root);
+      const st = readUpdateState(root);
+      const pending =
+        st.found && !st.corrupt && !isTerminalPhase(st.phase) ? st : null;
+      if (action === "status") {
+        const lines = [
+          `active: ${ptr.ok ? ptr.version : "(none)"}`,
+          `installed: ${installed.join(", ") || "(none)"}`,
+          pending ? `pending: ${pending.fromVersion} -> ${pending.toVersion} @ ${pending.phase}` : "no pending transaction",
+        ];
+        const hist = readHistoryTail(root, 1);
+        if (hist.length > 0) {
+          lines.push(`last: ${hist[0].fromVersion} -> ${hist[0].toVersion} = ${hist[0].result}`);
+        }
+        return { content: [{ type: "text", text: lines.join("\n") }], details: { active: ptr.version, installed, pending } };
+      }
+      if (action === "check") {
+        const latest = await checkLatestRelease();
+        const target = typeof params.version === "string" ? params.version : null;
+        if (target !== null && !isReleaseVersion(target)) {
+          return fail("Refused: bad_version.", "bad_version");
+        }
+        const lines = [
+          `active: ${ptr.ok ? ptr.version : "(none)"}`,
+          `installed: ${installed.join(", ") || "(none)"}`,
+          latest.ok ? `latest: ${latest.tag}` : `latest: unknown (${latest.error})`,
+        ];
+        if (latest.ok && ptr.ok) lines.push(latest.tag === ptr.version ? "up to date" : "update available");
+        if (target !== null) lines.push(`target ${target}: ${installed.includes(target) ? "installed" : "not installed"}`);
+        return { content: [{ type: "text", text: lines.join("\n") }], details: { active: ptr.version, installed, latest: latest.tag } };
+      }
+      if (action === "plan") {
+        const target = typeof params.version === "string" ? params.version : "";
+        if (!isReleaseVersion(target)) return fail("Refused: plan requires version (vX.Y.Z).", "bad_version");
+        const risks: string[] = [];
+        if (!ptr.ok) risks.push(`active pointer unreadable (${ptr.error})`);
+        if (pending) risks.push(`pending transaction ${pending.fromVersion} -> ${pending.toVersion} @ ${pending.phase}`);
+        if (st.found && st.corrupt) risks.push("update-state corrupt (recover first)");
+        const candidate = resolveReleaseDir(root, target);
+        const lines = [
+          `plan ${ptr.ok ? ptr.version : "(none)"} -> ${target}`,
+          `candidate present: ${candidate.ok ? "yes" : "no"}`,
+          `noop: ${ptr.ok && ptr.version === target ? "yes" : "no"}`,
+          risks.length > 0 ? `risks: ${risks.join(" | ")}` : "risks: none",
+        ];
+        return { content: [{ type: "text", text: lines.join("\n") }], details: { target, risks, candidatePresent: candidate.ok } };
+      }
+      if (action === "rollback") {
+        const prev = st.found && !st.corrupt ? st.previousVersion : "";
+        if (!isReleaseVersion(prev) || !resolveReleaseDir(root, prev).ok) {
+          return fail("Refused: no validated previous release to roll back to.", "no_rollback_target");
+        }
+        const spec = buildUpdaterArgv(root, "rollback", "", {});
+        if (!spec.ok) return fail(`Refused: ${spec.error}.`, spec.error);
+        const started = spawnDetached(spec.command, spec.args);
+        if (!started) return fail("Refused: spawn_failed.", "spawn_failed");
+        return {
+          content: [{ type: "text", text: `Rollback to ${prev} started. Poll status for the outcome.` }],
+          details: { accepted: true, target: prev },
+        };
+      }
+      if (action === "recover") {
+        const spec = buildUpdaterArgv(root, "recover", "", {});
+        if (!spec.ok) return fail(`Refused: ${spec.error}.`, spec.error);
+        const started = spawnDetached(spec.command, spec.args);
+        if (!started) return fail("Refused: spawn_failed.", "spawn_failed");
+        return {
+          content: [{ type: "text", text: "Recovery started. Poll status for the outcome." }],
+          details: { accepted: true },
+        };
+      }
+      // apply
+      const target = typeof params.version === "string" ? params.version : "";
+      if (!isReleaseVersion(target)) return fail("Refused: apply requires version (vX.Y.Z).", "bad_version");
+      if (pending) {
+        return fail(`Refused: transaction already in flight (${pending.fromVersion} -> ${pending.toVersion} @ ${pending.phase}).`, "transaction_pending");
+      }
+      let staging = "";
+      try {
+        staging = mkdtempSync(join(tmpdir(), "pi-update-"));
+      } catch {
+        return fail("Refused: staging_failed.", "staging_failed");
+      }
+      const zipPath = join(staging, "mi-pi-server-windows.zip");
+      const dl = await downloadRelease(target, zipPath);
+      if (!dl.ok) {
+        try { rmSync(staging, { recursive: true, force: true }); } catch { // ignore
+        }
+        return fail(`Refused: download failed (${dl.error}).`, dl.error);
+      }
+      const spec = buildUpdaterArgv(root, "update", target, { zipPath });
+      if (!spec.ok) {
+        try { rmSync(staging, { recursive: true, force: true }); } catch { // ignore
+        }
+        return fail(`Refused: ${spec.error}.`, spec.error);
+      }
+      const started = spawnDetached(spec.command, spec.args);
+      if (!started) return fail("Refused: spawn_failed.", "spawn_failed");
+      return {
+        content: [{ type: "text", text: `Update to ${target} started (${dl.bytes}B verified). Poll status for the outcome.` }],
+        details: { accepted: true, target },
+      };
+    },
+  });
+
+  async function runJsonCmd(
+    cmd: string,
+    args: string[],
+    timeoutMs: number,
+  ): Promise<unknown | null> {
+    try {
+      const { stdout } = await execFileAsync(cmd, args, {
+        timeout: timeoutMs,
+        windowsHide: true,
+        maxBuffer: 1024 * 1024,
+      });
+      try {
+        return JSON.parse(String(stdout ?? "")) as unknown;
+      } catch {
+        return null;
+      }
+    } catch (err) {
+      const e = err as { stdout?: unknown };
+      if (typeof e.stdout === "string") {
+        try {
+          return JSON.parse(e.stdout) as unknown;
+        } catch {
+          return null;
+        }
+      }
+      return null;
+    }
+  }
+
+  function spawnDetached(cmd: string, args: string[]): boolean {
+    try {
+      const child = spawn(cmd, args, {
+        detached: true,
+        stdio: "ignore",
+        windowsHide: true,
+      });
+      child.unref();
+      child.on("error", () => {
+        // fire-and-forget: updater.log carries the outcome
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function formatDoctorText(
+    status: string,
+    checks: unknown,
+    _repaired: unknown,
+  ): string {
+    void _repaired;
+    const lines: string[] = [`server ${status}`];
+    lines.push(formatDoctorChecks(checks));
+    return lines.filter((s) => s !== "").join("\n");
+  }
+
+  function formatDoctorChecks(checks: unknown): string {
+    if (!Array.isArray(checks)) return "";
+    const out: string[] = [];
+    for (const c of checks as Array<Record<string, unknown>>) {
+      if (typeof c !== "object" || c === null) continue;
+      const mark = c["ok"] === true ? "·" : "✖";
+      out.push(`${mark} ${String(c["name"] ?? "?")} [${String(c["severity"] ?? "?")}] :: ${String(c["detail"] ?? "")}`);
+    }
+    return out.join("\n");
+  }
 
   async function modelCatalogHere(
     agentDir: string,

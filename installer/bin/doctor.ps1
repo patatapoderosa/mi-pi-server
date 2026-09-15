@@ -16,6 +16,7 @@
 param(
   [switch]$Repair,
   [switch]$Json,
+  [string[]]$Only = @(),
   [string]$Root = ""
 )
 
@@ -74,7 +75,7 @@ try {
       if ($seen -ne "Running,Running") { return @{ Ok = $false; Detail = ("tasks non Running dopo start: " + $seen) } }
       return @{ Ok = $true; Detail = "tasks avviati e Running" }
     }
-    $res = Invoke-DoctorRepair -Paths $Paths -StartRuntime $startHook
+    $res = Invoke-DoctorRepair -Paths $Paths -Only $Only -StartRuntime $startHook
     Write-DoctorLog ("repair: " + ($res.Repaired -join ",") + " | " + $res.Detail) (& { if ($res.Ok) { "OK" } else { "FAIL" } })
     if ($Json) {
       ([ordered]@{ schemaVersion = 1; repaired = @($res.Repaired); detail = $res.Detail } | ConvertTo-Json -Depth 4) | Write-Output

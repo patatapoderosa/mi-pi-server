@@ -859,3 +859,180 @@ describe("server_model routes (fake pi on PATH)", () => {
     assert.equal(r.json["error"], "maintenance");
   });
 });
+
+describe("server_doctor / server_update routes (v3 fixture, no spawn)", () => {
+  let s: Started;
+  let root = "";
+  let dataDir = "";
+
+  function writeJson(rel: string, v: unknown): void {
+    const fp = join(root, rel);
+    mkdirSync(join(fp, ".."), { recursive: true });
+    writeFileSync(fp, JSON.stringify(v));
+  }
+
+  beforeEach(async () => {
+    root = mkdtempSync(join(tmpdir(), "pi-v3route-test-"));
+    dataDir = join(root, "data");
+    mkdirSync(join(dataDir, "secrets"), { recursive: true });
+    writeFileSync(join(dataDir, "secrets", "remote-hmac"), SECRET);
+    // minimal release v9.9.9
+    mkdirSync(join(root, "releases", "v9.9.9", "server"), { recursive: true });
+    writeFileSync(join(root, "releases", "v9.9.9", "server", "pi-daemon.mjs"), "x");
+    writeFileSync(join(root, "releases", "v9.9.9", "VERSION"), "v9.9.9");
+    // bin scripts (existence only; never executed in these tests)
+    mkdirSync(join(root, "bin"), { recursive: true });
+    writeFileSync(join(root, "bin", "doctor.ps1"), "x");
+    writeFileSync(join(root, "bin", "updater.ps1"), "x");
+    writeJson("data/active-release.json", { schemaVersion: 1, version: "v9.9.9" });
+    s = await boot(dataDir);
+  });
+
+  afterEach(async () => {
+    await close(s);
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it("GET /v1/doctor without report is 503", async () => {
+    const r = await signed(s.port, "/v1/doctor", {});
+    assert.equal(r.status, 503);
+  });
+
+  it("GET /v1/doctor returns cached report", async () => {
+    writeJson("data/doctor-report.json", {
+      schemaVersion: 1,
+      timestamp: "t",
+      status: "degraded",
+      checks: [{ name: "x", ok: false, severity: "warning", detail: "d", recoverable: true }],
+    });
+    const r = await signed(s.port, "/v1/doctor", {});
+    assert.equal(r.status, 200);
+    const body = r.json["body"] as Record<string, unknown>;
+    assert.equal(body["status"], "degraded");
+    assert.equal((body["checks"] as unknown[]).length, 1);
+  });
+
+  it("GET /v1/doctor on pre-v3 layout is 501", async () => {
+    const s2 = await boot();
+    try {
+      const r = await signed(s2.port, "/v1/doctor", {});
+      assert.equal(r.status, 501);
+      assert.equal(r.json["error"], "v3_unavailable");
+    } finally {
+      await close(s2);
+      rmSync(s2.agentDir, { recursive: true, force: true });
+    }
+  });
+
+  it("POST /v1/doctor validates body strictly", async () => {
+    const malformed = await signed(s.port, "/v1/doctor", { method: "POST", body: "{{{" });
+    assert.equal(malformed.status, 400);
+    const onlyAlone = await signed(s.port, "/v1/doctor", {
+      method: "POST",
+      body: JSON.stringify({ only: ["tasks"] }),
+    });
+    assert.equal(onlyAlone.status, 400);
+    assert.equal(onlyAlone.json["error"], "only_without_repair");
+    const badTypes = await signed(s.port, "/v1/doctor", {
+      method: "POST",
+      body: JSON.stringify({ fresh: "yes" }),
+    });
+    assert.equal(badTypes.status, 400);
+  });
+
+  it("POST /v1/doctor repair with bad group never spawns", async () => {
+    const r = await signed(s.port, "/v1/doctor", {
+      method: "POST",
+      body: JSON.stringify({ repair: true, only: ["tasks", "rm -rf"] }),
+    });
+    assert.equal(r.status, 500);
+    assert.equal(r.json["error"], "bad_repair_group");
+  });
+
+  it("GET /v1/update returns pointer state", async () => {
+    const r = await signed(s.port, "/v1/update", {});
+    assert.equal(r.status, 200);
+    const body = r.json["body"] as Record<string, unknown>;
+    assert.equal(body["active"], "v9.9.9");
+    assert.deepEqual(body["installed"], ["v9.9.9"]);
+    assert.equal(body["pendingTransaction"], null);
+  });
+
+  it("POST /v1/update validates actions", async () => {
+    const bad = await signed(s.port, "/v1/update", {
+      method: "POST",
+      body: JSON.stringify({ action: "reboot" }),
+    });
+    assert.equal(bad.status, 400);
+    assert.equal(bad.json["error"], "bad_action");
+    const planNoVer = await signed(s.port, "/v1/update", {
+      method: "POST",
+      body: JSON.stringify({ action: "plan" }),
+    });
+    assert.equal(planNoVer.status, 400);
+    const verWithRollback = await signed(s.port, "/v1/update", {
+      method: "POST",
+      body: JSON.stringify({ action: "rollback", version: "v9.9.9" }),
+    });
+    assert.equal(verWithRollback.status, 400);
+    assert.equal(verWithRollback.json["error"], "version_unexpected");
+  });
+
+  it("POST /v1/update plan reports risks honestly", async () => {
+    const r = await signed(s.port, "/v1/update", {
+      method: "POST",
+      body: JSON.stringify({ action: "plan", version: "v9.9.9" }),
+    });
+    assert.equal(r.status, 200);
+    const body = r.json["body"] as Record<string, unknown>;
+    assert.equal(body["target"], "v9.9.9");
+    assert.equal(body["noop"], true);
+    assert.equal(body["candidatePresent"], true);
+    assert.deepEqual(body["risks"], []);
+  });
+
+  it("POST /v1/update apply rejects bad version and pending tx", async () => {
+    const bad = await signed(s.port, "/v1/update", {
+      method: "POST",
+      body: JSON.stringify({ action: "apply", version: "bogus" }),
+    });
+    assert.equal(bad.status, 400);
+    writeJson("data/update-state.json", {
+      schemaVersion: 1,
+      transactionId: "tx-1",
+      fromVersion: "v9.9.9",
+      toVersion: "v9.9.10",
+      phase: "health_verifying",
+      previousVersion: "v9.9.9",
+      startedAt: "t",
+      updatedAt: "",
+    });
+    const pending = await signed(s.port, "/v1/update", {
+      method: "POST",
+      body: JSON.stringify({ action: "apply", version: "v9.9.10" }),
+    });
+    assert.equal(pending.status, 409);
+    assert.equal(pending.json["error"], "transaction_pending");
+  });
+
+  it("POST /v1/update rollback without target is 409", async () => {
+    const r = await signed(s.port, "/v1/update", {
+      method: "POST",
+      body: JSON.stringify({ action: "rollback" }),
+    });
+    assert.equal(r.status, 409);
+    assert.equal(r.json["error"], "no_rollback_target");
+  });
+
+  it("POST /v1/update check returns shape (latest may be null offline)", async () => {
+    const r = await signed(s.port, "/v1/update", {
+      method: "POST",
+      body: JSON.stringify({ action: "check", version: "v9.9.9" }),
+    });
+    assert.equal(r.status, 200);
+    const body = r.json["body"] as Record<string, unknown>;
+    assert.equal(body["active"], "v9.9.9");
+    assert.equal(body["targetInstalled"], true);
+    assert.ok("latest" in body && "updateAvailable" in body);
+  });
+});

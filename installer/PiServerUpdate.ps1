@@ -1442,3 +1442,47 @@ function Expand-ReleasePayload {
     return @{ Ok = $false; ExtractedDir = ""; Error = $_.Exception.Message }
   }
 }
+
+<#
+.SYNOPSIS
+  True when a payload dir is a v0.3.0+ release (engine + VERSION >= 0.3).
+  Never throws. Used by the installer to branch deploy flows.
+#>
+function Test-V3Payload {
+  param([string]$PayloadDir = "")
+  try {
+    if ([string]::IsNullOrWhiteSpace($PayloadDir)) { return $false }
+    if (-not (Test-Path -LiteralPath (Join-Path $PayloadDir "installer\PiServerUpdate.ps1"))) { return $false }
+    $raw = ""
+    try { $raw = ((Get-Content -LiteralPath (Join-Path $PayloadDir "VERSION") -Raw -ErrorAction Stop) | Out-String).Trim() } catch { return $false }
+    if ($raw.StartsWith("v")) { $raw = $raw.Substring(1) }
+    $parts = $raw -split "\."
+    if ($parts.Count -lt 2) { return $false }
+    $major = 0
+    $minor = 0
+    try { $major = [int]$parts[0]; $minor = [int]($parts[1] -split "-")[0] } catch { return $false }
+    return (($major -gt 0) -or ($minor -ge 3))
+  } catch { return $false }
+}
+
+<#
+.SYNOPSIS
+  True when the node runs the v0.3.0+ pointer flow (valid pointer >= 0.3).
+  Never throws. Used by installer steps to pick launchers/health paths.
+#>
+function Test-V3Active {
+  param($Paths)
+  try {
+    if ($null -eq $Paths) { return $false }
+    $ptr = Read-ActiveRelease -PointerPath $Paths.ActivePointer
+    if (-not $ptr.Ok) { return $false }
+    $v = $ptr.Version
+    if ($v.StartsWith("v")) { $v = $v.Substring(1) }
+    $parts = $v -split "\."
+    if ($parts.Count -lt 2) { return $false }
+    $major = 0
+    $minor = 0
+    try { $major = [int]$parts[0]; $minor = [int]($parts[1] -split "-")[0] } catch { return $false }
+    return (($major -gt 0) -or ($minor -ge 3))
+  } catch { return $false }
+}

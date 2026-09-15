@@ -7,7 +7,8 @@
   Actions (enum, never arbitrary code):
     status   - pointer + installed releases + pending transaction (read-only)
     update   - full pointer-based update to -Version (needs -StagingDir with
-               a downloaded+extracted payload; download stays in the caller)
+               an extracted payload, or -ZipPath with a verified ZIP that
+               is expanded locally; download+verify stay in the caller)
     rollback - pointer rollback to previousVersion from update-state
     recover  - deterministic crash recovery for an interrupted update
   Real Windows primitives (tasks/services/ports) are wired here; the engine
@@ -21,6 +22,7 @@ param(
   [string]$Action = "status",
   [string]$Version = "",
   [string]$StagingDir = "",
+  [string]$ZipPath = "",
   [string]$Root = ""
 )
 
@@ -84,7 +86,14 @@ try {
     }
     "update" {
       if ([string]::IsNullOrWhiteSpace($Version)) { throw "update richiede -Version (formato vX.Y.Z)" }
-      if ([string]::IsNullOrWhiteSpace($StagingDir)) { throw "update richiede -StagingDir (payload scaricato+estratto dal chiamante)" }
+      $effStaging = $StagingDir
+      if ([string]::IsNullOrWhiteSpace($effStaging) -and (-not [string]::IsNullOrWhiteSpace($ZipPath))) {
+        $xpDir = Join-Path ([System.IO.Path]::GetTempPath()) ("piserver-xp-" + [Guid]::NewGuid().ToString("N"))
+        $xp = Expand-ReleasePayload -ZipPath $ZipPath -DestDir $xpDir
+        if (-not $xp.Ok) { throw ("espansione zip fallita: " + $xp.Error) }
+        $effStaging = $xp.ExtractedDir
+      }
+      if ([string]::IsNullOrWhiteSpace($effStaging)) { throw "update richiede -StagingDir oppure -ZipPath (payload verificato dal chiamante)" }
       $nodeExe = ""
       $me = Read-MachineEnv -EnvPath $Paths.MachineEnv
       if ($me.Ok) { $nodeExe = $me.Env.NodeExe }
@@ -113,7 +122,7 @@ try {
         if ($seen -ne "Running,Running") { return @{ Ok = $false; Detail = ("tasks non Running dopo start: " + $seen) } }
         return @{ Ok = $true; Detail = "tasks avviati e Running" }
       }
-      $res = Invoke-ReleaseUpdate -Paths $Paths -TargetVersion $Version -StagingDir $StagingDir `
+      $res = Invoke-ReleaseUpdate -Paths $Paths -TargetVersion $Version -StagingDir $effStaging `
         -NodeExe $nodeExe -StopRuntime $stopHook -StartRuntime $startHook
       Write-UpdaterLog ("update " + $Version + ": " + $res.Action + " " + $res.Detail) (& { if ($res.Ok) { "OK" } else { "FAIL" } })
       if ($res.Ok) { exit 0 }

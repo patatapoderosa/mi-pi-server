@@ -1010,6 +1010,10 @@ try {
   Assert-True ($wiUp -notmatch 'Start-Transcript -Path \$LogFile') "niente transcript su installer.log"
   Assert-True ($wiUp -match "DeployWillRun") "dipendenze deploy->tasks/health"
   Assert-True ($wiUp -match "Test-ShouldAutoUpdate") "auto-update detection"
+  Assert-True ($wiUp -match "Invoke-V3Deploy -Paths") "step 6: deploy v3 via pointer"
+  Assert-True ($wiUp -match "launcherMain") "step 9: launcher variabili (bin in v3)"
+  Assert-True ($wiUp -match "Test-V3Active -Paths") "steps 9/11: branch v3 su pointer attivo"
+  Assert-True ($wiUp -match "Invoke-UpdateRecovery -Paths") "step 11: recovery transazionale v3"
   Remove-Variable -Name upKillLog,upForeign,upFlapGone,upOwn,upPersOwn,upProcs,upKilled,upKills,upSelfHit,upStarted,upHookCalls -Scope Global -ErrorAction SilentlyContinue
 
   Write-Host "== orphan pi sweep + move retry + probe verdict (v0.2.9) =="
@@ -1354,6 +1358,31 @@ try {
     }
   }
   Assert-True ($moveViolations.Count -eq 0) ("no live rename/remove + 5.1 ok (" + ($moveViolations -join ", ") + ")")
+  Write-Host "== expand release payload (zip -> staging) =="
+  $xpRoot = Join-Path $TmpRoot "xp"
+  $xpSrc = Join-Path $xpRoot "src"
+  New-V3Payload $xpSrc "v0.3.0"
+  $xpZip = Join-Path $xpRoot "rel.zip"
+  Compress-Archive -Path (Join-Path $xpSrc "*") -DestinationPath $xpZip -Force
+  $xpDst = Join-Path $xpRoot "out"
+  $xp1 = Expand-ReleasePayload -ZipPath $xpZip -DestDir $xpDst
+  Assert-True (($xp1.Ok) -and ((Get-Content -LiteralPath (Join-Path $xp1.ExtractedDir "VERSION") -Raw) -eq "v0.3.0")) "zip flat espanso"
+  $xpWrap = Join-Path $xpRoot "wrap"
+  New-Item -ItemType Directory -Path (Join-Path $xpWrap "inner") -Force | Out-Null
+  Copy-Item -Path (Join-Path $xpSrc "*") -Destination (Join-Path $xpWrap "inner") -Recurse -Force
+  $xpZip2 = Join-Path $xpRoot "rel2.zip"
+  Compress-Archive -Path (Join-Path $xpWrap "*") -DestinationPath $xpZip2 -Force
+  $xp2 = Expand-ReleasePayload -ZipPath $xpZip2 -DestDir (Join-Path $xpRoot "out2")
+  Assert-True (($xp2.Ok) -and ((Get-Content -LiteralPath (Join-Path $xp2.ExtractedDir "VERSION") -Raw) -eq "v0.3.0")) "zip con wrapper tollerato"
+  $xpBad = Expand-ReleasePayload -ZipPath (Join-Path $xpRoot "assente.zip") -DestDir (Join-Path $xpRoot "out3")
+  Assert-True (-not $xpBad.Ok) "zip assente rifiutato"
+  $xpEmpty = Join-Path $xpRoot "empty"
+  New-Item -ItemType Directory -Path $xpEmpty -Force | Out-Null
+  "x" | Out-File -LiteralPath (Join-Path $xpEmpty "nota.txt") -Encoding ascii -NoNewline
+  $xpZip3 = Join-Path $xpRoot "rel3.zip"
+  Compress-Archive -Path (Join-Path $xpEmpty "*") -DestinationPath $xpZip3 -Force
+  $xp3 = Expand-ReleasePayload -ZipPath $xpZip3 -DestDir (Join-Path $xpRoot "out4")
+  Assert-True (-not $xp3.Ok) "zip senza VERSION rifiutato"
 } finally {
   Remove-Item -LiteralPath $TmpRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
