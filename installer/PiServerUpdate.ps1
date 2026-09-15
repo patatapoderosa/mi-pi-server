@@ -1090,6 +1090,10 @@ function Invoke-LegacyMigration {
     if (-not $wp.Ok) {
       return @{ Ok = $false; Action = "rejected"; Detail = ("pointer iniziale fallito: " + $wp.Error) }
     }
+    $binSync = Install-BinFiles -PayloadDir $StagingDir -BinDir $Paths.Bin
+    if (-not $binSync.Ok) {
+      return @{ Ok = $false; Action = "rejected"; Detail = ("bin non installabili: " + $binSync.Error) }
+    }
     $updFn = $TaskActionUpdater
     if ($null -eq $updFn) { $updFn = { param($n, $p) return @{ Ok = $true; Detail = "task updater skipped" } } }
     foreach ($t in @(@{ Name = $Paths.TaskName; Launcher = $Paths.BinRunPi }, @{ Name = $Paths.RemoteTaskName; Launcher = $Paths.BinRunRemote })) {

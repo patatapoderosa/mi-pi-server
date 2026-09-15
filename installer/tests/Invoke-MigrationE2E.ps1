@@ -61,11 +61,13 @@ if ($null -eq $nodeCmd) {
 }
 $NodeExe = $nodeCmd.Source
 
-$TestPort = 44998
-$probeBusy = Get-TcpListenerOwner -Port $TestPort
-if ($probeBusy.Listening) {
-  Write-Host ("SKIP migration E2E (porta test " + $TestPort + " occupata)") -ForegroundColor Yellow
-  exit 0
+$TestPorts = @(44998, 44997)
+foreach ($tp in $TestPorts) {
+  $probeBusy = Get-TcpListenerOwner -Port $tp
+  if ($probeBusy.Listening) {
+    Write-Host ("SKIP migration E2E (porta test " + $tp + " occupata)") -ForegroundColor Yellow
+    exit 0
+  }
 }
 
 $TestHmac = "e2e-test-hmac-0123456789abcdef"
@@ -157,9 +159,10 @@ function Dump-E2ELogs([hashtable]$paths) {
   } catch { }
 }
 
-function Build-Scenario([string]$name) {
+function Build-Scenario([string]$name, [int]$port) {
   $root = Join-Path $FxRoot $name
   $paths = (Get-PiServerPaths -Root (Join-Path $root "psrv")).Clone()
+  $paths.RemotePortDefault = $port
   $paths.TaskName = "PiE2E-mig-" + $tag + "-" + $name + "-Pi"
   $paths.RemoteTaskName = "PiE2E-mig-" + $tag + "-" + $name + "-Remote"
   $app = $paths.App
@@ -184,7 +187,7 @@ function Build-Scenario([string]$name) {
       DaemonScript = Join-Path $app "server\pi-daemon.mjs"; NodeArgs = $stripArgs
       RemoteEntry = Join-Path $app "server\pi-remote-server\index.ts"; AgentDir = $paths.AgentDir
     } | ConvertTo-Json -Depth 3) | Out-File -LiteralPath (Join-Path $app "runtime-env.json") -Encoding utf8
-  (@{ port = $TestPort; bindHost = "127.0.0.1"; maxSkewSeconds = 300 } | ConvertTo-Json -Depth 3) | Out-File -LiteralPath (Join-Path $paths.AgentDir "remote-server.json") -Encoding ascii -NoNewline
+  (@{ port = $port; bindHost = "127.0.0.1"; maxSkewSeconds = 300 } | ConvertTo-Json -Depth 3) | Out-File -LiteralPath (Join-Path $paths.AgentDir "remote-server.json") -Encoding ascii -NoNewline
   New-Item -ItemType Directory -Path $paths.SecretsDir -Force | Out-Null
   $TestHmac | Out-File -LiteralPath (Join-Path $paths.SecretsDir "remote-hmac") -Encoding ascii -NoNewline
   $pay = Join-Path $root "pay30"
@@ -202,15 +205,15 @@ function Start-ScenarioRuntime([hashtable]$paths) {
   if (-not $w.Ok) { throw ("legacy pi non partito: " + $w.Detail) }
   $deadline = [DateTime]::UtcNow.AddSeconds(60)
   while ([DateTime]::UtcNow -lt $deadline) {
-    $o = Get-TcpListenerOwner -Port $TestPort
+    $o = Get-TcpListenerOwner -Port $paths.RemotePortDefault
     if ($o.Listening -and ([string]$o.CommandLine -match "pi-remote-server")) { break }
     Start-Sleep -Seconds 2
   }
-  $o2 = Get-TcpListenerOwner -Port $TestPort
+  $o2 = Get-TcpListenerOwner -Port $paths.RemotePortDefault
   if ((-not $o2.Listening) -or ([string]$o2.CommandLine -notmatch "pi-remote-server")) {
     throw ("legacy remote non in ascolto: " + $o2.Detail)
   }
-  $ping = Test-RemoteApiPing -Paths $paths -Port $TestPort -TimeoutSec 10
+  $ping = Test-RemoteApiPing -Paths $paths -Port $paths.RemotePortDefault -TimeoutSec 10
   if (-not $ping.Ok) { throw ("legacy api senza pong: " + $ping.Detail) }
 }
 
@@ -231,7 +234,7 @@ function Add-ScenarioLocks([string]$app, [int]$port) {
 }
 
 function New-E2EHooks([hashtable]$paths, [scriptblock]$versionReader) {
-  $stopHook = { param($p) return (Stop-PiServerRuntime -Paths $p -RemotePort $TestPort -TimeoutSec 60) }
+  $stopHook = { param($p) return (Stop-PiServerRuntime -Paths $p -RemotePort $p.RemotePortDefault -TimeoutSec 60) }
   $startHook = {
     param($p)
     try { Start-ScheduledTask -TaskName $p.TaskName -ErrorAction Stop } catch { }
@@ -243,7 +246,7 @@ function New-E2EHooks([hashtable]$paths, [scriptblock]$versionReader) {
       $sPi = Get-TaskState $p.TaskName
       $sRe = Get-TaskState $p.RemoteTaskName
       $seen = ($sPi + "," + $sRe)
-      $o = Get-TcpListenerOwner -Port $TestPort
+      $o = Get-TcpListenerOwner -Port $p.RemotePortDefault
       $portOk = ($o.Listening -and ([string]$o.CommandLine -match "pi-remote-server"))
       if (($sPi -eq "Running") -and ($sRe -eq "Running") -and $portOk) { break }
       Start-Sleep -Seconds 3
@@ -258,7 +261,7 @@ function New-E2EHooks([hashtable]$paths, [scriptblock]$versionReader) {
     return @{ PiRunning = $a; RemoteRunning = $b; Detail = ("pi=" + (Get-TaskState $p.TaskName) + " remote=" + (Get-TaskState $p.RemoteTaskName)) }
   }
   $portCheck = { param($pt) return (Get-TcpListenerOwner -Port $pt) }
-  $apiCheck = { param($p) return (Test-RemoteApiPing -Paths $p -Port $TestPort -TimeoutSec 10) }
+  $apiCheck = { param($p) return (Test-RemoteApiPing -Paths $p -Port $p.RemotePortDefault -TimeoutSec 10) }
   $taskUpd = { param($n, $lp) return (Update-PiServerTaskAction -TaskName $n -LauncherPath $lp -WorkDir $paths.Bin) }
   return @{ Stop = $stopHook; Start = $startHook; TaskCheck = $taskCheck; PortCheck = $portCheck; ApiCheck = $apiCheck; VersionReader = $versionReader; TaskUpd = $taskUpd }
 }
@@ -267,12 +270,12 @@ try {
   New-Item -ItemType Directory -Path $FxRoot -Force | Out-Null
 
   Write-Host "== migration E2E scenario 1: legacy -> v0.3.0 =="
-  $s1 = Build-Scenario "s1"
+  $s1 = Build-Scenario "s1" 44998
   $p1 = $s1.Paths
   Start-ScenarioRuntime $p1
   Assert-True ((Get-TaskState $p1.TaskName) -eq "Running") "legacy pi task Running"
   Assert-True ((Get-TaskState $p1.RemoteTaskName) -eq "Running") "legacy remote task Running (loopback)"
-  Add-ScenarioLocks $s1.App $TestPort
+  Add-ScenarioLocks $s1.App $p1.RemotePortDefault
   $vrLive = { param($p) $pv = Read-ActiveRelease -PointerPath $p.ActivePointer; return @{ Ok = $pv.Ok; Version = $pv.Version } }
   $h1 = New-E2EHooks $p1 $vrLive
   $mig1 = Invoke-LegacyMigration -Paths $p1 -StagingDir $s1.Payload -TargetVersion "v0.3.0" -NodeExe $NodeExe `
@@ -289,21 +292,23 @@ try {
   Assert-True (([string]$tRe.Actions[0].Arguments).Contains('"' + $p1.BinRunRemote + '"')) "task Remote su bin\run-remote.ps1"
   Assert-True ((Get-TaskState $p1.TaskName) -eq "Running") "pi task Running post-migration (nuovo launcher)"
   Assert-True ((Get-TaskState $p1.RemoteTaskName) -eq "Running") "remote task Running post-migration"
-  $pingNew = Test-RemoteApiPing -Paths $p1 -Port $TestPort -TimeoutSec 10
+  $pingNew = Test-RemoteApiPing -Paths $p1 -Port $p1.RemotePortDefault -TimeoutSec 10
   Assert-True $pingNew.Ok "api pong sulla nuova release"
   $goneAll = $true
   foreach ($id in $script:stubPids) {
     try { $pp = Get-Process -Id $id -ErrorAction Stop; if (-not $pp.HasExited) { $goneAll = $false } } catch { }
   }
   Assert-True $goneAll "lock-holder + orfano + listener spazzati dallo sweep"
+  Write-Host ("  MIG detail s1: " + $mig1.Action + " " + $mig1.Detail)
+  try { Stop-PiServerRuntime -Paths $p1 -RemotePort $p1.RemotePortDefault -TimeoutSec 30 | Out-Null } catch { }
   Stop-E2EStubs
   Unregister-E2ETasks
 
   Write-Host "== migration E2E scenario 2: failure -> rollback, online =="
-  $s2 = Build-Scenario "s2"
+  $s2 = Build-Scenario "s2" 44997
   $p2 = $s2.Paths
   Start-ScenarioRuntime $p2
-  Add-ScenarioLocks $s2.App $TestPort
+  Add-ScenarioLocks $s2.App $p2.RemotePortDefault
   $vrFailNew = {
     param($p)
     $pv = Read-ActiveRelease -PointerPath $p.ActivePointer
@@ -319,8 +324,10 @@ try {
   Assert-True ((Get-TaskState $p2.TaskName) -eq "Running") "server ONLINE: pi task Running dopo rollback"
   Assert-True ((Get-TaskState $p2.RemoteTaskName) -eq "Running") "server ONLINE: remote task Running dopo rollback"
   Assert-Equal (Get-Content -LiteralPath (Join-Path $s2.App "VERSION") -Raw) "0.2.10" "legacy app intatta dopo rollback"
-  $pingOld = Test-RemoteApiPing -Paths $p2 -Port $TestPort -TimeoutSec 10
+  $pingOld = Test-RemoteApiPing -Paths $p2 -Port $p2.RemotePortDefault -TimeoutSec 10
   Assert-True $pingOld.Ok "api pong sulla release precedente"
+  Write-Host ("  MIG detail s2: " + $mig2.Action + " " + $mig2.Detail)
+  try { Stop-PiServerRuntime -Paths $p2 -RemotePort $p2.RemotePortDefault -TimeoutSec 30 | Out-Null } catch { }
   Stop-E2EStubs
   Unregister-E2ETasks
 } catch {
