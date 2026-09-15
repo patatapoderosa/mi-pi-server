@@ -1127,6 +1127,233 @@ try {
     Assert-True ((@(Get-ChildItem -LiteralPath $fixOut -Filter "*.zip" -ErrorAction SilentlyContinue)).Count -eq 0) "nessuno ZIP creato"
     Assert-True ($nrOut -match "(?i)syntax|pi-daemon") "motivo cita la sintassi"
   }
+  Write-Host "== v0.3.0 pointer model (immutable releases) =="
+  $v3LibDir = Split-Path -Parent $PSScriptRoot
+  . (Join-Path $v3LibDir "PiServerUpdate.ps1")
+  . (Join-Path $v3LibDir "PiServerDoctor.ps1")
+  function New-V3Payload([string]$dir, [string]$ver) {
+    foreach ($rel in $script:ReleaseManifestV3) {
+      $fp = Join-Path $dir $rel
+      $dd = Split-Path -Parent $fp
+      if (-not (Test-Path -LiteralPath $dd)) { New-Item -ItemType Directory -Path $dd -Force | Out-Null }
+      ("v3:" + $rel) | Out-File -LiteralPath $fp -Encoding ascii -NoNewline
+    }
+    $ver | Out-File -LiteralPath (Join-Path $dir "VERSION") -Encoding ascii -NoNewline
+  }
+  function New-V3Root([string]$dir) {
+    $pp = Get-PiServerPaths -Root $dir
+    foreach ($d in @((Join-Path $dir "bin"), (Join-Path $dir "releases"), $pp.Data, $pp.Logs)) {
+      if (-not (Test-Path -LiteralPath $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
+    }
+    return $pp
+  }
+  Assert-True (Test-ReleaseVersionFormat -Version "v0.3.0") "formato v0.3.0 ok"
+  Assert-True (Test-ReleaseVersionFormat -Version "v10.20.30-rc.1") "prerelease ok"
+  Assert-True (-not (Test-ReleaseVersionFormat -Version "0.3.0")) "senza v rifiutata"
+  Assert-True (-not (Test-ReleaseVersionFormat -Version "v0.3")) "incompleta rifiutata"
+  Assert-True (-not (Test-ReleaseVersionFormat -Version "../../foo")) "traversal rifiutato (F)"
+  Assert-True (-not (Test-ReleaseVersionFormat -Version "C:\x\v0.3.0")) "drive path rifiutato"
+  Assert-True (-not (Test-ReleaseVersionFormat -Version "\\\\srv\\v0.3.0")) "UNC rifiutata"
+  Assert-True (-not (Test-ReleaseVersionFormat -Version "")) "vuota rifiutata"
+  $ptrRoot = Join-Path $TmpRoot "v3ptr"
+  $ppPtr = New-V3Root $ptrRoot
+  $rMiss = Read-ActiveRelease -PointerPath $ppPtr.ActivePointer
+  Assert-True ((-not $rMiss.Ok) -and ($rMiss.Error -match "assente")) "pointer assente = fail (E)"
+  $w1 = Write-ActiveRelease -PointerPath $ppPtr.ActivePointer -Version "v0.3.0"
+  Assert-True $w1.Ok "pointer write ok"
+  $r1 = Read-ActiveRelease -PointerPath $ppPtr.ActivePointer
+  Assert-True (($r1.Ok) -and ($r1.Version -eq "v0.3.0")) "pointer round-trip"
+  $wBad = Write-ActiveRelease -PointerPath $ppPtr.ActivePointer -Version "../../evil"
+  Assert-True (-not $wBad.Ok) "pointer write traversal rifiutato"
+  $rStill = Read-ActiveRelease -PointerPath $ppPtr.ActivePointer
+  Assert-True (($rStill.Ok) -and ($rStill.Version -eq "v0.3.0")) "pointer intatto dopo write rifiutato"
+  "non-json{{{" | Out-File -LiteralPath $ppPtr.ActivePointer -Encoding ascii -NoNewline
+  $rCorr = Read-ActiveRelease -PointerPath $ppPtr.ActivePointer
+  Assert-True (-not $rCorr.Ok) "pointer corrotto = fail (E)"
+  (@{ schemaVersion = 99; version = "v0.3.0" } | ConvertTo-Json) | Out-File -LiteralPath $ppPtr.ActivePointer -Encoding ascii -NoNewline
+  $rSchema = Read-ActiveRelease -PointerPath $ppPtr.ActivePointer
+  Assert-True (-not $rSchema.Ok) "schema futuro rifiutato"
+  $resRoot = Join-Path $TmpRoot "v3res"
+  $ppRes = New-V3Root $resRoot
+  $payRes = Join-Path $resRoot "pay"
+  New-V3Payload $payRes "v0.3.0"
+  $rdMiss = Resolve-ReleaseDir -Root $resRoot -Version "v0.3.0"
+  Assert-True (-not $rdMiss.Ok) "release assente rifiutata"
+  $inst0 = Install-ReleaseCandidate -StagingDir $payRes -ReleasesRoot $ppRes.Releases -Version "v0.3.0"
+  Assert-True (($inst0.Ok) -and (-not $inst0.Reused)) "install fresca"
+  $rd0 = Resolve-ReleaseDir -Root $resRoot -Version "v0.3.0"
+  Assert-True (($rd0.Ok) -and (Test-Path -LiteralPath (Join-Path $rd0.Dir "server\pi-daemon.mjs"))) "resolve release valida"
+  $rdTrav = Resolve-ReleaseDir -Root $resRoot -Version "v0.3.0" 
+  Assert-True $rdTrav.Ok "resolve sanity"
+  $instReuse = Install-ReleaseCandidate -StagingDir $payRes -ReleasesRoot $ppRes.Releases -Version "v0.3.0"
+  Assert-True (($instReuse.Ok) -and $instReuse.Reused) "contenuto identico = reuse (G)"
+  "DIVERSO" | Out-File -LiteralPath (Join-Path $payRes "shared\store.ts") -Encoding ascii -NoNewline
+  $instDiff = Install-ReleaseCandidate -StagingDir $payRes -ReleasesRoot $ppRes.Releases -Version "v0.3.0"
+  Assert-True ((-not $instDiff.Ok) -and ($instDiff.Error -match "diverso")) "contenuto diverso = fail closed (G)"
+  Assert-True ((Get-Content -LiteralPath (Join-Path $ppRes.Releases "v0.3.0\shared\store.ts") -Raw) -ne "DIVERSO") "release installata intatta dopo rifiuto"
+  $rdDot = Resolve-ReleaseDir -Root $resRoot -Version "v1.2.3-.."
+  Assert-True (-not $rdDot.Ok) "suffix .. passa formato ma traversal rifiutato"
+  $upRoot = Join-Path $TmpRoot "v3upd"
+  $ppUp = New-V3Root $upRoot
+  $pay30 = Join-Path $upRoot "pay30"
+  $pay31 = Join-Path $upRoot "pay31"
+  New-V3Payload $pay30 "v0.3.0"
+  New-V3Payload $pay31 "v0.3.1"
+  $i30 = Install-ReleaseCandidate -StagingDir $pay30 -ReleasesRoot $ppUp.Releases -Version "v0.3.0"
+  Assert-True $i30.Ok "setup v0.3.0"
+  $wPtr = Write-ActiveRelease -PointerPath $ppUp.ActivePointer -Version "v0.3.0"
+  Assert-True $wPtr.Ok "setup pointer"
+  $noop = Invoke-ReleaseUpdate -Paths $ppUp -TargetVersion "v0.3.0" -StagingDir $pay30
+  Assert-True (($noop.Ok) -and ($noop.Action -eq "noop")) "stessa versione = noop"
+  $hookOk = { param($p) return @{ Ok = $true; Detail = "ok (fake)" } }
+  $healthOk = { param($p, $v) return @{ Ok = $true; Detail = ("healthy " + $v) } }
+  $upA = Invoke-ReleaseUpdate -Paths $ppUp -TargetVersion "v0.3.1" -StagingDir $pay31 -StopRuntime $hookOk -StartRuntime $hookOk -VersionReader { param($p) return @{ Ok = $true; Version = "v0.3.1" } }
+  Assert-True (($upA.Ok) -and ($upA.Action -eq "updated")) "update A: switch+verify (A)"
+  Assert-Equal (Read-ActiveRelease -PointerPath $ppUp.ActivePointer).Version "v0.3.1" "pointer su v0.3.1 dopo A"
+  Assert-True ((Test-Path -LiteralPath (Join-Path $ppUp.Releases "v0.3.0\server\pi-daemon.mjs")) -and (Test-Path -LiteralPath (Join-Path $ppUp.Releases "v0.3.1\server\pi-daemon.mjs"))) "entrambe le release intatte (no rename)"
+  $healthKo = { param($p, $v) if ($v -eq "v0.3.2") { return @{ Ok = $false; Detail = "nuova rotta (fake)" } } return @{ Ok = $true; Detail = "ok" } }
+  $pay32 = Join-Path $upRoot "pay32"
+  New-V3Payload $pay32 "v0.3.2"
+  $vrStale = { param($p) return @{ Ok = $true; Version = "v0.3.1" } }
+  $upB = Invoke-ReleaseUpdate -Paths $ppUp -TargetVersion "v0.3.2" -StagingDir $pay32 -StopRuntime $hookOk -StartRuntime $hookOk -VersionReader $vrStale
+  Assert-True ((-not $upB.Ok) -and ($upB.Action -eq "rolled_back")) "update B: health fail -> rollback (B)"
+  Assert-Equal (Read-ActiveRelease -PointerPath $ppUp.ActivePointer).Version "v0.3.1" "pointer tornato su v0.3.1 dopo B"
+  $histLines = @(Get-Content -LiteralPath $ppUp.UpdateHistory | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+  Assert-True ($histLines.Count -ge 3) "history append-only (>=3 voci)"
+  $lastH = ($histLines[-1] | ConvertFrom-Json)
+  Assert-True (([string]$lastH.result -eq "update_failed_rollback_healthy") -and ([bool]$lastH.rollback)) "history registra rollback"
+  Assert-True ((Get-Content -LiteralPath (Join-Path $ppUp.Releases "v0.3.2\VERSION") -Raw) -eq "v0.3.2") "candidate fallita resta installata ma inattiva"
+  $recRoot = Join-Path $TmpRoot "v3rec"
+  $ppRec = New-V3Root $recRoot
+  $payR0 = Join-Path $recRoot "payR0"
+  $payR1 = Join-Path $recRoot "payR1"
+  New-V3Payload $payR0 "v0.3.0"
+  New-V3Payload $payR1 "v0.3.1"
+  Install-ReleaseCandidate -StagingDir $payR0 -ReleasesRoot $ppRec.Releases -Version "v0.3.0" | Out-Null
+  Install-ReleaseCandidate -StagingDir $payR1 -ReleasesRoot $ppRec.Releases -Version "v0.3.1" | Out-Null
+  Write-ActiveRelease -PointerPath $ppRec.ActivePointer -Version "v0.3.0" | Out-Null
+  function Set-RecState([string]$phase, [string]$ptrVer) {
+    $s = @{ schemaVersion = 1; transactionId = "tx-test"; fromVersion = "v0.3.0"; toVersion = "v0.3.1"; phase = $phase; previousVersion = "v0.3.0"; startedAt = "t"; updatedAt = "" }
+    Write-UpdateState -StatePath $ppRec.UpdateState -State $s | Out-Null
+    Write-ActiveRelease -PointerPath $ppRec.ActivePointer -Version $ptrVer | Out-Null
+  }
+  $recHealth = { param($p, $v) return @{ Ok = $true; Detail = "ok" } }
+  $recStart = { param($p) return @{ Ok = $true; Detail = "started" } }
+  Set-RecState "candidate_installed" "v0.3.0"
+  $rc1 = Invoke-UpdateRecovery -Paths $ppRec -StartRuntime $recStart -VerifyHealth $recHealth
+  Assert-True (($rc1.Ok) -and ($rc1.Action -eq "old_verified_safe_to_resume")) "crash pre-switch (C): old attivo, ripristinabile"
+  Assert-Equal (Read-ActiveRelease -PointerPath $ppRec.ActivePointer).Version "v0.3.0" "pointer intatto pre-switch"
+  Set-RecState "runtime_stopped" "v0.3.0"
+  $rc2 = Invoke-UpdateRecovery -Paths $ppRec -StartRuntime $recStart -VerifyHealth $recHealth
+  Assert-True (($rc2.Ok) -and ($rc2.Action -eq "resumed_old_running")) "crash in stop: old riavviato"
+  Set-RecState "pointer_switched" "v0.3.1"
+  $rc3 = Invoke-UpdateRecovery -Paths $ppRec -StartRuntime $recStart -VerifyHealth $recHealth
+  Assert-True (($rc3.Ok) -and ($rc3.Action -eq "switched_verified_completed")) "crash post-switch (D): nuova verificata"
+  Set-RecState "health_verifying" "v0.3.1"
+  $recKo = { param($p, $v) if ($v -eq "v0.3.1") { return @{ Ok = $false; Detail = "rotta" } } return @{ Ok = $true; Detail = "ok" } }
+  $rc4 = Invoke-UpdateRecovery -Paths $ppRec -StartRuntime $recStart -VerifyHealth $recKo
+  Assert-True (($rc4.Ok) -and ($rc4.Action -eq "rolled_back_healthy")) "crash in verify con nuova rotta: rollback"
+  Assert-Equal (Read-ActiveRelease -PointerPath $ppRec.ActivePointer).Version "v0.3.0" "pointer rollback dopo crash"
+  Set-RecState "rollback_started" "v0.3.0"
+  $rc5 = Invoke-UpdateRecovery -Paths $ppRec -StartRuntime $recStart -VerifyHealth $recHealth
+  Assert-True (($rc5.Ok) -and ($rc5.Action -eq "rolled_back_healthy")) "crash in rollback: rollback completato"
+  Remove-Item -LiteralPath $ppRec.UpdateState -Force
+  $rc6 = Invoke-UpdateRecovery -Paths $ppRec -StartRuntime $recStart -VerifyHealth $recHealth
+  Assert-True (($rc6.Ok) -and ($rc6.Action -eq "nothing_to_do")) "senza state: nothing to do"
+  $migRoot = Join-Path $TmpRoot "v3mig"
+  $legApp = Join-Path $migRoot "psrv\app"
+  New-Item -ItemType Directory -Path (Join-Path $legApp "server") -Force | Out-Null
+  "x" | Out-File -LiteralPath (Join-Path $legApp "server\pi-daemon.mjs") -Encoding ascii -NoNewline
+  "0.2.10" | Out-File -LiteralPath (Join-Path $legApp "VERSION") -Encoding ascii -NoNewline
+  $legPaths = Get-PiServerPaths -Root (Join-Path $migRoot "psrv")
+  $fakeNode = Join-Path $migRoot "node-fake.exe"
+  "x" | Out-File -LiteralPath $fakeNode -Encoding ascii -NoNewline
+  (@{ NodeExe = $fakeNode; PiBin = ""; NpmGlobalBin = ""; NodeArgs = @(); AgentDir = $legPaths.AgentDir } | ConvertTo-Json) | Out-File -LiteralPath (Join-Path $legApp "runtime-env.json") -Encoding ascii -NoNewline
+  $legChk = Test-LegacyLayout -Paths $legPaths
+  Assert-True (($legChk.Found) -and ($legChk.Version -eq "v0.2.10")) "legacy rilevato, VERSION normalizzata"
+  $payMig = Join-Path $migRoot "payMig"
+  New-V3Payload $payMig "v0.3.0"
+  $taskActs = @{}
+  $updater = { param($n, $p) $taskActs[$n] = $p; return @{ Ok = $true; Detail = "ok" } }
+  $vrLive = { param($p) return @{ Ok = $true; Version = (Read-ActiveRelease -PointerPath $legPaths.ActivePointer).Version } }
+  $mig = Invoke-LegacyMigration -Paths $legPaths -StagingDir $payMig -TargetVersion "v0.3.0" -StopRuntime $hookOk -StartRuntime $hookOk -VersionReader $vrLive -TaskActionUpdater $updater
+  Assert-True (($mig.Ok) -and ($mig.Action -eq "migrated")) "migration copy-only felice"
+  Assert-Equal (Read-ActiveRelease -PointerPath $legPaths.ActivePointer).Version "v0.3.0" "pointer su target dopo migration"
+  Assert-True (Test-Path -LiteralPath (Join-Path $legPaths.Releases "v0.2.10\server\pi-daemon.mjs")) "snapshot legacy installato"
+  Assert-True (Test-Path -LiteralPath (Join-Path $legPaths.Releases "v0.3.0\server\pi-daemon.mjs")) "target installato"
+  Assert-True (Test-Path -LiteralPath (Join-Path $legApp "VERSION")) "legacy app intatta (H, mai rename)"
+  Assert-Equal (Get-Content -LiteralPath (Join-Path $legApp "VERSION") -Raw) "0.2.10" "legacy VERSION intatta"
+  Assert-True (($taskActs[$legPaths.TaskName] -eq $legPaths.BinRunPi) -and ($taskActs[$legPaths.RemoteTaskName] -eq $legPaths.BinRunRemote)) "task repointati su bin"
+  Assert-True ((Read-MachineEnv -EnvPath $legPaths.MachineEnv).Ok) "machine env promossa in data"
+  $migRoot2 = Join-Path $TmpRoot "v3migfail"
+  $ppMig2 = New-V3Root $migRoot2
+  $legApp2 = Join-Path $migRoot2 "psrv\app"
+  New-Item -ItemType Directory -Path (Join-Path $legApp2 "server") -Force | Out-Null
+  "x" | Out-File -LiteralPath (Join-Path $legApp2 "server\pi-daemon.mjs") -Encoding ascii -NoNewline
+  "vCORROTTA!!!" | Out-File -LiteralPath (Join-Path $legApp2 "VERSION") -Encoding ascii -NoNewline
+  $legPaths2 = Get-PiServerPaths -Root (Join-Path $migRoot2 "psrv")
+  $migBad = Invoke-LegacyMigration -Paths $legPaths2 -StagingDir $payMig -TargetVersion "v0.3.0" -StopRuntime $hookOk -StartRuntime $hookOk
+  Assert-True ((-not $migBad.Ok) -and ($migBad.Action -eq "rejected")) "VERSION legacy invalida: migration rifiutata, legacy intatto"
+  $docRoot = Join-Path $TmpRoot "v3doc"
+  $ppDoc = New-V3Root $docRoot
+  $payDoc = Join-Path $docRoot "payDoc"
+  New-V3Payload $payDoc "v0.3.0"
+  Install-ReleaseCandidate -StagingDir $payDoc -ReleasesRoot $ppDoc.Releases -Version "v0.3.0" | Out-Null
+  Write-ActiveRelease -PointerPath $ppDoc.ActivePointer -Version "v0.3.0" | Out-Null
+  "{}" | Out-File -LiteralPath (Join-Path $ppDoc.AgentDir "settings.json") -Encoding ascii -NoNewline
+  "x" | Out-File -LiteralPath (Join-Path $ppDoc.AgentDir "auth.json") -Encoding ascii -NoNewline
+  New-Item -ItemType Directory -Path $ppDoc.SecretsDir -Force | Out-Null
+  "0123456789abcdef" | Out-File -LiteralPath (Join-Path $ppDoc.SecretsDir "remote-hmac") -Encoding ascii -NoNewline
+  $docNode = Join-Path $docRoot "node-fake.exe"
+  "x" | Out-File -LiteralPath $docNode -Encoding ascii -NoNewline
+  $wmeDoc = Write-MachineEnv -EnvPath $ppDoc.MachineEnv -Env @{ NodeExe = $docNode; PiBin = ""; NpmGlobalBin = ""; NodeArgs = @(); AgentDir = $ppDoc.AgentDir }
+  Assert-True $wmeDoc.Ok "setup machine env doctor"
+  $fakeTasks = { param($n) return @{ Exists = $true; State = "Running"; LastResult = 0; Detail = "Running/0" } }
+  $fakeConn = { param($p) return @{ Listening = $false; Pid = 0; Name = ""; CommandLine = ""; Detail = "free" } }
+  $fakeTs = { return @{ Ok = $true; Ip = "100.64.0.1"; Detail = "100.64.0.1" } }
+  $doc1 = Invoke-ServerDoctor -Paths $ppDoc -TaskReader $fakeTasks -ConnectionReader $fakeConn -TailscaleReader $fakeTs -ProcessProbe { return @() }
+  Assert-True (($doc1.Status -eq "degraded") -and ($doc1.ReportPath -eq $ppDoc.DoctorReport)) "doctor degraded (listener free) + report scritto"
+  $rep = (Get-Content -LiteralPath $ppDoc.DoctorReport -Raw | ConvertFrom-Json)
+  Assert-True (($rep.status -eq "degraded") -and ($rep.checks.Count -ge 12)) "report strutturato >=12 checks"
+  $repRaw = Get-Content -LiteralPath $ppDoc.DoctorReport -Raw
+  Assert-True (($repRaw -notmatch "0123456789abcdef") -and ($repRaw -notmatch "[Ss]ecret")) "report senza secrets"
+  $global:upDocStarted = @()
+  $starter = { param($n) $global:upDocStarted += $n; return @{ Ok = $true; Detail = "started" } }
+  $deadTasks = { param($n) return @{ Exists = $false; State = ""; LastResult = 0; Detail = "assente" } }
+  $rep1 = Invoke-DoctorRepair -Paths $ppDoc -Only @("tasks") -TaskReader $deadTasks -TaskStarter $starter -ConnectionReader $fakeConn -TailscaleReader $fakeTs -ProcessProbe { return @() }
+  Assert-True ((($global:upDocStarted -contains $ppDoc.TaskName) -and ($global:upDocStarted -contains $ppDoc.RemoteTaskName))) "repair avvia task fermi (allowlist)"
+  Remove-Variable -Name upDocStarted -Scope Global -ErrorAction SilentlyContinue
+  Write-DoctorCircuit -CircuitPath $ppDoc.DoctorCircuit | Out-Null
+  Write-DoctorCircuit -CircuitPath $ppDoc.DoctorCircuit | Out-Null
+  Write-DoctorCircuit -CircuitPath $ppDoc.DoctorCircuit | Out-Null
+  $cb = Test-DoctorCircuit -CircuitPath $ppDoc.DoctorCircuit
+  Assert-True (-not $cb.Allowed) "circuit breaker scatta dopo 3 (max 3/10min)"
+  $repBlocked = Invoke-DoctorRepair -Paths $ppDoc -TaskReader $deadTasks -TaskStarter $starter -ConnectionReader $fakeConn
+  Assert-True ((-not $repBlocked.Ok) -and ($repBlocked.Detail -match "circuit breaker")) "repair rifiutata a circuito aperto"
+  $v3Files = @((Join-Path $v3LibDir "PiServerUpdate.ps1"), (Join-Path $v3LibDir "PiServerDoctor.ps1"), (Join-Path $v3LibDir "bin\run-pi.ps1"), (Join-Path $v3LibDir "bin\run-remote.ps1"), (Join-Path $v3LibDir "bin\updater.ps1"), (Join-Path $v3LibDir "bin\doctor.ps1"))
+  $moveViolations = @()
+  $v3InBlock = $false
+  foreach ($vf in $v3Files) {
+    $ln = 0
+    foreach ($line in (Get-Content -LiteralPath $vf)) {
+      $ln++
+      $scan = $line
+      if (-not $v3InBlock) {
+        if ($scan -match '<#') { $v3InBlock = $true; $scan = ($scan -split '<#', 2)[0]; if ($scan -match '#>') { $v3InBlock = $false } }
+      } else {
+        if ($scan -match '#>') { $v3InBlock = $false }
+        continue
+      }
+      $code = ($scan -split '#')[0]
+      if ($code -match "\bMove-Item\b|\bRename-Item\b|\bRemove-Item\b") {
+        if (($code -match '\$Paths\.App|\$rd\.Dir|\$releaseDir|\$snapDest|\$dest\b|ReleasesRoot') -and ($code -notmatch "SilentlyContinue")) {
+          $moveViolations += ((Split-Path -Leaf $vf) + ":" + $ln)
+        }
+      }
+      if ($code -match "\?\?|\?\.") { $moveViolations += ((Split-Path -Leaf $vf) + ":" + $ln + " (operatore 5.1)") }
+    }
+  }
+  Assert-True ($moveViolations.Count -eq 0) ("no live rename/remove + 5.1 ok (" + ($moveViolations -join ", ") + ")")
 } finally {
   Remove-Item -LiteralPath $TmpRoot -Recurse -Force -ErrorAction SilentlyContinue
 }

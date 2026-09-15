@@ -90,6 +90,20 @@ function Get-PiServerPaths {
     TaskName = "PiHomeServer"
     RemoteTaskName = "PiRemoteServer"
     RemotePortDefault = 43128
+    Bin = Join-Path $Root "bin"
+    Releases = Join-Path $Root "releases"
+    BinRunPi = Join-Path (Join-Path $Root "bin") "run-pi.ps1"
+    BinRunRemote = Join-Path (Join-Path $Root "bin") "run-remote.ps1"
+    BinUpdater = Join-Path (Join-Path $Root "bin") "updater.ps1"
+    BinDoctor = Join-Path (Join-Path $Root "bin") "doctor.ps1"
+    ActivePointer = Join-Path $data "active-release.json"
+    UpdateState = Join-Path $data "update-state.json"
+    UpdateHistory = Join-Path $data "update-history.jsonl"
+    DoctorReport = Join-Path $data "doctor-report.json"
+    DoctorCircuit = Join-Path $data "doctor-circuit.json"
+    MachineEnv = Join-Path $data "runtime-env.json"
+    UpdaterLog = Join-Path $logs "updater.log"
+    DoctorLog = Join-Path $logs "doctor.log"
   }
 }
 

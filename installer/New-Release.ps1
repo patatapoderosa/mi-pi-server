@@ -41,25 +41,14 @@ if ([string]::IsNullOrWhiteSpace($OutDir)) {
   $OutDir = Join-Path $RepoRoot "dist-release"
 }
 
-$wanted = @(
-  "server\pi-daemon.mjs",
-  "server\spawn-pi.mjs",
-  "server\pi-remote-config\index.ts",
-  "server\pi-remote-config\package.json",
-  "server\pi-remote-server\index.ts",
-  "server\pi-remote-server\server.ts",
-  "server\pi-remote-server\migrate.ts",
-  "server\pi-remote-server\tailscale.ts",
-  "shared\protocol.ts",
-  "shared\modules.ts",
-  "shared\store.ts",
-  "shared\pi-model.ts",
-  "installer\PiServerLib.ps1",
-  "installer\windows-installer.ps1",
-  "installer\run-task.ps1",
-  "installer\run-remote.ps1"
-)
-
+. (Join-Path (Split-Path -Parent $PSCommandPath) "PiServerLib.ps1")
+$updateLibPath = Join-Path (Split-Path -Parent $PSCommandPath) "PiServerUpdate.ps1"
+if (Test-Path -LiteralPath $updateLibPath) { . $updateLibPath }
+$wanted = @($script:ReleaseManifest | ForEach-Object { $_ })
+$v3Marker = Join-Path $RepoRoot "installer\PiServerUpdate.ps1"
+if ((Test-Path -LiteralPath $v3Marker) -and ($null -ne $script:ReleaseManifestV3)) {
+  $wanted = @($script:ReleaseManifestV3 | ForEach-Object { $_ })
+}
 foreach ($rel in $wanted) {
   if (-not (Test-Path -LiteralPath (Join-Path $RepoRoot $rel))) {
     Write-Host "RELEASE FALLITA" -ForegroundColor Red
@@ -81,6 +70,21 @@ if (-not $rtGate.Ok) {
   exit 1
 }
 Write-Host "runtime JS syntax OK (pi-daemon.mjs, spawn-pi.mjs)" -ForegroundColor Green
+$psGateFiles = @($wanted | Where-Object { $_ -like "*.ps1" })
+$psBad = @()
+foreach ($rel in $psGateFiles) {
+  $pf = Join-Path $RepoRoot $rel
+  $tok = $null
+  $errs = $null
+  [System.Management.Automation.Language.Parser]::ParseFile($pf, [ref]$tok, [ref]$errs) | Out-Null
+  if ($errs.Count -gt 0) { $psBad += ($rel + ": " + $errs[0].Message) }
+}
+if ($psBad.Count -gt 0) {
+  Write-Host "RELEASE FALLITA" -ForegroundColor Red
+  Write-Host ("Motivo: PowerShell non valido: " + ($psBad -join "; "))
+  exit 1
+}
+Write-Host ("PowerShell syntax OK (" + $psGateFiles.Count + " file)") -ForegroundColor Green
 try {
   & npm --prefix "$RepoRoot" run typecheck 2>&1 | Out-Null
   if ($LASTEXITCODE -ne 0) { throw "exit $LASTEXITCODE" }

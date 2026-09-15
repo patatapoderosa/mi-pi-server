@@ -76,3 +76,8 @@ jobs:
         run: |
           powershell.exe -NoProfile -NonInteractive `
             -File installer/tests/Invoke-UpgradeE2E.ps1
+      - name: Migration E2E on real Windows (legacy app -> pointer releases)
+        shell: powershell
+        run: |
+          powershell.exe -NoProfile -NonInteractive `
+            -File installer/tests/Invoke-MigrationE2E.ps1
