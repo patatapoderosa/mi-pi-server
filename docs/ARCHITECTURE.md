@@ -74,6 +74,10 @@ Phone flow is direct: DM → ServerBot → Pi → `server_status`/`server_config
 | `GET /v1/models` | signed | live Pi catalog with per-provider auth (capped) |
 | `POST /v1/model/validate` | signed | dry-run selection check (read-only) |
 | `POST /v1/model` | signed + core gates | validated atomic settings write + backup |
+| `GET /v1/doctor` | signed | cached structured diagnostics (no secrets) |
+| `POST /v1/doctor` | signed (+gates for repair) | `{fresh?, repair?, only?}` → fixed `doctor.ps1` spawn |
+| `GET /v1/update` | signed | pointer + releases + pending transaction + history tail |
+| `POST /v1/update` | signed (+gates for apply/rollback/recover) | `{action, version?}` → check/plan (reads) or detached updater spawn |
 
 Auth (every `/v1/*` route except `/v1/health`), verification order:
 headers → signature (constant-time) → freshness → persisted anti-replay →
@@ -136,6 +140,38 @@ neither the app root nor the daemon markers, yet their cwd lock blocks the
 directory rename (`EACCES`). The port gate never kills foreign listeners;
 a failed swap leaves the live app untouched and reports redacted
 blocker candidates (command lines, secrets stripped) for diagnosis.
+
+## Immutable releases v0.3.0 (`bin/` + `releases/` + pointer)
+
+The v0.2.x updater renamed the LIVE `C:\PiServer\app` directory, so any
+process holding cwd/handles inside it (daemon-spawned `pi --mode rpc`
+orphans, AV scanners) broke upgrades with `EACCES`. v0.3.0 never renames,
+moves or overwrites a live release: every version installs immutable under
+`C:\PiServer\releases\<version>\`, and activation switches ONLY the
+`data\active-release.json` pointer (temp + OS replace, crash-atomic).
+
+- `bin\run-pi.ps1` / `run-remote.ps1`: stable Task Scheduler targets.
+  They read the pointer (strict `vX.Y.Z` allowlist + canonical child-of-
+  `releases` check, fail closed), load machine facts from
+  `data\runtime-env.json`, and start the active release daemon in the
+  foreground. Invalid pointer = exit 3, never a guessed version.
+- `bin\updater.ps1` (`status|update|rollback|recover`) and `bin\doctor.ps1`
+  (diagnose + allowlist repair) are thin entry points over
+  `installer\PiServerUpdate.ps1` / `PiServerDoctor.ps1`.
+- `data\update-state.json` records every phase (`preflight` … `completed`,
+  `rollback_*`); a reboot mid-update resumes deterministically
+  (`Invoke-UpdateRecovery`): pre-switch crashes keep the old release,
+  post-switch crashes verify-or-roll-back. `update-history.jsonl` is
+  append-only (no secrets).
+- Migration from v0.2.x is copy-only: legacy `app\` → snapshot
+  `releases\<legacy-ver>`, machine env promoted to `data\`, tasks repointed
+  to `bin\`, legacy verified through the new launcher, then pointer switch
+  to the target. Legacy `app\` is never renamed or deleted.
+- `server_doctor` (diagnose/repair) and `server_update`
+  (check/plan/apply/status/rollback/recover) are first-class Mac + ServerBot
+  capabilities over the same signed pipeline (mutations honor core gates).
+  Remote spawns use fixed argv only (`powershell -File` on a `bin\` script
+  plus enum action + regex version); reads never spawn. See `docs/SECURITY.md`.
 
 ## Remote Model Management (`server_model`)
 

@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased (v0.3.0 — NOT published, awaiting review)
+
+Root fix for the endless updater-fix cycle: releases are immutable,
+the live tree is never renamed, activation is an atomic pointer switch.
+
+### Added
+
+- Pointer-based releases: `bin/` (stable launchers + updater/doctor
+  entries), `releases/<version>/` (immutable code), `data/` (pointer,
+  update-state, history, machine facts). `NEVER MODIFY THE RUNNING RELEASE`.
+- Copy-only migration from legacy `C:\PiServer\app` (snapshot + verify
+  old via new launcher + switch + verify new + automatic pointer rollback;
+  legacy app never renamed or deleted).
+- Crash-safe `update-state.json` phases with deterministic reboot recovery
+  and append-only `update-history.jsonl`.
+- `server_doctor` (structured healthy/degraded/unhealthy, no secrets) +
+  allowlist self-heal behind a 3-in-10-minutes circuit breaker.
+- `server_update` (check/plan/apply/status/rollback/recover) as first-class
+  Mac + ServerBot capabilities: signed pipeline, core gates on mutations,
+  fixed-argv spawns only, trusted GitHub releases only, no remote shell.
+- `GET/POST /v1/doctor`, `GET/POST /v1/update` daemon routes.
+
 ## v0.2.10 — 2026-09-13
 
 ### Fixed
@@ -19,6 +41,7 @@
 
 - Rerun the one-liner (resolves `latest` → v0.2.10). No checkpoint
   deletion, no reinstall, no new `/login`, no `-Force`.
+
 ## v0.2.9 — 2026-09-12
 
 ### Added
@@ -106,7 +129,7 @@
   launcher's pre-launch line.
 - Added `Invoke-TaskE2E.ps1`: real Windows end-to-end (temp SYSTEM task with
   a SPACED path, stub pi.cmd, real `Wait-TaskStartup` polling, State/Running
-  + LastTaskResult + log + 10s-liveness checks, full teardown). Runs in CI
+  - LastTaskResult + log + 10s-liveness checks, full teardown). Runs in CI
   on windows-latest under powershell.exe 5.1; self-dumps logs on failure.
 
 ### Upgrade notes
@@ -238,7 +261,6 @@
   A login done in the user profile is offered for migration; a login already
   in the server dir is recognized immediately.
 
-
 ## v0.2.2 — 2026-09-11
 
 ### Fixed
@@ -274,7 +296,6 @@
   Interrupted installs resume automatically from the failed step.
   `-Update` keeps working (deploy always re-runs in update mode).
 
-
 ## v0.2.1 — 2026-09-11
 
 ### Fixed
@@ -304,7 +325,6 @@
 - No migration needed: rerun the one-liner (it resolves `latest` → v0.2.1)
   or `setup.ps1 -Update`. Pinned installs keep working:
   `setup.ps1 -Version v0.2.1 -ExpectedSha256 <hash>`.
-
 
 ## v0.2.0 — 2026-09-11
 

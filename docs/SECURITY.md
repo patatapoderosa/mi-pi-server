@@ -70,6 +70,16 @@ code and no state change. The Mac surfaces them as tool errors.
   (`allowedServices` in `remote-server.json`): no commands, paths, or scripts
   can pass through it.
 
+- `server_doctor` / `server_update` (daemon) and the ServerBot twins spawn ONLY
+  fixed argv: `powershell.exe -NoProfile -NonInteractive -File <root>\bin\doctor.ps1|updater.ps1`
+  plus an enum action (`-Action update|rollback|recover`), a regex version (`vX.Y.Z`),
+  a `-Json`/`-Repair` switch, or repair-group names from a 6-item allowlist used as
+  separate argv elements. No `-Command` strings, no shell, no paths built from
+  remote input (staging dirs come from daemon-created temp dirs; versions pass the
+  release regex; downloads use fixed GitHub release URLs). Update/rollback/recover
+  spawns are detached (fire-and-forget, outcome in `updater.log`, polled via status).
+  Read routes (`GET /v1/doctor`, `GET /v1/update`, check/plan) never spawn.
+  The pre-existing `server_model` precedent (fixed `pi` argv) is extended, not weakened.
 - `server_model` runs only fixed Pi CLI commands (`--list-models`,
   `auth check --provider <allowlisted-id> --json --no-refresh` where the
   provider comes from Pi's own catalog, never raw client input) and reads
@@ -77,6 +87,7 @@ code and no state change. The Mac surfaces them as tool errors.
   `~/.pi`). Responses carry catalog metadata + booleans only — no tokens,
   keys, auth.json content, or environment secrets. Writes are backup +
   atomic rename; corrupt settings files are refused, never overwritten.
+
 ## Supply chain (Windows installer)
 
 - Honest trust root: `setup.ps1` is downloaded over HTTPS from

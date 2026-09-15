@@ -14,6 +14,10 @@
  *   POST /v1/modules/:name/enable    auth: flip boolean "enabled" on
  *   POST /v1/modules/:name/disable   auth: flip boolean "enabled" off
  *   POST /v1/model                   auth: { provider?, model, thinkingLevel?, applyNow? } -> validated atomic write
+ *   GET  /v1/doctor                  auth: cached structured diagnostics
+ *   POST /v1/doctor                  auth: { fresh?, repair?, only? } -> fixed doctor.ps1 spawn
+ *   GET  /v1/update                  auth: pointer + releases + transaction status
+ *   POST /v1/update                  auth: { action: check|plan|apply|status|rollback|recover, version? }
  * Auth (every /v1/* route except /v1/health):
  *   X-Pi-Timestamp / X-Pi-Nonce / X-Pi-Signature, HMAC-SHA256 over
  *   METHOD + LF + PATH + LF + TS + LF + NONCE + LF + SHA256(raw body).
@@ -91,7 +95,6 @@ import {
   readUpdateState,
   resolveReleaseDir,
   v3Available,
-  type UpdateAction,
 } from "./update.ts";
 const execFileAsync = promisify(execFile);
 const MAX_BODY_BYTES = 262144;
@@ -1375,7 +1378,7 @@ async function handle(
       });
       return;
     }
-    const version: UpdateAction extends never ? never : string = versionRaw;
+    const version: string = versionRaw;
     let staging = "";
     try {
       staging = mkdtempSync(join(tmpdir(), "pi-update-"));
