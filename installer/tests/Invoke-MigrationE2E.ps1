@@ -171,9 +171,17 @@ function Build-Scenario([string]$name) {
   Copy-Item -LiteralPath (Join-Path $app "installer\run-remote.ps1") -Destination (Join-Path $app "run-remote.ps1") -Force
   $stubPi = Join-Path $app "stub-pi.cmd"
   New-StubPi $stubPi
+  $stripProbe = Join-Path $app "server\pi-remote-server\index.ts"
+  $stripArgs = @()
+  foreach ($cand in @(@(), @("--experimental-strip-types"))) {
+    try {
+      & $NodeExe @cand --check $stripProbe 2>&1 | Out-Null
+      if ($LASTEXITCODE -eq 0) { $stripArgs = $cand; break }
+    } catch { }
+  }
   (@{
       NodeExe = $NodeExe; PiBin = $stubPi; NpmGlobalBin = ""
-      DaemonScript = Join-Path $app "server\pi-daemon.mjs"; NodeArgs = @()
+      DaemonScript = Join-Path $app "server\pi-daemon.mjs"; NodeArgs = $stripArgs
       RemoteEntry = Join-Path $app "server\pi-remote-server\index.ts"; AgentDir = $paths.AgentDir
     } | ConvertTo-Json -Depth 3) | Out-File -LiteralPath (Join-Path $app "runtime-env.json") -Encoding utf8
   (@{ port = $TestPort; bindHost = "127.0.0.1"; maxSkewSeconds = 300 } | ConvertTo-Json -Depth 3) | Out-File -LiteralPath (Join-Path $paths.AgentDir "remote-server.json") -Encoding ascii -NoNewline
