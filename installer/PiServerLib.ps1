@@ -566,16 +566,29 @@ function Test-ShouldAutoUpdate {
 .SYNOPSIS
   Pure verdict on a TCP probe result: found / free / probe-failed.
 .DESCRIPTION
-  A silent empty result means FREE (expected case, no transcript noise);
-  empty WITH a cmdlet error means the probe itself failed (fail closed).
-  Never throws.
+  Non-empty result means FOUND. Empty result means FREE when silent or when
+  every recorded error is the benign CIM no-match shape (that is how
+  Get-NetTCPConnection reports an empty set on 5.1: an ObjectNotFound
+  ErrorRecord, not empty output). Any other error means the probe itself
+  failed (fail closed). Never throws.
 #>
 function Test-ConnectionProbeResult {
-  param($Connections, [bool]$HadError = $false)
+  param($Connections, $Errors)
   try {
     $list = @($Connections) | Where-Object { $null -ne $_ }
     if (@($list).Count -gt 0) { return "found" }
-    if ($HadError) { return "probe-failed" }
+    $errs = @($Errors) | Where-Object { $null -ne $_ }
+    if (@($errs).Count -eq 0) { return "free" }
+    foreach ($e in $errs) {
+      $cat = ""
+      $fqid = ""
+      $msg = ""
+      try { $cat = [string]$e.CategoryInfo.Category } catch { }
+      try { $fqid = [string]$e.FullyQualifiedErrorId } catch { }
+      try { $msg = [string]$e.Exception.Message } catch { }
+      $isNoMatch = (($cat -eq "ObjectNotFound") -or ($fqid -match "NoMatching|NotFound") -or ($msg -match "(?i)no matching.*objects found"))
+      if (-not $isNoMatch) { return "probe-failed" }
+    }
     return "free"
   } catch { return "probe-failed" }
 }
@@ -589,7 +602,7 @@ function Get-TcpListenerOwner {
       if ($env:OS -ne "Windows_NT") { return @{ Listening = $false; Pid = 0; Name = ""; CommandLine = ""; Detail = "non-Windows" } }
       $tcpErr = @()
       $conns = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorVariable tcpErr -ErrorAction SilentlyContinue)
-      $probeVerdict = Test-ConnectionProbeResult -Connections $conns -HadError ((@($tcpErr).Count -gt 0))
+      $probeVerdict = Test-ConnectionProbeResult -Connections $conns -Errors $tcpErr
       if ($probeVerdict -eq "probe-failed") {
         $firstErr = ""
         try { $firstErr = [string]$tcpErr[0].Exception.Message } catch { }

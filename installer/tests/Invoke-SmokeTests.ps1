@@ -1030,9 +1030,15 @@ try {
   $sOrphan = Stop-PiServerRuntime -Paths $ppPaths -RemotePort 0 -TimeoutSec 5 -TaskReader $rNoTasks -ProcessProbe $probeOrphan -Stopper $stopOrphan
   Assert-True $sOrphan.Ok "orfano pi fermato"
   Assert-True (($global:upOrphanKills.Count -eq 1) -and ($global:upOrphanKills[0] -eq 777)) "kill solo orfano, foreign intatto"
-  Assert-Equal (Test-ConnectionProbeResult -Connections @() -HadError $false) "free" "vuoto senza errori = free"
-  Assert-Equal (Test-ConnectionProbeResult -Connections $null -HadError $true) "probe-failed" "vuoto con errore = probe-failed"
-  Assert-Equal (Test-ConnectionProbeResult -Connections @(@{ x = 1 }) -HadError $true) "found" "dati presenti vince"
+  Assert-Equal (Test-ConnectionProbeResult -Connections @() -Errors @()) "free" "vuoto senza errori = free"
+  $errReal = [pscustomobject]@{ CategoryInfo = @{ Category = "NotSpecified" }; FullyQualifiedErrorId = "GetFailed"; Exception = @{ Message = "boom" } }
+  Assert-Equal (Test-ConnectionProbeResult -Connections $null -Errors @($errReal)) "probe-failed" "errore reale = probe-failed"
+  Assert-Equal (Test-ConnectionProbeResult -Connections @(@{ x = 1 }) -Errors @($errReal)) "found" "dati presenti vince"
+  $errNoMatch = [pscustomobject]@{ CategoryInfo = @{ Category = "ObjectNotFound" }; FullyQualifiedErrorId = "NoMatchingObjectsFound"; Exception = @{ Message = "No matching objects found" } }
+  Assert-Equal (Test-ConnectionProbeResult -Connections @() -Errors @($errNoMatch)) "free" "no-match CIM = free (5.1)"
+  $errFqid = [pscustomobject]@{ CategoryInfo = @{ Category = "X" }; FullyQualifiedErrorId = "NoMatchingObjectsFound,Foo"; Exception = @{ Message = "altro" } }
+  Assert-Equal (Test-ConnectionProbeResult -Connections @() -Errors @($errFqid)) "free" "fqid no-match = free"
+  Assert-Equal (Test-ConnectionProbeResult -Connections @() -Errors @($errNoMatch, $errReal)) "probe-failed" "un errore reale basta per probe-failed"
   $mvRoot = Join-Path $TmpRoot "mvretry"
   $mvSrc = Join-Path $mvRoot "src"
   $mvDst = Join-Path $mvRoot "dst"

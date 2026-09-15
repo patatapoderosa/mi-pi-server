@@ -141,6 +141,22 @@ function Get-TaskState([string]$name) {
   } catch { return "missing" }
 }
 
+function Dump-E2ELogs([hashtable]$paths) {
+  try {
+    Write-Host ("  LOG task pi=" + (Get-TaskState $paths.TaskName) + " remote=" + (Get-TaskState $paths.RemoteTaskName))
+    foreach ($lf in @($paths.ServerLog, $paths.ServerErrLog, $paths.RemoteLog, $paths.RemoteErrLog)) {
+      try {
+        if (Test-Path -LiteralPath $lf) {
+          Write-Host ("  LOG tail " + $lf + ":")
+          Get-Content -LiteralPath $lf -Tail 15 | ForEach-Object { Write-Host ("    " + $_) }
+        } else {
+          Write-Host ("  LOG absent: " + $lf)
+        }
+      } catch { }
+    }
+  } catch { }
+}
+
 function Build-Scenario([string]$name) {
   $root = Join-Path $FxRoot $name
   $paths = (Get-PiServerPaths -Root (Join-Path $root "psrv")).Clone()
@@ -176,7 +192,7 @@ function Start-ScenarioRuntime([hashtable]$paths) {
   $w = Wait-TaskStartup -TaskName $paths.TaskName -LauncherPath (Join-Path $paths.App "run-task.ps1") `
     -ProcessMatch "pi-daemon\.mjs" -LogPath $paths.ServerLog -TimeoutSec 30
   if (-not $w.Ok) { throw ("legacy pi non partito: " + $w.Detail) }
-  $deadline = [DateTime]::UtcNow.AddSeconds(30)
+  $deadline = [DateTime]::UtcNow.AddSeconds(60)
   while ([DateTime]::UtcNow -lt $deadline) {
     $o = Get-TcpListenerOwner -Port $TestPort
     if ($o.Listening -and ([string]$o.CommandLine -match "pi-remote-server")) { break }
@@ -301,6 +317,10 @@ try {
   Unregister-E2ETasks
 } catch {
   Write-Host ("  FAIL eccezione E2E: " + $_.Exception.Message) -ForegroundColor Red
+  foreach ($vn in @("p1", "p2")) {
+    $vv = Get-Variable -Name $vn -ErrorAction SilentlyContinue
+    if (($null -ne $vv) -and ($null -ne $vv.Value)) { Dump-E2ELogs $vv.Value }
+  }
   $script:failed++
   $script:failures += "eccezione E2E"
 } finally {
