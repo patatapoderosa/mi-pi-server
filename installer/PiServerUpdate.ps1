@@ -1169,7 +1169,8 @@ function Test-RemoteApiPing {
     }
     $resp = Invoke-RestMethod -Uri ("http://127.0.0.1:" + $Port + "/v1/ping") -Headers $headers -TimeoutSec $TimeoutSec -UseBasicParsing -ErrorAction Stop
     $pong = $false
-    try { $pong = [bool]$resp.pong } catch { }
+    try { $pong = [bool]$resp.body.pong } catch { }
+    if (-not $pong) { try { $pong = [bool]$resp.pong } catch { } }
     if ($pong) { return @{ Ok = $true; Detail = "pong" } }
     return @{ Ok = $false; Detail = "risposta senza pong" }
   } catch {
@@ -1397,5 +1398,47 @@ function Update-PiServerTaskAction {
     return @{ Ok = $true; Detail = ("task repointato su " + $LauncherPath) }
   } catch {
     return @{ Ok = $false; Detail = $_.Exception.Message }
+  }
+}
+
+<#
+.SYNOPSIS
+  Expand a release ZIP into a staging dir (tolerant layout). Never throws.
+.DESCRIPTION
+  Uses Expand-Archive (built-in, no 7z dependency). Accepts both flat zips
+  (VERSION at top, our builder layout) and single-wrapper-folder zips
+  (descends one level). Returns @{ Ok; ExtractedDir; Error }. The extracted
+  tree is validated later by Test-ReleaseContent; this function only
+  guarantees a readable directory.
+#>
+function Expand-ReleasePayload {
+  param([string]$ZipPath = "", [string]$DestDir = "")
+  try {
+    if ([string]::IsNullOrWhiteSpace($ZipPath) -or [string]::IsNullOrWhiteSpace($DestDir)) {
+      return @{ Ok = $false; ExtractedDir = ""; Error = "zip/dest vuoti" }
+    }
+    if (-not (Test-Path -LiteralPath $ZipPath)) {
+      return @{ Ok = $false; ExtractedDir = ""; Error = "zip assente" }
+    }
+    if (Test-Path -LiteralPath $DestDir) {
+      try { Remove-Item -LiteralPath $DestDir -Recurse -Force -ErrorAction Stop } catch { }
+    }
+    try { New-Item -ItemType Directory -Path $DestDir -Force -ErrorAction Stop | Out-Null }
+    catch { return @{ Ok = $false; ExtractedDir = ""; Error = ("dest non creabile: " + $DestDir) } }
+    try {
+      Expand-Archive -LiteralPath $ZipPath -DestinationPath $DestDir -Force -ErrorAction Stop
+    } catch {
+      return @{ Ok = $false; ExtractedDir = ""; Error = ("estrazione fallita: " + $_.Exception.Message) }
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $DestDir "VERSION"))) {
+      $subs = @(Get-ChildItem -LiteralPath $DestDir -Directory -ErrorAction SilentlyContinue)
+      if (($subs.Count -eq 1) -and (Test-Path -LiteralPath (Join-Path $subs[0].FullName "VERSION"))) {
+        return @{ Ok = $true; ExtractedDir = $subs[0].FullName; Error = "" }
+      }
+      return @{ Ok = $false; ExtractedDir = ""; Error = "VERSION assente dopo estrazione" }
+    }
+    return @{ Ok = $true; ExtractedDir = $DestDir; Error = "" }
+  } catch {
+    return @{ Ok = $false; ExtractedDir = ""; Error = $_.Exception.Message }
   }
 }
