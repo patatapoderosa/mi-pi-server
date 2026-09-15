@@ -1,6 +1,6 @@
 {
   "name": "pi-remote",
-  "version": "0.2.10",
+  "version": "0.3.0-rc1",
   "private": true,
   "description": "Mac-side Pi extension: natural-language remote control of the 24/7 Pi server node via HMAC-signed HTTP over Tailscale (Keychain secrets).",
   "type": "module",

@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased (v0.3.0 — NOT published, awaiting review)
+## v0.3.0-rc1 — 2026-09-15 (release candidate, NOT stable)
 
 Root fix for the endless updater-fix cycle: releases are immutable,
 the live tree is never renamed, activation is an atomic pointer switch.

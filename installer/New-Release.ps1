@@ -100,6 +100,8 @@ if (-not (Test-Path -LiteralPath $OutDir)) {
 }
 $stage = Join-Path $OutDir ("stage-" + [Guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $stage -Force | Out-Null
+  $Version | Out-File -LiteralPath (Join-Path $stage "VERSION") -Encoding ascii -NoNewline
+  Write-Host ("VERSION timbrata: " + $Version) -ForegroundColor Green
 try {
   foreach ($rel in $wanted) {
     $dst = Join-Path $stage $rel
