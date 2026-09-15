@@ -30,7 +30,7 @@ param()
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = "Stop"
 
-$RepoRoot = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
+$RepoRoot = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $PSCommandPath))
 . (Join-Path (Split-Path -Parent (Split-Path -Parent $PSCommandPath)) "PiServerLib.ps1")
 . (Join-Path (Split-Path -Parent (Split-Path -Parent $PSCommandPath)) "PiServerUpdate.ps1")
 . (Join-Path (Split-Path -Parent (Split-Path -Parent $PSCommandPath)) "PiServerDoctor.ps1")
