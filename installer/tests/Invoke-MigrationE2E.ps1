@@ -151,6 +151,8 @@ function Build-Scenario([string]$name) {
   New-Item -ItemType Directory -Path $paths.Data -Force | Out-Null
   New-Item -ItemType Directory -Path $paths.Logs -Force | Out-Null
   New-E2EReleaseFiles $app "0.2.10"
+  Copy-Item -LiteralPath (Join-Path $app "installer\run-task.ps1") -Destination (Join-Path $app "run-task.ps1") -Force
+  Copy-Item -LiteralPath (Join-Path $app "installer\run-remote.ps1") -Destination (Join-Path $app "run-remote.ps1") -Force
   $stubPi = Join-Path $app "stub-pi.cmd"
   New-StubPi $stubPi
   (@{
